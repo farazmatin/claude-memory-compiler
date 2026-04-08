@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 # ── Paths ──────────────────────────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -20,14 +21,15 @@ LOG_FILE = KNOWLEDGE_DIR / "log.md"
 STATE_FILE = SCRIPTS_DIR / "state.json"
 
 # ── Timezone ───────────────────────────────────────────────────────────
-TIMEZONE = "America/Chicago"
+TIMEZONE = "America/Toronto"
+TZ = ZoneInfo(TIMEZONE)
 
 
 def now_iso() -> str:
     """Current time in ISO 8601 format."""
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    return datetime.now(TZ).isoformat(timespec="seconds")
 
 
 def today_iso() -> str:
     """Current date in ISO 8601 format."""
-    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
+    return datetime.now(TZ).strftime("%Y-%m-%d")
