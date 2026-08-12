@@ -44,6 +44,8 @@ whole architecture:
 ## Quick start
 
 ```bash
+cp .env.example .env      # then fill in MMC_LIGHTRAG_API_KEY and HF_TOKEN
+
 uv sync                                  # core deps
 uv sync --extra asr                      # + whisperx (heavy: torch, CUDA libs)
 docker compose up -d                     # LightRAG + Ollama
@@ -56,8 +58,29 @@ uv run pipeline run --owner "Your Name"
 uv run pipeline query "what did we decide about pricing?"
 ```
 
-`export HF_TOKEN=hf_...` before the first run, or diarization is skipped — see
-[Prerequisites](#prerequisites).
+Both `.env` values are required: `docker compose` refuses to start without an API
+key, and diarization is silently skipped without `HF_TOKEN` — which means action
+items with no owners. See [Prerequisites](#prerequisites).
+
+## Which model does what
+
+Three LLM jobs, and they cannot all use the same provider:
+
+| Job | Provider | Why |
+|---|---|---|
+| Minutes compilation | Gemini Flash → Codex → Claude | Subscription-backed, tried in order, falls through on failure |
+| Speaker resolution | same chain | ditto |
+| Graph & entity extraction | **local Ollama** | LightRAG needs an HTTP endpoint; no CLI subscription can serve one |
+
+Set the order with `MMC_LLM_PROVIDERS=gemini,codex,claude`. A quota limit or CLI
+hiccup on the preferred provider falls through to the next rather than stalling a
+batch that already paid for transcription.
+
+**The consequence worth understanding:** your subscriptions can't reach LightRAG's
+extraction step, so graph quality is capped by a small local model on CPU. Two
+mitigations, both open: have the minutes compiler emit explicit entities and
+relations for deterministic indexing, and split retrieval from synthesis so the
+local model retrieves while a subscription writes the answer.
 
 ## Commands
 
@@ -126,7 +149,34 @@ above against your actual hardware.
   `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0`. Without
   this, diarization is skipped with a warning and you get transcripts with no
   speaker attribution — which means action items with no owners.
+- **`MMC_LIGHTRAG_API_KEY`** — see below.
 - **Docker** for LightRAG + Ollama.
+- At least one of **`gemini`**, **`codex`**, or the **Claude Agent SDK** reachable.
+
+## Security
+
+Both services bind to **loopback only**. This index holds a searchable record of
+every decision, customer conversation, and internal disagreement in the corpus;
+publishing it on `0.0.0.0` would put that on the network unauthenticated. To reach
+the WebUI from another machine, tunnel:
+
+```bash
+ssh -L 9621:127.0.0.1:9621 user@server
+```
+
+`MMC_LIGHTRAG_API_KEY` is required and enforced — `docker compose` fails fast if
+it's unset rather than starting something open.
+
+## Tests
+
+```bash
+uv sync --extra dev
+uv run pytest
+```
+
+46 tests, no network and no model calls, runs in under a second. Several encode
+defects found in review — same-day prior-context windowing, recompile skipping
+speaker resolution, replace-on-reindex — and name the failure they prevent.
 
 Two upstream bugs are already worked around in `docker-compose.yml`: Ollama is
 pinned to `0.12.11` because `0.13.x` breaks LightRAG's embeddings
@@ -177,6 +227,15 @@ silently assigns work to the wrong person.
 **ASR sits behind a `Backend` protocol.** Swapping in a paid API or a GPU model
 touches one class and nothing downstream — the designed escape hatch from the CPU
 constraint.
+
+**Re-indexing replaces, never appends.** Each meeting's LightRAG document id is
+recorded in the manifest and the old version is deleted before a recompiled one is
+inserted. If the delete fails, the insert is abandoned rather than leaving two
+contradictory copies of the same meeting in the graph.
+
+**The corpus outlives its index.** `minutes/` is portable markdown. If LightRAG
+stalls, slows down, or gets outgrown, the corpus re-indexes into anything else —
+your data is not hostage to it.
 
 ## Not included
 

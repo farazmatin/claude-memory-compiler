@@ -29,7 +29,7 @@ import traceback
 from pathlib import Path
 
 from pipeline import compile_minutes, db, index, ingest, speakers
-from pipeline.config import TEMPLATE_VERSION, ensure_dirs
+from pipeline.config import OWNER_NAME, TEMPLATE_VERSION, ensure_dirs
 
 # Stage names as recorded in stage_runs, for timing analysis.
 STAGE_TRANSCRIBE = "transcribe"
@@ -102,8 +102,13 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         f"duplicate {counts['duplicate']}, failed {counts['failed']}"
     )
     if args.then_run:
-        return _run_all(argparse.Namespace(limit=None, no_llm=False))
-    return 0
+        # Skip ingest inside the chain: it just ran, and re-running it would
+        # re-hash the whole inbox for nothing.
+        return _run_all(
+            argparse.Namespace(limit=None, no_llm=False, owner=None),
+            include_ingest=False,
+        )
+    return 1 if counts["failed"] else 0
 
 
 # ── Stage runners ─────────────────────────────────────────────────────
@@ -182,6 +187,7 @@ def cmd_speakers(args: argparse.Namespace) -> int:
         print("Nothing to resolve.")
         return 0
 
+    failures = 0
     for position, meeting in enumerate(queue, 1):
         print(f"[{position}/{len(queue)}] {meeting.label}")
         with db.connect() as conn:
@@ -209,6 +215,7 @@ def cmd_speakers(args: argparse.Namespace) -> int:
                 if unresolved:
                     print(f"    unresolved: {', '.join(unresolved)}")
             except Exception as exc:  # noqa: BLE001
+                failures += 1
                 detail = f"{type(exc).__name__}: {exc}"
                 print(f"    FAILED {detail}")
                 if args.traceback:
@@ -216,7 +223,7 @@ def cmd_speakers(args: argparse.Namespace) -> int:
                 db.finish_stage(conn, run_id, False, detail)
                 db.mark_failed(conn, meeting.id, detail)
 
-    return 0
+    return 1 if failures else 0
 
 
 def cmd_minutes(args: argparse.Namespace) -> int:
@@ -269,7 +276,7 @@ def cmd_minutes(args: argparse.Namespace) -> int:
                 # the model call is retryable, so the meeting stays in the queue.
 
     print(f"\nCompiled {len(queue) - failures}/{len(queue)}.")
-    return 0
+    return 1 if failures else 0
 
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -289,6 +296,7 @@ def cmd_index(args: argparse.Namespace) -> int:
         return 0
 
     failures = 0
+    stale = 0
     for position, meeting in enumerate(queue, 1):
         print(f"[{position}/{len(queue)}] {meeting.label}")
         if not meeting.minutes_path:
@@ -302,23 +310,45 @@ def cmd_index(args: argparse.Namespace) -> int:
         with db.connect() as conn:
             run_id = db.start_stage(conn, meeting.id, STAGE_INDEX)
             try:
-                index.insert_minutes(path)
-                db.finish_stage(conn, run_id, True, path.name)
-                db.advance(conn, meeting.id, db.INDEXED)
+                doc_id, replaced = index.replace_minutes(path, meeting.lightrag_doc_id)
+                if not replaced:
+                    # The old copy is still in the graph. Refusing to insert keeps
+                    # the corpus consistent instead of leaving two contradictory
+                    # versions of the same meeting for retrieval to trip over.
+                    stale += 1
+                    detail = f"stale copy {meeting.lightrag_doc_id} could not be deleted"
+                    print(f"    SKIPPED {detail}")
+                    db.finish_stage(conn, run_id, False, detail)
+                    continue
+                db.finish_stage(conn, run_id, True, f"{path.name} -> {doc_id}")
+                db.advance(conn, meeting.id, db.INDEXED, lightrag_doc_id=doc_id)
                 print("    indexed")
             except index.IndexError_ as exc:
                 failures += 1
                 print(f"    FAILED {exc}")
                 db.finish_stage(conn, run_id, False, str(exc))
 
-    print(f"\nIndexed {len(queue) - failures}/{len(queue)}.")
-    return 0
+    print(f"\nIndexed {len(queue) - failures - stale}/{len(queue)}.")
+    if stale:
+        print(
+            f"{stale} meeting(s) skipped because a previously indexed version "
+            f"could not be removed. Delete them in the LightRAG UI, then re-run."
+        )
+    return 1 if (failures or stale) else 0
 
 
-def _run_all(args: argparse.Namespace) -> int:
-    """Walk every stage in order, oldest meeting first."""
-    stages = [
-        ("ingest", cmd_ingest, argparse.Namespace(then_run=False)),
+def _run_all(args: argparse.Namespace, include_ingest: bool = True) -> int:
+    """Walk every stage in order, oldest meeting first.
+
+    Returns non-zero if ANY stage failed. This runs from a nightly timer, and a
+    batch that exits 0 after every stage failed is indistinguishable from success
+    - which means a break in month 4 goes unnoticed until a query comes back
+    empty in month 9.
+    """
+    stages: list[tuple[str, object, argparse.Namespace]] = []
+    if include_ingest:
+        stages.append(("ingest", cmd_ingest, argparse.Namespace(then_run=False)))
+    stages += [
         ("transcribe", cmd_transcribe, argparse.Namespace(
             limit=args.limit, keep_going=True, traceback=False)),
         ("speakers", cmd_speakers, argparse.Namespace(
@@ -328,9 +358,23 @@ def _run_all(args: argparse.Namespace) -> int:
             limit=args.limit, recompile=False, traceback=False)),
         ("index", cmd_index, argparse.Namespace(limit=args.limit)),
     ]
+
+    failed: list[str] = []
     for name, handler, stage_args in stages:
         print(f"\n=== {name} ===")
-        handler(stage_args)
+        try:
+            if handler(stage_args):  # type: ignore[operator]
+                failed.append(name)
+        except Exception as exc:  # noqa: BLE001 - a crashed stage must not hide the rest
+            failed.append(name)
+            print(f"  stage crashed: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+
+    if failed:
+        print(f"\nFAILED stages: {', '.join(failed)}")
+        print("Run `pipeline status` for detail.")
+        return 1
+    print("\nAll stages completed.")
     return 0
 
 
@@ -402,8 +446,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_speakers = subparsers.add_parser("speakers", help="resolve speaker labels to names")
     add_common(p_speakers)
     p_speakers.add_argument(
-        "--owner", default=None,
-        help="your own name, used to disambiguate two-speaker recordings",
+        "--owner", default=OWNER_NAME or None,
+        help="your own name, used to disambiguate two-speaker recordings "
+             "(defaults to MMC_OWNER_NAME)",
     )
     p_speakers.add_argument(
         "--no-llm", action="store_true", help="heuristics and overrides only"
@@ -425,7 +470,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_run = subparsers.add_parser("run", help="every pending stage, in order")
     p_run.add_argument("--limit", type=int, default=None)
-    p_run.add_argument("--owner", default=None)
+    p_run.add_argument("--owner", default=OWNER_NAME or None)
     p_run.add_argument("--no-llm", action="store_true")
     p_run.set_defaults(func=cmd_run)
 

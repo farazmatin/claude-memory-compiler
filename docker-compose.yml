@@ -18,7 +18,9 @@ services:
     container_name: mmc-ollama
     restart: unless-stopped
     ports:
-      - "11434:11434"
+      # Loopback only. Nothing outside this host has any business reaching the
+      # model server.
+      - "127.0.0.1:11434:11434"
     volumes:
       - ollama_data:/root/.ollama
     environment:
@@ -42,7 +44,12 @@ services:
     container_name: mmc-lightrag
     restart: unless-stopped
     ports:
-      - "9621:9621"
+      # LOOPBACK ONLY, DELIBERATELY. This service holds a searchable index of
+      # every decision, customer conversation, and internal disagreement in the
+      # corpus. Publishing it on 0.0.0.0 puts that on the network unauthenticated.
+      # To reach it from another machine, use an SSH tunnel:
+      #   ssh -L 9621:127.0.0.1:9621 user@server
+      - "127.0.0.1:9621:9621"
     depends_on:
       ollama:
         condition: service_healthy
@@ -50,8 +57,14 @@ services:
       - ./rag_storage:/app/rag_storage
       - ./minutes:/app/inputs:ro
     environment:
+      # 0.0.0.0 binds inside the container only; the published port above is what
+      # controls host exposure.
       - HOST=0.0.0.0
       - PORT=9621
+
+      # Required. Set MMC_LIGHTRAG_API_KEY in .env (see .env.example) - the
+      # pipeline sends it as X-API-Key. Defence in depth behind the loopback bind.
+      - LIGHTRAG_API_KEY=${MMC_LIGHTRAG_API_KEY:?set MMC_LIGHTRAG_API_KEY in .env}
 
       # LLM: graph and entity extraction. A ~4B model is the right size here -
       # extraction is a structured task, and on CPU a 7B+ model turns a 5-minute

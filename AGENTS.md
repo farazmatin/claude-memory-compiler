@@ -88,6 +88,15 @@ never by discovery time. The minutes compiler reads earlier minutes to populate
 against its own future. This also makes backfill build the graph in the order
 events actually happened.
 
+`recent_indexed_before()` compares `(date, time)` as a **pair**. A date-only
+comparison made every meeting blind to the other four from the same day, so at five
+meetings a day a decision reversed after lunch was never flagged.
+
+**Known limitation:** prior context is selected by *recency*, not topic. A decision
+being reversed is often months old, so long-horizon reversals — the valuable case —
+will usually be missed. The fix is to query LightRAG for topically related priors
+instead of taking the last three chronologically.
+
 **Failure policy differs by stage on purpose.** Transcription failures mark the row
 `failed` (something is wrong with the file or environment; a human should look).
 Minutes failures leave the row at `speakers_resolved` — the transcript is intact
@@ -193,8 +202,20 @@ with resolved names.
 
 ### 4. minutes (`pipeline/compile_minutes.py`)
 
-Claude Agent SDK, no tools, `max_turns=3`. Subscription-covered, which is why the
-highest-value artifact uses it while bulk entity extraction runs on local Ollama.
+Runs through the provider chain in `pipeline/llm.py` — Gemini Flash, then Codex,
+then Claude — falling through on failure. All three are subscription-backed, which
+is why the highest-value artifact uses them while bulk entity extraction runs on
+local Ollama.
+
+**The constraint that shapes this:** none of the three can serve LightRAG, which
+needs an HTTP endpoint rather than a CLI. So graph extraction — the most
+quality-sensitive step in retrieval — is permanently on a small local model. Two
+open mitigations: emit entities and relations from this stage for deterministic
+indexing, and split retrieval from synthesis (`only_need_context`) so a
+subscription writes the final answer.
+
+Prompts reach the CLI providers on **stdin**, never argv: a full transcript is tens
+of thousands of tokens and would risk `ARG_MAX`.
 
 Prompt assembles: `templates/minutes.md` (the spec) + meeting metadata + resolved
 attendees + explicit unresolved-label instructions + excerpts from up to 3 earlier
@@ -217,6 +238,23 @@ from retained transcripts. **This is the payoff for the three-tier design.**
 back to a meeting. Minutes only. Long timeout (default 600s) because CPU-bound
 entity extraction blocks the request.
 
+**Replace, never append.** `compute_doc_id()` mirrors LightRAG's own
+`compute_mdhash_id(content.strip(), prefix="doc-")`, so the document id is knowable
+before insert and stable across restarts. `replace_minutes()` uses it to:
+
+1. Skip entirely when content is unchanged — re-extraction would burn minutes of
+   CPU to reach the same state.
+2. Delete the previous version before inserting a recompiled one.
+3. **Abandon the insert if the delete failed**, returning `replaced=False` so the
+   CLI skips the meeting and reports it.
+
+Step 3 matters: inserting anyway leaves both versions in the graph, so every entity
+and relation from the old copy survives alongside the new one and retrieval starts
+returning contradictory duplicates. That would silently invalidate the entire
+reason transcripts are retained. `delete_document()` tries the current endpoint then
+the older path, since this route has moved between releases; a total failure is
+reported rather than swallowed.
+
 ### 6. query
 
 `POST /query`. Modes: `hybrid` (default, graph + vector), `global` (aggregative,
@@ -231,6 +269,12 @@ Everything in `pipeline/config.py`, all overridable by environment variable.
 
 | Variable | Default | Notes |
 |---|---|---|
+| `MMC_LLM_PROVIDERS` | `gemini,codex,claude` | Priority order; falls through on failure |
+| `MMC_GEMINI_MODEL` | unset | Pin a Flash version; unset lets the CLI choose |
+| `MMC_GEMINI_ARGS` / `MMC_CODEX_ARGS` | `-p -` / `exec -` | Override if a CLI changes its invocation |
+| `MMC_LLM_TIMEOUT` | `900` | Per-call ceiling; a CLI wanting a TTY would otherwise hang the batch |
+| `MMC_LIGHTRAG_API_KEY` | — | **Required**; compose fails fast without it |
+| `MMC_OWNER_NAME` | unset | Default for `--owner` |
 | `MMC_TIMEZONE` | `America/Toronto` | Meeting dates depend on it; wrong value mislabels the corpus |
 | `MMC_ASR_MODEL` | `large-v3-turbo` | `large-v3` only if you have a GPU |
 | `MMC_ASR_DEVICE` | `cpu` | |
@@ -251,6 +295,11 @@ the template it describes.
 | [LightRAG#2023](https://github.com/HKUDS/LightRAG/issues/2023) | Server won't boot on Ollama bindings | Set a dummy `OPENAI_API_KEY` |
 | pyannote gating | Diarization fails at *runtime*, not install | `HF_TOKEN` + accept model terms |
 | `EMBEDDING_DIM` mismatch | Opaque dimension error at insert | Must match model (mxbai-embed-large = 1024) |
+
+Both services bind to **loopback only** and `LIGHTRAG_API_KEY` is enforced by
+compose. The index is a searchable record of every decision and customer
+conversation in the corpus; a `0.0.0.0` bind with the default empty key would
+expose that unauthenticated. Reach the WebUI over an SSH tunnel.
 
 CPU contention is also configured for: `MAX_ASYNC=2`, `MAX_PARALLEL_INSERT=1`,
 `OLLAMA_NUM_PARALLEL=1`, `OLLAMA_KEEP_ALIVE=30m`. Transcription and indexing share

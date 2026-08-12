@@ -19,7 +19,13 @@ dependencies = [
 # Kept optional so the manifest/minutes/index stages can be installed and tested
 # on machines that will never run transcription.
 asr = [
-    "whisperx>=3.1.1",
+    # Upper bound is deliberate. whisperx moves DiarizationPipeline's auth kwarg
+    # and assign_word_speakers' location between releases; pipeline/asr.py carries
+    # shims for both, but an unpinned major would land mid-batch unannounced.
+    "whisperx>=3.1.1,<4",
+]
+dev = [
+    "pytest>=8.0",
 ]
 
 [project.scripts]
@@ -27,6 +33,11 @@ pipeline = "pipeline.cli:main"
 
 [tool.ruff]
 line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Tests never reach the network or spawn a model; the suite runs in under a second.
+addopts = "-q"
 
 [tool.hatch.build.targets.wheel]
 packages = ["pipeline"]

@@ -84,7 +84,13 @@ def load_prior_context(conn, meeting: db.Meeting) -> str:
     order rather than discovery order - out-of-order compilation would compare a
     meeting against its own future.
     """
-    priors = db.recent_indexed_before(conn, meeting.meeting_date, PRIOR_CONTEXT_DOCS)
+    priors = db.recent_indexed_before(
+        conn,
+        meeting.meeting_date,
+        PRIOR_CONTEXT_DOCS,
+        meeting_time=meeting.meeting_time,
+        exclude_id=meeting.id,
+    )
     if not priors:
         return "(no earlier minutes on record)"
 
@@ -213,7 +219,7 @@ def compile_meeting(
     meeting at its current status so the batch can retry it later.
     """
     prompt = build_prompt(meeting, transcript, speaker_names, load_prior_context(conn, meeting))
-    document = strip_wrapping_fence(complete(prompt, max_turns=3))
+    document = strip_wrapping_fence(complete(prompt))
 
     if not document.startswith("---"):
         raise LLMError("compiled minutes are missing YAML frontmatter")

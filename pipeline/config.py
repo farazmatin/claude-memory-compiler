@@ -63,6 +63,30 @@ ENABLE_DIARIZATION = os.environ.get("MMC_DIARIZATION", "1") not in ("0", "false"
 # This fails at runtime, not at install time.
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
 
+# ── LLM providers ─────────────────────────────────────────────────────
+# Priority order, highest first. Tried in sequence, falling through on failure,
+# so a quota limit on the preferred provider does not stall a nightly batch that
+# has already paid for transcription.
+#
+# All three are subscription-backed rather than metered APIs. None of them can
+# serve LightRAG, which needs an HTTP endpoint - that runs on local Ollama.
+LLM_PROVIDER_ORDER = [
+    name.strip()
+    for name in os.environ.get("MMC_LLM_PROVIDERS", "gemini,codex,claude").split(",")
+    if name.strip()
+]
+
+# Left unset, the Gemini CLI picks its own default model. Pin it here to hold a
+# specific Flash version.
+GEMINI_MODEL = os.environ.get("MMC_GEMINI_MODEL", "")
+
+# Per-call ceiling. Generous: a full transcript is a large prompt, and a CLI that
+# wants a TTY would otherwise hang the batch indefinitely.
+LLM_TIMEOUT_SEC = float(os.environ.get("MMC_LLM_TIMEOUT", "900"))
+
+OWNER_NAME = os.environ.get("MMC_OWNER_NAME", "")
+
+
 # ── Minutes compilation ───────────────────────────────────────────────
 # Bump when templates/minutes.md changes semantically. Stamped into every
 # minutes file's frontmatter so `pipeline minutes --recompile` can find stale

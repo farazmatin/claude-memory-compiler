@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS meetings (
     template_version TEXT,
     transcript_path TEXT,
     minutes_path    TEXT,
+    -- LightRAG's id for the indexed copy of this meeting's minutes. Required to
+    -- DELETE the stale version before re-indexing a recompiled document;
+    -- without it a recompile leaves the old entities in the graph forever.
+    lightrag_doc_id TEXT,
     error           TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
@@ -92,6 +96,7 @@ class Meeting:
     template_version: str | None
     transcript_path: str | None
     minutes_path: str | None
+    lightrag_doc_id: str | None
     error: str | None
     created_at: str
     updated_at: str
@@ -130,10 +135,23 @@ def connect(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+#  column -> DDL. Applied to manifests created before the column existed.
+MIGRATIONS: dict[str, str] = {
+    "lightrag_doc_id": "ALTER TABLE meetings ADD COLUMN lightrag_doc_id TEXT",
+}
+
+
 def init_db(db_path: Path | None = None) -> None:
-    """Create tables. Idempotent."""
+    """Create tables and apply pending migrations. Idempotent."""
     with connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        # CREATE TABLE IF NOT EXISTS silently skips an existing table, so new
+        # columns must be added explicitly or an upgraded install keeps running
+        # against the old shape and fails at the first write.
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(meetings)")}
+        for column, ddl in MIGRATIONS.items():
+            if column not in existing:
+                conn.execute(ddl)
 
 
 # ── Meeting rows ──────────────────────────────────────────────────────
@@ -202,35 +220,57 @@ def stale_template(conn: sqlite3.Connection, current_version: str) -> list[Meeti
     This is the recompilation path: bump TEMPLATE_VERSION, re-run the minutes
     stage over these, and years of history gets rebuilt from retained
     transcripts with no ASR cost.
+
+    Restricted to meetings that have already cleared speaker resolution. A
+    meeting still at `transcribed` also has a transcript and a NULL
+    template_version, and compiling it here would jump it straight to
+    minutes_compiled - skipping stage 3 entirely and producing minutes whose
+    action items are owned by "SPEAKER_01".
     """
     sql = """
         SELECT * FROM meetings
         WHERE transcript_path IS NOT NULL
+          AND status IN (?, ?, ?)
           AND (template_version IS NULL OR template_version != ?)
         ORDER BY meeting_date IS NULL, meeting_date, meeting_time, created_at
     """
-    return [_row_to_meeting(r) for r in conn.execute(sql, (current_version,)).fetchall()]
+    params = (SPEAKERS_RESOLVED, MINUTES_COMPILED, INDEXED, current_version)
+    return [_row_to_meeting(r) for r in conn.execute(sql, params).fetchall()]
 
 
 def recent_indexed_before(
-    conn: sqlite3.Connection, meeting_date: str | None, limit: int
+    conn: sqlite3.Connection,
+    meeting_date: str | None,
+    limit: int,
+    meeting_time: str | None = None,
+    exclude_id: str | None = None,
 ) -> list[Meeting]:
-    """Most recent meetings with minutes that predate `meeting_date`.
+    """Most recent meetings with minutes that precede this one.
 
     Feeds prior-decision context into the minutes compiler so it can flag when a
     decision reverses an earlier position.
+
+    Compares (date, time) as a pair, not date alone. At five meetings a day a
+    date-only comparison makes every meeting blind to the other four from the
+    same day, so a decision reversed after lunch would never be flagged.
     """
     if not meeting_date:
         return []
+    # Empty string sorts below any "HH:MM", so an unknown time places the meeting
+    # at the start of its day rather than excluding it.
+    time_key = meeting_time or ""
     sql = """
         SELECT * FROM meetings
         WHERE minutes_path IS NOT NULL
           AND meeting_date IS NOT NULL
-          AND meeting_date < ?
+          AND (meeting_date < ?
+               OR (meeting_date = ? AND COALESCE(meeting_time, '') < ?))
+          AND id != COALESCE(?, '')
         ORDER BY meeting_date DESC, meeting_time DESC
         LIMIT ?
     """
-    return [_row_to_meeting(r) for r in conn.execute(sql, (meeting_date, limit)).fetchall()]
+    params = (meeting_date, meeting_date, time_key, exclude_id, limit)
+    return [_row_to_meeting(r) for r in conn.execute(sql, params).fetchall()]
 
 
 def advance(
@@ -246,7 +286,8 @@ def advance(
     """
     allowed = {
         "audio_path", "meeting_date", "meeting_time", "title_hint", "duration_sec",
-        "asr_model", "template_version", "transcript_path", "minutes_path", "error",
+        "asr_model", "template_version", "transcript_path", "minutes_path",
+        "lightrag_doc_id", "error",
     }
     unknown = set(fields) - allowed
     if unknown:
