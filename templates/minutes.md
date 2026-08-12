@@ -74,6 +74,12 @@ One short paragraph: what this meeting was for and what preceded it.
 
 ## Product Entities Touched
 - **{Feature / epic / release}** — what happened to it in this meeting.
+
+## Entities
+{Name} ({person|feature|customer|release|team|metric|other}): {one line}
+
+## Relations
+{Subject} -> {predicate} -> {Object}
 ```
 
 ## Section notes
@@ -92,3 +98,24 @@ audio — which matters, because a PM gets asked "did we actually agree to that?
 **Attendees** should use resolved names. If a speaker is still an unresolved
 `SPEAKER_xx` label, list it as `Unknown speaker (SPEAKER_xx)` rather than
 guessing. Consistent spelling across meetings matters more than completeness.
+
+**Entities and Relations** are the most mechanically important sections, and the
+reason is not obvious.
+
+The knowledge graph that answers questions is built by a small local model running
+on CPU — it cannot use the subscription that compiles these minutes. That model
+reliably reads an explicit list like `Atlas (feature): the platform rewrite`, and
+unreliably discovers the same fact from narrative prose. So state it outright here.
+
+Rules:
+
+- One entity per line, exactly `Name (kind): one line`. Kinds are `person`,
+  `feature`, `customer`, `release`, `team`, `metric`, `other`.
+- Names must match how they appear elsewhere in the document, character for
+  character. A mismatch creates two graph nodes for one thing.
+- One relation per line, exactly `Subject -> predicate -> Object`. Use short verb
+  predicates: `owns`, `blocks`, `depends on`, `requested`, `deprioritized`,
+  `decided`, `raised`, `part of`.
+- Both ends of a relation should be entities listed above.
+- Include only what this meeting actually establishes. A relation you inferred
+  from general knowledge is noise in the graph.

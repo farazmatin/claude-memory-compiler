@@ -302,34 +302,100 @@ CLI are interactive tools, not servers, and no subscription offers an embedding
 model at all. So the most quality-sensitive step in *retrieval* is permanently
 capped by a small model on CPU, no matter what is paid for elsewhere.
 
-Two mitigations, both designed but not yet built:
+Both mitigations are now built — see D17 and D18. The ceiling is narrowed rather
+than removed: entity *identification* moved to a frontier model, and answer
+*writing* moved to one, but graph traversal still runs locally.
 
-1. **Compiler-emitted entities.** The minutes template already produces an
-   `entities:` list. Have the subscription-backed compiler emit entities *and
-   relations* as structured data, and index those deterministically instead of
-   asking a 4B model to rediscover them from prose. Intelligence moves to where the
-   subscription reaches.
-2. **Split retrieval from synthesis.** `index.query_context()` already returns
-   retrieved context without generating an answer. Let the local model retrieve and
-   a subscription write the answer. This also decouples query latency from local
-   generation speed — relevant because `global`-mode traversal on CPU could
-   otherwise mean minutes per question, and a knowledge base you wait three minutes
-   for is one you stop using.
+### D17 — The compiler emits the knowledge graph
+
+**Decision.** The minutes template emits explicit `Entities` and `Relations`
+sections. These are parsed, canonicalized through the people registry, stored in the
+manifest, and appended to the indexed document as a normalized block.
+
+**Why.** The first half of the subscription-ceiling fix. A ~4B model reads
+`Atlas (feature): the platform rewrite` reliably and discovers the same fact from
+narrative prose unreliably. The frontier model already running once per meeting can
+state it outright, so it does. Storing them in the manifest also means the corpus no
+longer depends on LightRAG's extraction quality at all.
+
+**Why a tolerant line parser, not JSON.** Models emit stray prose around JSON often
+enough that a strict parse throws away a whole usable block. Recovering most of a
+messy block beats discarding all of a slightly-malformed one.
+
+### D18 — Retrieval and synthesis are separate
+
+**Decision.** `pipeline/answer.py` retrieves via LightRAG, then hands the context to
+the subscription chain to write the answer. `--local` keeps LightRAG's own
+generation, and it is the automatic fallback when no provider is reachable.
+
+**Why.** The second half of the ceiling fix, and the answer to query latency: answer
+quality and speed stop depending on CPU-bound local generation. Empty retrieval
+short-circuits rather than asking a model to answer from nothing — that is how a
+knowledge base starts inventing.
+
+### D19 — A people registry, because models do not spell consistently
+
+**Decision.** `people` + `person_aliases` tables. Every resolved name and every
+person entity normalizes through `canonical_name()`. `pipeline people --merge`
+rewrites history across speakers, entities, and both ends of every relation.
+
+**Why.** Asking a model to spell a name the same way it did four months ago is not a
+strategy. Each variant becomes a separate graph node, so one person recorded three
+ways is three disconnected entities no query finds together. Unknown names pass
+through unchanged — a new person is normal, and dropping them would be worse than an
+unnormalized spelling.
+
+**Rejected for now.** Voiceprints. pyannote emits speaker embeddings so it is
+feasible, but this makes spelling deterministic, which was the actual failure.
+
+### D20 — Speaker bounds are supplied, over-segmentation is surfaced
+
+**Decision.** `MMC_MIN_SPEAKERS` / `MMC_MAX_SPEAKERS` are passed to pyannote when
+set. An implausible count (>8) or zero speakers produces a warning.
+
+**Why.** pyannote over-segments a noisy 1:1 into three or four speakers and
+under-counts large meetings with overlapping speech, and diarization accuracy is the
+main lever on whether action items get correct owners. Surfaced rather than
+corrected: the fix is a bound or a better microphone, not a guess.
+
+### D21 — Preflight as a command
+
+**Decision.** `pipeline doctor` runs 18 environment checks, each with a fix.
+
+**Why.** Almost everything that goes wrong here fails at *runtime*, and several
+degrade quietly. The gated-model check is the important one: a HuggingFace token
+proves nothing about licence acceptance, which is the part people miss, and missing
+diarization costs every action item its owner while printing only a mid-batch
+warning.
+
+**What it deliberately does not claim.** That the output is good. It verifies the
+environment; only a real meeting read against its audio verifies the minutes.
+
+### D22 — Alerting is a command, not a feature
+
+**Decision.** `MMC_ALERT_COMMAND` receives the failure summary on stdin, with
+`{subject}` substituted.
+
+**Why.** Exiting non-zero (D13) is necessary but not sufficient: cron mails the local
+user and nobody reads local mail on a headless server. A command rather than
+built-in email/webhook support because whatever the server already has beats a
+second notification stack. Delivery never raises — an alerting failure masking the
+pipeline failure it reports would be strictly worse than no alert.
 
 ## Known limitations
 
 Accepted, with the reasoning:
 
-- **Speaker identity is per-meeting.** No voiceprints or global registry, so
-  consistency across years depends on the resolver re-picking the same spelling
-  from `known_speaker_names`. Inconsistent spellings fragment graph entities.
-- **Diarization degrades on large or overlapping meetings** and no
-  `min/max_speakers` hint is passed.
+- **Graph traversal is still local.** D17 moved entity identification to a frontier
+  model and D18 moved answer writing, but the traversal between them runs on the
+  small local model.
+- **No voiceprints.** D19 makes spelling deterministic, not identification
+  automatic.
 - **Token estimation is `len // 4`.** Deliberately rough and biased conservative:
   over-estimating costs an unnecessary map-reduce pass, under-estimating costs a
   blown context window.
 - **`seen_files` keys on path+size+mtime.** A file edited in place with identical
   size and mtime would be missed. This does not happen to finished recordings.
-- **Nothing has run against real audio, LightRAG, or the CLI providers.** ASR,
-  indexing, and both CLI invocations are unverified end to end. The 102 tests cover
-  logic, not integration.
+- **Nothing has run against real audio, LightRAG, or the CLI providers.** 165 tests
+  cover logic, not integration. `pipeline doctor` verifies the environment; it
+  cannot verify output quality.

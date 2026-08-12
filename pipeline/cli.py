@@ -28,7 +28,7 @@ import sys
 import traceback
 from pathlib import Path
 
-from pipeline import compile_minutes, db, index, ingest, speakers
+from pipeline import compile_minutes, db, entities, index, ingest, speakers
 from pipeline.config import OWNER_NAME, TEMPLATE_VERSION, ensure_dirs
 
 # Stage names as recorded in stage_runs, for timing analysis.
@@ -163,6 +163,8 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
                 f"    {len(transcript.segments)} segments, "
                 f"{len(transcript.speaker_labels)} speaker(s)"
             )
+            if transcript.diarization_warning:
+                print(f"    WARNING {transcript.diarization_warning}")
         except Exception as exc:
             failures += 1
             detail = f"{type(exc).__name__}: {exc}"
@@ -311,7 +313,17 @@ def cmd_index(args: argparse.Namespace) -> int:
         with db.connect() as conn:
             run_id = db.start_stage(conn, meeting.id, STAGE_INDEX)
             try:
-                doc_id, replaced = index.replace_minutes(path, meeting.lightrag_doc_id)
+                # Append the canonicalized graph block from the manifest. The
+                # local extraction model reads an explicit list reliably and
+                # discovers the same facts from prose unreliably - this is the
+                # mitigation for that ceiling.
+                augment = entities.render_for_index(
+                    db.get_entities(conn, meeting.id),
+                    db.get_relations(conn, meeting.id),
+                )
+                doc_id, replaced = index.replace_minutes(
+                    path, meeting.lightrag_doc_id, augment=augment
+                )
                 if not replaced:
                     # The old copy is still in the graph. Refusing to insert keeps
                     # the corpus consistent instead of leaving two contradictory
@@ -361,6 +373,7 @@ def _run_all(args: argparse.Namespace, include_ingest: bool = True) -> int:
     ]
 
     failed: list[str] = []
+    crashes: list[str] = []
     for name, handler, stage_args in stages:
         print(f"\n=== {name} ===")
         try:
@@ -368,12 +381,18 @@ def _run_all(args: argparse.Namespace, include_ingest: bool = True) -> int:
                 failed.append(name)
         except Exception as exc:
             failed.append(name)
+            crashes.append(f"{name}: {type(exc).__name__}: {exc}")
             print(f"  stage crashed: {type(exc).__name__}: {exc}")
             traceback.print_exc()
 
     if failed:
         print(f"\nFAILED stages: {', '.join(failed)}")
         print("Run `pipeline status` for detail.")
+        # A non-zero exit is not enough on a headless server: cron mails the local
+        # user and nobody reads local mail. Push the failure somewhere visible.
+        from pipeline import alert
+
+        alert.send(failed, detail="\n".join(crashes))
         return 1
     print("\nAll stages completed.")
     return 0
@@ -386,12 +405,100 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_query(args: argparse.Namespace) -> int:
+    from pipeline import answer
+
     try:
-        print(index.query(args.question, mode=args.mode, top_k=args.top_k))
+        result = answer.ask(
+            args.question,
+            mode=args.mode,
+            top_k=args.top_k,
+            synthesize=not args.local,
+        )
     except index.IndexError_ as exc:
         print(f"{exc}", file=sys.stderr)
         return 1
+
+    print(result.text)
+    if args.timing:
+        print(f"\n{result.timing_line()}")
     return 0
+
+
+def cmd_people(args: argparse.Namespace) -> int:
+    """Inspect and curate the people registry.
+
+    Curating this is worth the effort: every spelling variant becomes a separate
+    node in the knowledge graph, so one person recorded three ways is three
+    disconnected entities that no query finds together.
+    """
+    db.init_db()
+    with db.connect() as conn:
+        if args.merge:
+            source, target = args.merge
+            rewritten = db.merge_person(conn, source, target)
+            print(f"Merged {source!r} into {target!r} ({rewritten} speaker row(s) rewritten).")
+            return 0
+
+        if args.add:
+            canonical, *aliases = args.add
+            db.add_person(conn, canonical, aliases=aliases)
+            print(f"Registered {canonical!r}" + (f" with aliases {aliases}" if aliases else ""))
+            return 0
+
+        people = db.list_people(conn)
+        if not people:
+            print("No people registered yet. They are added automatically as meetings resolve.")
+            return 0
+        print(f"{'name':<24} {'role':<14} {'meetings':>8}  aliases")
+        for person in people:
+            print(
+                f"{person['canonical']!s:<24} {person['role'] or ''!s:<14} "
+                f"{person['meetings'] or 0:>8}  {person['aliases'] or ''}"
+            )
+    return 0
+
+
+def cmd_entities(args: argparse.Namespace) -> int:
+    """Most-mentioned entities across the corpus.
+
+    A useful health check on graph quality: if the top entries are generic words
+    rather than product and people names, the compiler is emitting noise.
+    """
+    db.init_db()
+    with db.connect() as conn:
+        rows = db.entity_mentions(conn, args.limit)
+    if not rows:
+        print("No entities recorded yet.")
+        return 0
+    print(f"{'entity':<32} {'kind':<12} {'meetings':>8}")
+    for row in rows:
+        print(f"{row['name']!s:<32} {row['kind'] or ''!s:<12} {row['meetings']:>8}")
+    return 0
+
+
+def cmd_doctor(_args: argparse.Namespace) -> int:
+    """Preflight the environment.
+
+    Verifies nothing is obviously broken. It cannot tell you the minutes are any
+    good - only running a real meeting through and reading the result does that.
+    """
+    from pipeline import doctor
+
+    checks, ok = doctor.run()
+    for check in checks:
+        print(f"[{check.symbol}] {check.name:<22} {check.detail}")
+        if check.fix and check.status != doctor.OK:
+            print(f"{'':<9} -> {check.fix}")
+
+    failed = sum(1 for c in checks if c.status == doctor.FAIL)
+    warned = sum(1 for c in checks if c.status == doctor.WARN)
+    print(f"\n{len(checks)} checks: {failed} failed, {warned} warnings")
+    if ok:
+        print(
+            "\nEnvironment looks ready. This does NOT verify output quality - run one "
+            "real meeting and read the transcript against the audio."
+        )
+    return 0 if ok else 1
 
 
 def cmd_backup(args: argparse.Namespace) -> int:
@@ -497,7 +604,35 @@ def build_parser() -> argparse.ArgumentParser:
              "whose answer spans many meetings",
     )
     p_query.add_argument("--top-k", type=int, default=None)
+    p_query.add_argument(
+        "--local", action="store_true",
+        help="let LightRAG's local model write the answer instead of the "
+             "subscription chain (faster to start, lower quality)",
+    )
+    p_query.add_argument(
+        "--timing", action="store_true",
+        help="report retrieval vs synthesis time, to see which phase is slow",
+    )
     p_query.set_defaults(func=cmd_query)
+
+    p_people = subparsers.add_parser("people", help="inspect the people registry")
+    p_people.add_argument(
+        "--add", nargs="+", metavar=("CANONICAL", "ALIAS"),
+        help="register a canonical name and optional aliases",
+    )
+    p_people.add_argument(
+        "--merge", nargs=2, metavar=("FROM", "INTO"),
+        help="fold one person into another, rewriting existing records",
+    )
+    p_people.set_defaults(func=cmd_people)
+
+    p_entities = subparsers.add_parser("entities", help="most-mentioned entities")
+    p_entities.add_argument("--limit", type=int, default=50)
+    p_entities.set_defaults(func=cmd_entities)
+
+    subparsers.add_parser(
+        "doctor", help="preflight the environment before a real batch"
+    ).set_defaults(func=cmd_doctor)
 
     p_backup = subparsers.add_parser(
         "backup", help="back up transcripts, minutes, audio and the manifest"

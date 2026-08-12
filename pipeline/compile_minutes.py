@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from pipeline import db
+from pipeline import db, entities
 from pipeline.asr import Transcript, format_timestamp
 from pipeline.config import (
     MINUTES_DIR,
@@ -412,6 +412,17 @@ def compile_meeting(
 
     if not document.startswith("---"):
         raise LLMError("compiled minutes are missing YAML frontmatter")
+
+    # Entities and relations were emitted by a frontier model; normalize the person
+    # names through the registry and persist them independently of LightRAG.
+    parsed_entities, parsed_relations = entities.extract(document)
+    parsed_entities, parsed_relations = entities.canonicalize(
+        conn, parsed_entities, parsed_relations
+    )
+    db.replace_entities(conn, meeting.id, parsed_entities, parsed_relations)
+    for entity in parsed_entities:
+        if entity.get("kind") == "person":
+            db.add_person(conn, entity["name"])
 
     MINUTES_DIR.mkdir(parents=True, exist_ok=True)
     path = minutes_path(meeting, extract_title(document))

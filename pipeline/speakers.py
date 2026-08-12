@@ -257,6 +257,12 @@ def resolve(
             resolved[label] = name
             confidence[label] = CONFIDENCE_CONFIRMED
 
+    # Normalize through the people registry before persisting. A model asked to
+    # spell a name the same way it did four months ago is not a reliable strategy,
+    # and every variant it invents becomes a separate graph node.
+    for label, name in list(resolved.items()):
+        resolved[label] = db.canonical_name(conn, name) or name
+
     for label in labels:
         db.set_speaker(
             conn,
@@ -265,5 +271,9 @@ def resolve(
             resolved.get(label),
             confidence.get(label, CONFIDENCE_UNKNOWN),
         )
+
+    # Register anyone new so the next meeting normalizes against them.
+    for name in resolved.values():
+        db.add_person(conn, name)
 
     return resolved

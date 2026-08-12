@@ -77,6 +77,51 @@ CREATE TABLE IF NOT EXISTS stage_runs (
 
 CREATE INDEX IF NOT EXISTS idx_stage_runs_meeting ON stage_runs(meeting_id, stage);
 
+-- Canonical people. Speaker resolution and entity extraction both normalize
+-- through this, so "Mike", "Michael" and "michael" become one graph node instead
+-- of three. Without it, cross-year spelling consistency depends on the LLM
+-- re-picking the same string every time, which it will not.
+CREATE TABLE IF NOT EXISTS people (
+    canonical   TEXT PRIMARY KEY,
+    role        TEXT,               -- optional: "PM", "engineering", "customer"
+    notes       TEXT,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS person_aliases (
+    alias       TEXT PRIMARY KEY,   -- lowercased for case-insensitive matching
+    canonical   TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (canonical) REFERENCES people(canonical) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_person_aliases_canonical ON person_aliases(canonical);
+
+-- Entities and relations emitted by the minutes compiler. Kept in the manifest as
+-- well as in the indexed document so they survive independently of LightRAG - the
+-- corpus must never be hostage to the index.
+CREATE TABLE IF NOT EXISTS entities (
+    meeting_id  TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    kind        TEXT,               -- person | feature | customer | release | other
+    description TEXT,
+    PRIMARY KEY (meeting_id, name),
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
+
+CREATE TABLE IF NOT EXISTS relations (
+    meeting_id  TEXT NOT NULL,
+    subject     TEXT NOT NULL,
+    predicate   TEXT NOT NULL,
+    object      TEXT NOT NULL,
+    PRIMARY KEY (meeting_id, subject, predicate, object),
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_relations_subject ON relations(subject);
+
 -- Inbox files already seen, keyed by identity rather than content. Lets ingest
 -- skip hashing a file it has already hashed: the inbox is never emptied (it is a
 -- synced folder), so by year five a nightly run would otherwise re-read ~165 GB
@@ -378,6 +423,183 @@ def known_speaker_names(conn: sqlite3.Connection, limit: int = 50) -> list[str]:
         (limit,),
     ).fetchall()
     return [r["name"] for r in rows]
+
+
+# ── People registry ───────────────────────────────────────────────────
+#
+# The point of this table is determinism. Asking a model to spell a name the same
+# way it did four months ago is not a reliable strategy, and every variant it
+# invents becomes a separate node in the knowledge graph.
+
+def add_person(
+    conn: sqlite3.Connection,
+    canonical: str,
+    aliases: list[str] | None = None,
+    role: str | None = None,
+) -> None:
+    """Register a canonical name and any aliases that should map to it.
+
+    The canonical name is always registered as an alias of itself, so lookup has
+    a single code path.
+    """
+    canonical = canonical.strip()
+    if not canonical:
+        return
+    ts = now_iso()
+    conn.execute(
+        """
+        INSERT INTO people (canonical, role, created_at) VALUES (?, ?, ?)
+        ON CONFLICT(canonical) DO UPDATE SET role = COALESCE(?, role)
+        """,
+        (canonical, role, ts, role),
+    )
+    for alias in {canonical, *(aliases or [])}:
+        cleaned = alias.strip().lower()
+        if cleaned:
+            conn.execute(
+                """
+                INSERT INTO person_aliases (alias, canonical, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(alias) DO UPDATE SET canonical = ?
+                """,
+                (cleaned, canonical, ts, canonical),
+            )
+
+
+def canonical_name(conn: sqlite3.Connection, name: str | None) -> str | None:
+    """Map any known alias to its canonical spelling.
+
+    Unknown names pass through unchanged rather than being rejected: a new person
+    appearing in a meeting is normal, and silently dropping them would be worse
+    than an unnormalized spelling.
+    """
+    if not name:
+        return name
+    row = conn.execute(
+        "SELECT canonical FROM person_aliases WHERE alias = ?", (name.strip().lower(),)
+    ).fetchone()
+    return row["canonical"] if row else name.strip()
+
+
+def list_people(conn: sqlite3.Connection) -> list[dict[str, object]]:
+    """Every canonical person with their aliases and meeting count."""
+    rows = conn.execute(
+        """
+        SELECT p.canonical, p.role,
+               (SELECT GROUP_CONCAT(a.alias, ', ') FROM person_aliases a
+                 WHERE a.canonical = p.canonical AND a.alias != LOWER(p.canonical)
+               ) AS aliases,
+               (SELECT COUNT(DISTINCT s.meeting_id) FROM speakers s
+                 WHERE s.name = p.canonical) AS meetings
+        FROM people p
+        ORDER BY meetings DESC, p.canonical
+        """
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def merge_person(conn: sqlite3.Connection, from_name: str, into: str) -> int:
+    """Fold one person into another, rewriting existing rows.
+
+    For when the same human was recorded under two names before the registry knew
+    about it. Returns the number of speaker rows rewritten.
+    """
+    from_name, into = from_name.strip(), into.strip()
+    if not from_name or not into or from_name == into:
+        return 0
+
+    add_person(conn, into, aliases=[from_name])
+    cursor = conn.execute(
+        "UPDATE speakers SET name = ? WHERE name = ?", (into, from_name)
+    )
+    # Historic entities and relations must move too, or the graph keeps both nodes.
+    conn.execute("UPDATE entities SET name = ? WHERE name = ?", (into, from_name))
+    conn.execute("UPDATE relations SET subject = ? WHERE subject = ?", (into, from_name))
+    conn.execute("UPDATE relations SET object = ? WHERE object = ?", (into, from_name))
+    conn.execute(
+        "UPDATE person_aliases SET canonical = ? WHERE canonical = ?", (into, from_name)
+    )
+    conn.execute("DELETE FROM people WHERE canonical = ?", (from_name,))
+    return cursor.rowcount
+
+
+# ── Entities and relations ────────────────────────────────────────────
+
+def replace_entities(
+    conn: sqlite3.Connection,
+    meeting_id: str,
+    entities: list[dict[str, str]],
+    relations: list[dict[str, str]],
+) -> None:
+    """Store a meeting's emitted entities and relations, replacing any prior set.
+
+    Replace rather than append: a recompile must not leave the previous run's
+    entities behind, for the same reason re-indexing deletes before inserting.
+    """
+    conn.execute("DELETE FROM entities WHERE meeting_id = ?", (meeting_id,))
+    conn.execute("DELETE FROM relations WHERE meeting_id = ?", (meeting_id,))
+
+    for entity in entities:
+        name = (entity.get("name") or "").strip()
+        if not name:
+            continue
+        conn.execute(
+            """
+            INSERT INTO entities (meeting_id, name, kind, description)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(meeting_id, name) DO UPDATE SET kind = ?, description = ?
+            """,
+            (
+                meeting_id, name, entity.get("kind"), entity.get("description"),
+                entity.get("kind"), entity.get("description"),
+            ),
+        )
+
+    for relation in relations:
+        subject = (relation.get("subject") or "").strip()
+        predicate = (relation.get("predicate") or "").strip()
+        obj = (relation.get("object") or "").strip()
+        if not (subject and predicate and obj):
+            continue
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO relations (meeting_id, subject, predicate, object)
+            VALUES (?, ?, ?, ?)
+            """,
+            (meeting_id, subject, predicate, obj),
+        )
+
+
+def get_entities(conn: sqlite3.Connection, meeting_id: str) -> list[dict[str, object]]:
+    rows = conn.execute(
+        "SELECT name, kind, description FROM entities WHERE meeting_id = ? ORDER BY name",
+        (meeting_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_relations(conn: sqlite3.Connection, meeting_id: str) -> list[dict[str, object]]:
+    rows = conn.execute(
+        """
+        SELECT subject, predicate, object FROM relations
+        WHERE meeting_id = ? ORDER BY subject, predicate, object
+        """,
+        (meeting_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def entity_mentions(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, object]]:
+    """Most-mentioned entities across the corpus, for `pipeline entities`."""
+    rows = conn.execute(
+        """
+        SELECT name, kind, COUNT(DISTINCT meeting_id) AS meetings
+        FROM entities GROUP BY name, kind
+        ORDER BY meetings DESC, name LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ── Seen-file cache ───────────────────────────────────────────────────

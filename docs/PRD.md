@@ -1,7 +1,7 @@
 # PRD — Meeting Minutes Compiler
 
-**Status:** implemented, not yet run on real data
-**Last updated:** 2026-08-12 (post adversarial review)
+**Status:** implemented and review-complete; not yet run on real data
+**Last updated:** 2026-08-12 (all 20 review findings addressed)
 
 ## Problem
 
@@ -90,10 +90,11 @@ them:
 | ~5 meetings/day, indefinitely | Postgres storage from day one; ~9k documents within two years |
 | Sensitive business content | Loopback binding, local models, no cloud index |
 
-**The most important consequence:** subscriptions serve one high-value call per
-meeting (the minutes compile), but LightRAG needs an HTTP endpoint for its many
-extraction calls, so the most quality-sensitive step in retrieval is capped by a
-small local model. This is the central open tension in the design — see
+**The most important consequence:** subscriptions cannot serve LightRAG, which needs
+an HTTP endpoint, so its extraction runs on a small local model. Two jobs were
+therefore moved to where the subscription does reach — the compiler emits the graph
+explicitly (D17) and synthesis is split from retrieval (D18). What remains local is
+graph traversal. See
 [ARCHITECTURE.md](ARCHITECTURE.md#the-subscription-ceiling).
 
 ## Success criteria
@@ -129,9 +130,16 @@ rate by 10–20 points; model choice moves it by less than one.
 
 ## Open questions
 
-- Does `large-v3-turbo` lose accuracy that matters on real far-field meeting
-  audio? Only measurement on actual recordings answers this.
-- Is a 4B local model adequate for graph extraction, or does the subscription
-  ceiling force compiler-emitted entities?
+Only answerable with real data on real hardware. `pipeline doctor` confirms the
+environment; none of these are environment questions.
+
+- Does `large-v3-turbo` lose accuracy that matters on real far-field meeting audio?
+  Measure on one recording, counting errors only on names, product terms, numbers
+  and dates.
+- Is graph traversal on a 4B local model good enough once entities are supplied
+  explicitly? Compiler-emitted entities (D17) removed the identification half of
+  this; the traversal half is untested.
+- What is query latency at ~9k documents? `--timing` instruments it; the corpus is
+  empty so far.
 - Are meetings in-person or virtual? Virtual would make Google Meet's Drive
   recordings (which *do* have an API) a better capture path than the phone.

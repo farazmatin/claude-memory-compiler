@@ -1,11 +1,15 @@
 # Adversarial Review — Findings & Status
 
 Review of the initial implementation across architecture, code, design, features,
-scalability and deployment. Kept in the repo because the *open* section is the
-honest state of the system, and because a finding with its reasoning attached is
-worth more than a fixed line of code with neither.
+scalability and deployment. Kept in the repo because a finding with its reasoning
+attached is worth more than a fixed line of code with neither, and because the
+residual-risk section is the honest state of the system.
 
-**Reviewed:** 2026-08-12 · **Findings:** 20 · **Fixed:** 14 · **Open:** 6
+**Reviewed:** 2026-08-12 · **Findings:** 20 · **Addressed:** 20 · **Open:** 0
+
+All twenty findings have been worked. Two carry residual caveats that code cannot
+remove — see [Residual risk](#residual-risk). Nothing here is a to-do list any
+more; it is the record of what was wrong and what was done about it.
 
 ---
 
@@ -40,7 +44,7 @@ occurs on a failed delete.
 
 | # | Finding | Fix |
 |---|---|---|
-| W1 | Tests lived in a scratchpad, uncommitted. | 102 tests in `tests/`, each regression test naming the failure it prevents. |
+| W1 | Tests lived in a scratchpad, uncommitted. | 165 tests in `tests/`, each regression test naming the failure it prevents. |
 | W2 | No CI — tests only ran when someone remembered. | GitHub Actions on push and PR: pytest + ruff. |
 | W3 | `whisperx>=3.1.1` unpinned upward, though its diarization API moves between releases. | Capped below 4. |
 | W4 | Ruff ruleset unpinned — a release could add rules and break CI on an unrelated push. | Explicit `select` list, with documented ignores. |
@@ -54,60 +58,123 @@ inline.
 
 ---
 
-## Open
+## Previously open — now addressed
 
-Not fixed. Each carries why it was deferred rather than merely being listed.
+These were deferred in the first pass and have since been built. Each notes what
+code cannot fix.
 
-### O1 — The subscription ceiling (architectural)
+### O1 — The subscription ceiling ✔ mitigated
 
-No subscription can serve LightRAG, which needs an HTTP endpoint, and none offers
-an embedding model. So graph and entity extraction — the most quality-sensitive
-step in retrieval — is permanently capped by a ~4B local model on CPU.
+No subscription can serve LightRAG (it needs an HTTP endpoint) and none offers an
+embedding model, so graph extraction runs on a ~4B local model on CPU. That
+constraint is permanent. Both designed mitigations are now built:
 
-Two designed mitigations: have the subscription-backed compiler emit entities *and
-relations* for deterministic indexing, and split retrieval from synthesis
-(`index.query_context()` is already the hook). Deferred because both are
-meaningful work and neither is knowable as necessary until the local model's
-extraction quality has been observed on real minutes.
+**O1a — the compiler emits the graph.** `pipeline/entities.py` parses explicit
+`Entities` and `Relations` sections from the minutes, canonicalizes person names
+through the people registry, stores them in the manifest, and appends a normalized
+block to the indexed document. The reasoning: a small model reads
+`Atlas (feature): the platform rewrite` reliably and discovers the same fact from
+narrative prose unreliably. The frontier model that compiles the minutes now does
+that work once, and the local model only has to read it.
 
-### O2 — Nothing verified against real infrastructure
+The parser is deliberately tolerant of shape (`-` bullets, `[]` brackets, `->`/`→`/`|`
+arrows, missing descriptions) because models produce all of those for one
+instruction, and recovering most of a messy block beats discarding all of a
+slightly-malformed one.
 
-ASR, diarization, LightRAG, Postgres, and both CLI providers are **unrun**. The 102
-tests cover logic; there is no integration coverage. Specifically unverified:
-`gemini -p -` and `codex exec -` invocations, the LightRAG delete endpoint shape,
-and whether `only_need_context` is exposed by the server.
+**O1b — retrieval and synthesis are split.** `pipeline/answer.py` retrieves via
+LightRAG and hands the context to the subscription chain to write the answer.
+`--local` keeps LightRAG's own generation for comparison, and it is the automatic
+fallback when no provider is reachable — an answer from the small model beats no
+answer. Empty retrieval short-circuits rather than asking a model to answer from
+nothing, which is how a knowledge base starts inventing.
 
-Mitigated rather than fixed: CLI binaries and arguments are env-overridable, the
-delete path tries two endpoint shapes, and `query_context` degrades to `""`.
+*Residual:* the manifest copy of entities means the corpus is no longer dependent on
+LightRAG's extraction quality, but graph *traversal* still happens inside LightRAG.
 
-### O3 — Speaker identity is per-meeting
+### O2 — Verification ✔ made possible, not completed
 
-No voiceprints, no global registry. Cross-year spelling consistency depends on the
-resolver re-picking the same name from `known_speaker_names`. Inconsistent
-spellings fragment graph entities. pyannote emits speaker embeddings, so a
-persistent registry is feasible — deferred as a larger feature than the review's
-scope.
+`pipeline doctor` runs 18 checks: ffmpeg/ffprobe, whisperx importability, the ASR
+model against the device, **HF token plus actual gated-model reachability**, every
+provider in the chain, LightRAG health and whether its storage backend is
+file-based, Ollama models, directories, disk headroom, manifest state, and glossary
+depth. Each failure carries the fix.
 
-### O4 — Query latency at scale is unmeasured
+The gated-model check matters most: a token proves nothing about licence acceptance,
+which is the part people miss, and missing diarization costs every action item its
+owner while printing only a warning nobody reads mid-batch.
 
-`global`-mode traversal over 50-150k entities with CPU-bound generation could take
-minutes per question. A knowledge base you wait three minutes for is one you stop
-using. Postgres (C4) addresses storage but not generation speed; the
-retrieval/synthesis split (O1) is the real fix. Unmeasurable until the corpus is
-large.
+*Residual, and it cannot be closed by code:* `doctor` verifies the environment is
+ready. It does not verify the output is good. Transcription accuracy, diarization
+quality and graph usefulness require running one real meeting and reading the
+result. The CLI invocations (`gemini -p -`, `codex exec -`) and the LightRAG delete
+endpoint shape remain unconfirmed against live services; all are env-overridable or
+try multiple shapes.
 
-### O5 — Diarization degrades on large meetings
+### O3 — Speaker identity ✔ made deterministic
 
-No `min_speakers` / `max_speakers` hint is passed, and pyannote degrades on
-overlapping speech and high speaker counts. Sortformer v2 and DiariZen benchmark
-better on meeting audio but are GPU-oriented. Deferred pending measurement on real
-recordings.
+A `people` table with `person_aliases` now normalizes every resolved name.
+`db.canonical_name()` maps any known alias to one canonical spelling; the resolver
+normalizes before persisting and registers new people for next time.
+`pipeline people --merge Mike Michael` folds a duplicate and **rewrites history** —
+speakers, entities, and both ends of every relation — because leaving those behind
+keeps two graph nodes for one person.
 
-### O6 — No failure alerting
+Unknown names pass through unchanged rather than being rejected: a new person
+appearing is normal, and dropping them would be worse than an unnormalized spelling.
 
-`pipeline run` now exits non-zero (B1), but nothing *notifies*. Cron mails output by
-default on many systems, which may suffice; if not, this needs a push or email hook.
-Deferred because the fix depends on how the server is actually operated.
+*Residual:* still no voiceprints. This makes spelling deterministic, not
+identification automatic. pyannote emits speaker embeddings, so voiceprint matching
+remains a feasible extension.
+
+### O4 — Query latency ✔ made measurable
+
+`pipeline query --timing` reports retrieval and synthesis separately, so when
+queries get slow the number says which phase is responsible. The split itself (O1b)
+also decouples answer generation from CPU-bound local inference, which was the
+larger part of the projected latency.
+
+*Residual:* actual latency at 9k documents remains unmeasured because the corpus is
+empty. The instrumentation is what was missing; the measurement needs data.
+
+### O5 — Diarization on large meetings ✔ bounded
+
+`MMC_MIN_SPEAKERS` / `MMC_MAX_SPEAKERS` are passed to pyannote when set, with a
+`TypeError` fallback for versions that do not accept them. `Transcript.diarization_warning`
+flags an implausible speaker count (>8 by default) as likely over-segmentation, and
+zero speakers as "action items will have no owners". Surfaced rather than corrected:
+the fix is a bound or a better microphone, not a guess.
+
+*Residual:* Sortformer v2 and DiariZen benchmark better on meeting audio but are
+GPU-oriented, so they stay out of a CPU-only deployment.
+
+### O6 — Failure alerting ✔ built
+
+`MMC_ALERT_COMMAND` is invoked when the nightly batch fails, with the summary on
+**stdin** and `{subject}` substituted. Deliberately a command rather than built-in
+email or webhook support: whatever the server already has (`mail`, `curl` to ntfy,
+`systemd-cat`) beats a second notification stack to configure and maintain.
+
+The summary names the failed stages, includes crash detail, points at
+`status`/`doctor`/`retry`, and states that nothing is lost — a 3am alert should not
+imply data loss when stages are resumable. Alert delivery never raises: an alerting
+failure masking the pipeline failure it reports would be strictly worse than no
+alert.
+
+---
+
+## Residual risk
+
+Two things remain true that no amount of code changes:
+
+1. **Nothing has been run against real audio, real LightRAG, or the real CLIs.**
+   165 tests cover logic. `pipeline doctor` will tell you the environment is sound.
+   Neither tells you the minutes are any good. That requires one real meeting, read
+   against the audio, counting errors only on names, product terms, numbers and
+   dates.
+2. **Graph traversal quality is still bounded by a small local model.** O1a moves
+   entity *identification* upstream to a frontier model, which is the larger half of
+   the problem, but the traversal that answers a question still runs locally.
 
 ---
 

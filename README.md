@@ -76,16 +76,26 @@ Set the order with `MMC_LLM_PROVIDERS=gemini,codex,claude`. A quota limit or CLI
 hiccup on the preferred provider falls through to the next rather than stalling a
 batch that already paid for transcription.
 
-**The consequence worth understanding:** your subscriptions can't reach LightRAG's
-extraction step, so graph quality is capped by a small local model on CPU. Two
-mitigations, both open: have the minutes compiler emit explicit entities and
-relations for deterministic indexing, and split retrieval from synthesis so the
-local model retrieves while a subscription writes the answer.
+**The constraint worth understanding, and how it's handled.** Your subscriptions
+can't reach LightRAG's extraction step — it needs an HTTP endpoint, and no
+subscription offers embeddings at all. So two jobs were moved to where the
+subscription *does* reach:
+
+- **The compiler emits the graph.** Minutes include explicit `Entities` and
+  `Relations` sections, written by the frontier model, stored in the manifest, and
+  handed to the index pre-stated. A small model reads an explicit list reliably and
+  discovers the same facts from prose unreliably.
+- **Synthesis is split from retrieval.** LightRAG retrieves; the subscription chain
+  writes the answer. `--local` keeps LightRAG's own generation for comparison, and
+  it's the automatic fallback when no provider is reachable.
+
+What remains local is graph traversal. That's narrowed, not eliminated.
 
 ## Commands
 
 ```bash
 pipeline init                     # create directories and the manifest
+pipeline doctor                   # preflight the environment (run this first)
 pipeline ingest                   # discover + dedup new audio
 pipeline transcribe               # ASR + alignment + diarization  (the slow one)
 pipeline speakers --owner "Name"  # resolve SPEAKER_00 → real names
@@ -95,6 +105,10 @@ pipeline run                      # every pending stage, in order
 pipeline status                   # where everything is, plus real stage timings
 pipeline query "question"         # ask the knowledge base
 pipeline query "..." --mode global   # for answers spanning many meetings
+pipeline query "..." --timing     # retrieval vs synthesis time
+pipeline people                   # the people registry
+pipeline people --merge Mike Michael   # fold a duplicate, rewriting history
+pipeline entities                 # most-mentioned entities (graph health check)
 pipeline minutes --recompile      # rebuild after a template change, no ASR cost
 pipeline backup --to /mnt/backup  # snapshot everything irreplaceable
 pipeline retry                    # requeue whatever failed
@@ -145,6 +159,24 @@ filesystem watcher, or runs will overlap:
 `pipeline status` prints measured per-stage timings so you can check the table
 above against your actual hardware.
 
+## Preflight
+
+```bash
+pipeline doctor
+```
+
+18 checks: ffmpeg, whisperx, the ASR model against your device, **HF token plus
+actual gated-model reachability**, every provider in the chain, LightRAG health and
+whether its storage is file-based, Ollama models, directories, disk headroom,
+manifest state, glossary depth. Each failure prints its fix.
+
+The gated-model check earns its place: a HuggingFace token proves nothing about
+licence acceptance, which is the part people miss, and missing diarization costs
+every action item its owner while printing only a warning mid-batch.
+
+**What it does not tell you:** whether the output is good. That needs one real
+meeting, read against the audio.
+
 ## Prerequisites
 
 - **ffmpeg** on `PATH` (audio normalization and duration probing)
@@ -187,6 +219,20 @@ written alongside it. The LightRAG index is deliberately **not** backed up — i
 derived from `minutes/` and rebuilt with `pipeline index`.
 
 Add it to the nightly timer after `run`.
+
+## When the batch fails
+
+`pipeline run` exits non-zero, but on a headless server nothing reads cron's mail.
+Set `MMC_ALERT_COMMAND` and a failure pushes a summary somewhere you'll see it:
+
+```bash
+MMC_ALERT_COMMAND=curl -s -d @- https://ntfy.sh/my-topic
+MMC_ALERT_COMMAND=mail -s "{subject}" me@example.com
+```
+
+The summary arrives on stdin with `{subject}` substituted, names the failed stages,
+and points at `status` / `doctor` / `retry`. A command rather than built-in email
+support because whatever your server already has beats a second notification stack.
 
 ## Tests
 
@@ -257,6 +303,11 @@ original recording.
 **Unresolved speakers stay unresolved.** The resolver won't guess a name from a
 filename alone. A visible `SPEAKER_01` is fixable; a confidently wrong name
 silently assigns work to the wrong person.
+
+**Names are normalized, not trusted.** A people registry maps aliases to one
+canonical spelling, because asking a model to spell a name the same way it did four
+months ago isn't a strategy — and each variant becomes a separate graph node. Curate
+it with `pipeline people`.
 
 **ASR sits behind a `Backend` protocol.** Swapping in a paid API or a GPU model
 touches one class and nothing downstream — the designed escape hatch from the CPU

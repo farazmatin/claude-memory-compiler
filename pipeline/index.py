@@ -113,10 +113,18 @@ def delete_document(doc_id: str) -> bool:
     return False
 
 
-def replace_minutes(path: Path, previous_doc_id: str | None) -> tuple[str, bool]:
+def replace_minutes(
+    path: Path, previous_doc_id: str | None, augment: str = ""
+) -> tuple[str, bool]:
     """Index a minutes file, replacing any previously indexed version.
 
     Returns (doc_id, replaced_cleanly).
+
+    `augment` is appended to the indexed text but never written to the file on
+    disk. It carries the canonicalized entity and relation block from the manifest:
+    the file keeps what the compiler actually wrote, while the index gets names
+    normalized through the people registry. Since it is derived deterministically
+    from the manifest, the document id stays stable.
 
     The recompile path depends on this. Inserting a recompiled document without
     deleting its predecessor leaves both copies in the graph, so every entity and
@@ -124,7 +132,7 @@ def replace_minutes(path: Path, previous_doc_id: str | None) -> tuple[str, bool]
     starts returning contradictory duplicates. That would quietly invalidate the
     whole reason transcripts are retained.
     """
-    text = path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8") + augment
     doc_id = compute_doc_id(text)
 
     if previous_doc_id and previous_doc_id == doc_id:
