@@ -238,24 +238,40 @@ support because whatever your server already has beats a second notification sta
 
 ```bash
 uv sync --extra dev
-uv run pytest
+sudo apt-get install ffmpeg   # functional tests generate real audio
+
+uv run pytest                 # everything
+uv run pytest -m "not e2e"    # unit only, <1s
+uv run pytest -m e2e          # functional only
 ```
 
-102 tests, no network and no model calls, under half a second. CI runs them plus
-ruff on every push. Regression tests name the failure they prevent, so the reasoning
-survives refactoring.
+**187 tests in two layers**, both gating CI:
 
-**What is not covered:** ASR, LightRAG, Postgres, and the Gemini/Codex CLI
-invocations have never been run. The suite covers logic, not integration — see
-[docs/REVIEW.md](docs/REVIEW.md#o2--nothing-verified-against-real-infrastructure).
+- **165 unit tests** — functions in isolation, no network, under a second.
+- **22 functional tests** — drive the real CLI end to end over a throwaway tree
+  with real audio, real ffmpeg, a real SQLite manifest and real HTTP to a
+  LightRAG-shaped server. Only the ASR model, the LLM and LightRAG's internals are
+  substituted, and the LLM fake is an actual executable so the subprocess/stdin
+  provider path is genuinely exercised.
+
+The functional layer earns its keep: it caught two bugs the unit suite could not
+see, including one where the nightly batch reported success after a total
+transcription failure. Details in
+[docs/TESTING.md](docs/TESTING.md).
+
+**Still not covered:** real Whisper, real pyannote, real LightRAG, real Postgres,
+and the actual `gemini`/`codex` binaries. The functional tests prove the app's own
+wiring; they cannot prove the transcript is accurate.
 
 ## Documentation
 
 | Document | For |
 |---|---|
+| [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | **Start here** — setup, daily use, troubleshooting |
 | [docs/PRD.md](docs/PRD.md) | Problem, goals, non-goals, constraints, success criteria |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions with rationale and what was rejected |
-| [docs/REVIEW.md](docs/REVIEW.md) | Adversarial review: 14 findings fixed, 6 open |
+| [docs/REVIEW.md](docs/REVIEW.md) | Adversarial review: 20 findings, all addressed |
+| [docs/TESTING.md](docs/TESTING.md) | Test strategy and what each layer covers |
 | [AGENTS.md](AGENTS.md) | Operational reference — env vars, stage internals, gotchas |
 
 Two upstream bugs are already worked around in `docker-compose.yml`: Ollama is

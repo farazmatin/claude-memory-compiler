@@ -24,8 +24,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from pipeline import index
-from pipeline.llm import LLMError, complete, last_provider
+from pipeline import index, llm
+from pipeline.llm import LLMError, complete
 
 
 @dataclass
@@ -125,7 +125,7 @@ def ask(
             text=text,
             retrieval_sec=retrieval_sec,
             synthesis_sec=synthesis_sec,
-            provider=last_provider,
+            provider=llm.last_provider,
             context_chars=len(context),
             synthesized=True,
         )

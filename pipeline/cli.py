@@ -362,8 +362,13 @@ def _run_all(args: argparse.Namespace, include_ingest: bool = True) -> int:
     if include_ingest:
         stages.append(("ingest", cmd_ingest, argparse.Namespace(then_run=False)))
     stages += [
+        # keep_going stays False here. It means "exit 0 despite failures", which is
+        # only ever an interactive convenience — inside the nightly batch it would
+        # hide a total transcription failure behind a success exit code, which is
+        # the very thing this function exists to prevent. Continuing past one bad
+        # file is separate and unconditional: the per-meeting try/except does it.
         ("transcribe", cmd_transcribe, argparse.Namespace(
-            limit=args.limit, keep_going=True, traceback=False)),
+            limit=args.limit, keep_going=False, traceback=False)),
         ("speakers", cmd_speakers, argparse.Namespace(
             limit=args.limit, owner=getattr(args, "owner", None),
             no_llm=args.no_llm, traceback=False)),
@@ -560,7 +565,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_common(p_transcribe)
     p_transcribe.add_argument(
-        "--keep-going", action="store_true", help="exit 0 even if some files failed"
+        "--keep-going", action="store_true",
+        help="exit 0 even if some files failed (interactive use only; the batch "
+             "never sets this, or a total failure would look like success)",
     )
     p_transcribe.set_defaults(func=cmd_transcribe)
 

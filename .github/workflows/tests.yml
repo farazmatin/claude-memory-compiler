@@ -15,13 +15,25 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Install ffmpeg
+        # Required by the functional tests: they generate real audio and exercise
+        # the real normalization and duration-probing paths.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
       - name: Install
-        # Core + dev only. The `asr` extra pulls torch and CUDA libraries and is
-        # not needed: the suite never loads a model or touches the network.
+        # Core + dev only. The `asr` extra pulls torch and CUDA libraries; the
+        # functional tests substitute a Backend implementation instead, which also
+        # proves that seam works.
         run: uv sync --extra dev
 
-      - name: Test
-        run: uv run pytest
+      - name: Unit tests
+        run: uv run pytest -m "not e2e"
+
+      - name: Functional tests
+        # Drive the real CLI end to end: real audio, real ffmpeg, real manifest,
+        # real HTTP to a LightRAG-shaped server. These caught a bug the unit suite
+        # could not see, so they gate merges too.
+        run: uv run pytest -m e2e
 
       - name: Lint
         run: uv run --with ruff ruff check pipeline tests

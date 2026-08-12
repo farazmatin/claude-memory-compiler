@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pipeline import alert, answer, index
+from pipeline import alert, answer, index, llm
 from pipeline.llm import LLMError
 
 # ── retrieval + synthesis ─────────────────────────────────────────────
@@ -11,10 +11,11 @@ def test_local_model_retrieves_and_subscription_writes(monkeypatch):
     """The whole point of the split: each job on the right model."""
     monkeypatch.setattr(index, "query_context", lambda *a, **k: "RETRIEVED CONTEXT")
     monkeypatch.setattr(answer, "complete", lambda prompt: f"answered from: {prompt[-30:]}")
-    monkeypatch.setattr(answer, "last_provider", "gemini")
+    monkeypatch.setattr(llm, "last_provider", "gemini")
 
     result = answer.ask("why did we defer Atlas?")
 
+    assert result.provider == "gemini", "must report which provider actually answered"
     assert result.synthesized is True
     assert result.context_chars == len("RETRIEVED CONTEXT")
     assert "answered from" in result.text
@@ -73,7 +74,7 @@ def test_timing_is_reported_per_phase(monkeypatch):
     """Latency at scale must be attributable: traversal or generation?"""
     monkeypatch.setattr(index, "query_context", lambda *a, **k: "context")
     monkeypatch.setattr(answer, "complete", lambda prompt: "answer")
-    monkeypatch.setattr(answer, "last_provider", "codex")
+    monkeypatch.setattr(llm, "last_provider", "codex")
 
     result = answer.ask("q")
     line = result.timing_line()
