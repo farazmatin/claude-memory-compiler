@@ -3,6 +3,11 @@
 Complete technical reference. Written so an agent (or a person) can understand,
 modify, or rebuild this system without reading every source file.
 
+Companion documents: [docs/PRD.md](docs/PRD.md) for goals and scope,
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for design decisions and what was
+rejected, [docs/REVIEW.md](docs/REVIEW.md) for the adversarial review and the six
+findings still open.
+
 ## The compiler analogy
 
 ```
@@ -317,6 +322,26 @@ calls, and reloading weights between them otherwise dominates runtime.
 
 Total marginal cost per meeting is electricity. The tradeoff is a ~4 hour nightly
 batch, which is why `pipeline run` belongs on a timer rather than a file watcher.
+
+## Backup and restore
+
+`pipeline backup --to PATH`. Priority order reflects what is actually
+irreplaceable:
+
+1. `transcripts/` — immutable source; everything downstream rebuilds from these
+   without re-running ASR.
+2. `audio/` — recreates transcripts, but only at 30-50 CPU-minutes each.
+3. `minutes/` — rebuildable from transcripts, at the cost of LLM quota.
+4. `db/manifest.db` — rebuildable in principle, painful in practice.
+
+Uses `sqlite3.Connection.backup()` plus an integrity check, **not** a file copy: a
+copy of a live database can capture a torn page or miss the WAL, producing a
+snapshot that restores as corrupt. Tree sync is incremental on size+mtime, and
+nothing is ever deleted from the destination — a file vanishing from the source is
+precisely when the copy matters.
+
+`rag_storage/` and the Postgres volume are deliberately excluded. The index is
+derived; `pipeline index` rebuilds it.
 
 ## Extending
 

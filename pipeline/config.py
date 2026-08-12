@@ -102,6 +102,14 @@ MINUTES_TARGET_WORDS_MAX = 1200
 # that reverse earlier positions.
 PRIOR_CONTEXT_DOCS = 3
 
+# Ceiling on the dialogue portion of the minutes prompt. A one-hour meeting is
+# ~13k tokens and fits comfortably; a three-hour one does not. Over budget, the
+# compiler switches to map-reduce rather than failing or silently truncating.
+MINUTES_PROMPT_TOKEN_BUDGET = int(os.environ.get("MMC_MINUTES_TOKEN_BUDGET", "60000"))
+
+# Window size for the map pass, in tokens of dialogue.
+MINUTES_MAP_WINDOW_TOKENS = int(os.environ.get("MMC_MINUTES_MAP_WINDOW", "20000"))
+
 # ── LightRAG ──────────────────────────────────────────────────────────
 LIGHTRAG_URL = os.environ.get("MMC_LIGHTRAG_URL", "http://localhost:9621")
 LIGHTRAG_API_KEY = os.environ.get("MMC_LIGHTRAG_API_KEY", "")

@@ -96,8 +96,12 @@ pipeline status                   # where everything is, plus real stage timings
 pipeline query "question"         # ask the knowledge base
 pipeline query "..." --mode global   # for answers spanning many meetings
 pipeline minutes --recompile      # rebuild after a template change, no ASR cost
+pipeline backup --to /mnt/backup  # snapshot everything irreplaceable
 pipeline retry                    # requeue whatever failed
 ```
+
+`pipeline run` exits **non-zero if any stage failed**, so a nightly cron reports a
+broken batch instead of silently succeeding.
 
 Each stage claims meetings at one status and advances them to the next, tracked in
 `db/manifest.db`. Stages are independent and resumable — a crash during minutes
@@ -167,6 +171,23 @@ ssh -L 9621:127.0.0.1:9621 user@server
 `MMC_LIGHTRAG_API_KEY` is required and enforced — `docker compose` fails fast if
 it's unset rather than starting something open.
 
+## Backup
+
+The corpus is not in git, and it is not reconstructible from anything else.
+
+```bash
+pipeline backup --to /mnt/backup            # everything
+pipeline backup --to /mnt/backup --no-audio # skip the bulkiest tier
+```
+
+Uses SQLite's online backup API rather than a file copy, because copying a live
+database can capture a torn page and produce a snapshot that restores as corrupt.
+The snapshot is integrity-checked, and a `BACKUP_INFO.txt` with restore steps is
+written alongside it. The LightRAG index is deliberately **not** backed up — it is
+derived from `minutes/` and rebuilt with `pipeline index`.
+
+Add it to the nightly timer after `run`.
+
 ## Tests
 
 ```bash
@@ -174,9 +195,22 @@ uv sync --extra dev
 uv run pytest
 ```
 
-46 tests, no network and no model calls, runs in under a second. Several encode
-defects found in review — same-day prior-context windowing, recompile skipping
-speaker resolution, replace-on-reindex — and name the failure they prevent.
+102 tests, no network and no model calls, under half a second. CI runs them plus
+ruff on every push. Regression tests name the failure they prevent, so the reasoning
+survives refactoring.
+
+**What is not covered:** ASR, LightRAG, Postgres, and the Gemini/Codex CLI
+invocations have never been run. The suite covers logic, not integration — see
+[docs/REVIEW.md](docs/REVIEW.md#o2--nothing-verified-against-real-infrastructure).
+
+## Documentation
+
+| Document | For |
+|---|---|
+| [docs/PRD.md](docs/PRD.md) | Problem, goals, non-goals, constraints, success criteria |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions with rationale and what was rejected |
+| [docs/REVIEW.md](docs/REVIEW.md) | Adversarial review: 14 findings fixed, 6 open |
+| [AGENTS.md](AGENTS.md) | Operational reference — env vars, stage internals, gotchas |
 
 Two upstream bugs are already worked around in `docker-compose.yml`: Ollama is
 pinned to `0.12.11` because `0.13.x` breaks LightRAG's embeddings
@@ -243,4 +277,7 @@ Getting audio off your phone. The pipeline starts from "audio file in a
 directory," so that decision stays independent. Point `inbox/` at a synced folder,
 an rclone mount, or anything else that produces files.
 
-See **[AGENTS.md](AGENTS.md)** for the full technical reference.
+**Known open issues** are tracked honestly in
+[docs/REVIEW.md](docs/REVIEW.md#open) — including the one that matters most: no
+subscription can serve LightRAG's extraction step, so graph quality is capped by a
+small local model regardless of what you pay for.

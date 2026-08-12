@@ -166,7 +166,7 @@ class ClaudeSDKProvider:
                     for block in message.content:
                         if isinstance(block, TextBlock):
                             response += block.text
-        except Exception as exc:  # noqa: BLE001 - SDK raises varied transport errors
+        except Exception as exc:
             raise LLMError(f"{type(exc).__name__}: {exc}") from exc
 
         if not response.strip():

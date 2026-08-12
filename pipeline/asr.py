@@ -39,7 +39,6 @@ from pipeline.config import (
     TRANSCRIPTS_DIR,
 )
 
-
 # ── Transcript model ──────────────────────────────────────────────────
 
 @dataclass
@@ -293,7 +292,7 @@ class WhisperXBackend:
                 from whisperx.diarize import assign_word_speakers as assign  # type: ignore
             return assign(diarize_segments, result)
 
-        except Exception as exc:  # noqa: BLE001 - diarization must never lose a transcript
+        except Exception as exc:
             print(f"    diarization failed ({type(exc).__name__}: {exc})")
             return result
 

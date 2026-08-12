@@ -9,10 +9,10 @@ and must never be redone. Improving the minutes template later means re-running
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
 
 from pipeline.config import DB_PATH, now_iso
 
@@ -76,6 +76,18 @@ CREATE TABLE IF NOT EXISTS stage_runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_stage_runs_meeting ON stage_runs(meeting_id, stage);
+
+-- Inbox files already seen, keyed by identity rather than content. Lets ingest
+-- skip hashing a file it has already hashed: the inbox is never emptied (it is a
+-- synced folder), so by year five a nightly run would otherwise re-read ~165 GB
+-- just to rediscover known duplicates.
+CREATE TABLE IF NOT EXISTS seen_files (
+    path        TEXT PRIMARY KEY,
+    size        INTEGER NOT NULL,
+    mtime       INTEGER NOT NULL,
+    meeting_id  TEXT,               -- NULL when the file was a duplicate
+    seen_at     TEXT NOT NULL
+);
 """
 
 
@@ -114,7 +126,9 @@ class Meeting:
 
 
 def _row_to_meeting(row: sqlite3.Row) -> Meeting:
-    return Meeting(**{k: row[k] for k in row.keys()})
+    # .keys() is required here: iterating a sqlite3.Row yields VALUES, not keys,
+    # so SIM118's suggested rewrite would silently build a broken mapping.
+    return Meeting(**{k: row[k] for k in row.keys()})  # noqa: SIM118
 
 
 @contextmanager
@@ -364,6 +378,35 @@ def known_speaker_names(conn: sqlite3.Connection, limit: int = 50) -> list[str]:
         (limit,),
     ).fetchall()
     return [r["name"] for r in rows]
+
+
+# ── Seen-file cache ───────────────────────────────────────────────────
+
+def file_unchanged(conn: sqlite3.Connection, path: str, size: int, mtime: int) -> bool:
+    """True if this exact path/size/mtime has already been processed.
+
+    Identity, not content: the point is to avoid reading the file at all. A file
+    edited in place with the same size and mtime would be missed, which does not
+    happen to finished audio recordings.
+    """
+    row = conn.execute(
+        "SELECT size, mtime FROM seen_files WHERE path = ?", (path,)
+    ).fetchone()
+    return bool(row and row["size"] == size and int(row["mtime"]) == mtime)
+
+
+def mark_seen(
+    conn: sqlite3.Connection, path: str, size: int, mtime: int, meeting_id: str | None
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO seen_files (path, size, mtime, meeting_id, seen_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET
+            size = ?, mtime = ?, meeting_id = ?, seen_at = ?
+        """,
+        (path, size, mtime, meeting_id, now_iso(), size, mtime, meeting_id, now_iso()),
+    )
 
 
 # ── Stage timing ──────────────────────────────────────────────────────

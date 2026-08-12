@@ -8,10 +8,13 @@ The resolver is deliberately conservative: an unresolved label stays
 `SPEAKER_01` rather than being guessed. A visible gap is fixable; a confident
 wrong name is not.
 
-Resolution cascade, cheapest and most reliable first:
-  1. Filename hint ("Ali Aug 10 ...") when the meeting has exactly two speakers
-  2. LLM pass over the opening minutes, looking for self-introductions
-  3. Manual overrides file - always wins
+Resolution order, weakest evidence first so stronger evidence overwrites:
+  1. LLM pass over the opening minutes - reads self-introductions and who is
+     addressed by name, seeded with candidate names from the filename
+  2. Manual overrides file - ground truth, always wins
+
+The filename supplies *candidates*, never a label mapping: knowing two people were
+present does not tell you which diarization label is which.
 """
 
 from __future__ import annotations
@@ -51,7 +54,7 @@ def load_overrides(path: Path | None = None) -> dict[str, dict[str, str]]:
         import yaml
 
         data = yaml.safe_load(target.read_text(encoding="utf-8")) or {}
-    except Exception as exc:  # noqa: BLE001 - a broken override file must not halt the batch
+    except Exception as exc:
         print(f"    override file unreadable ({exc}); ignoring")
         return {}
 
@@ -84,32 +87,37 @@ def speaking_time(transcript: Transcript) -> dict[str, float]:
     return totals
 
 
-def guess_from_filename(
+def candidates_from_filename(
     transcript: Transcript, title_hint: str | None, owner_name: str | None
-) -> dict[str, str]:
-    """Use a one-name filename hint in a two-speaker meeting.
+) -> list[str]:
+    """Likely attendee names for a two-speaker meeting, WITHOUT assigning labels.
 
-    "Ali Aug 10 at 11-12 a.m." in a two-person recording means the other party is
-    Ali. Applied only when both facts hold, and only when we also know who the
-    recorder is - otherwise which label to assign is a coin flip, and a coin flip
-    is exactly what this module refuses to do.
+    "Ali Aug 10 at 11-12 a.m." in a two-speaker recording tells us the attendees
+    are probably {owner, Ali}. It does NOT tell us which diarization label is which.
+
+    An earlier version assumed the dominant speaker was the recorder. That is wrong
+    for a large share of a PM's calendar - in a stakeholder interview, a user
+    research session, or a demo, the other person talks more - and it produced
+    confidently reversed names, silently assigning action items to the wrong
+    person. It also contradicted this module's own rule against guessing.
+
+    The mapping decision therefore goes to the LLM, which can read who introduces
+    themselves and who is addressed by name. This only supplies candidates.
     """
     labels = transcript.speaker_labels
-    if not title_hint or len(labels) != 2 or not owner_name:
-        return {}
+    if len(labels) != 2:
+        return []
 
-    hint = title_hint.strip()
+    names: list[str] = []
+    if owner_name and owner_name.strip():
+        names.append(owner_name.strip())
+
+    hint = (title_hint or "").strip()
     # Multi-word hints are usually subjects ("roadmap review"), not people.
-    if not hint or len(hint.split()) > 2:
-        return {}
+    if hint and len(hint.split()) <= 2:
+        names.append(hint)
 
-    # The recorder holds the phone and typically dominates the audio.
-    totals = speaking_time(transcript)
-    if len(totals) != 2:
-        return {}
-    loudest = max(totals, key=lambda label: totals[label])
-    other = next(label for label in labels if label != loudest)
-    return {loudest: owner_name, other: hint}
+    return names
 
 
 # ── LLM resolution ────────────────────────────────────────────────────
@@ -129,10 +137,12 @@ def build_resolution_prompt(
     transcript: Transcript,
     known_names: list[str],
     title_hint: str | None,
+    candidates: list[str] | None = None,
 ) -> str:
     labels = transcript.speaker_labels
     known = ", ".join(known_names) if known_names else "(none recorded yet)"
     hint = title_hint or "(none)"
+    likely = ", ".join(candidates) if candidates else "(none)"
     return f"""You are identifying speakers in a meeting transcript.
 
 The diarization system assigned anonymous labels. Your job is to map each label
@@ -143,6 +153,12 @@ to a real person's name, using ONLY evidence in the transcript.
 
 ## Filename hint
 {hint}
+
+## Likely attendees
+Derived from the filename and configuration. These are probably the two people
+in the room, but which label is which is NOT known - decide that from the
+transcript, or return null.
+{likely}
 
 ## Names seen in previous meetings
 Prefer these exact spellings when a speaker is one of these people. Inconsistent
@@ -168,7 +184,10 @@ Return ONLY a JSON object mapping every label to a name or null. No prose.
 
 
 def resolve_with_llm(
-    transcript: Transcript, known_names: list[str], title_hint: str | None
+    transcript: Transcript,
+    known_names: list[str],
+    title_hint: str | None,
+    candidates: list[str] | None = None,
 ) -> dict[str, str]:
     """Ask the model to name the speakers. Returns only confident mappings."""
     import json
@@ -176,7 +195,7 @@ def resolve_with_llm(
     if not transcript.speaker_labels:
         return {}
 
-    prompt = build_resolution_prompt(transcript, known_names, title_hint)
+    prompt = build_resolution_prompt(transcript, known_names, title_hint, candidates)
     try:
         raw = complete(prompt)
     except LLMError as exc:
@@ -221,15 +240,13 @@ def resolve(
     resolved: dict[str, str] = {}
     confidence: dict[str, str] = {}
 
-    for label, name in guess_from_filename(
-        transcript, meeting.title_hint, owner_name
-    ).items():
-        resolved[label] = name
-        confidence[label] = CONFIDENCE_INFERRED
+    # Candidates only - the filename says who was probably present, never which
+    # label is which.
+    candidates = candidates_from_filename(transcript, meeting.title_hint, owner_name)
 
-    if use_llm and len(resolved) < len(labels):
+    if use_llm:
         for label, name in resolve_with_llm(
-            transcript, db.known_speaker_names(conn), meeting.title_hint
+            transcript, db.known_speaker_names(conn), meeting.title_hint, candidates
         ).items():
             resolved[label] = name
             confidence[label] = CONFIDENCE_INFERRED

@@ -151,6 +151,38 @@ def insert_minutes(path: Path) -> dict:
     return insert_text(path.read_text(encoding="utf-8"), file_source=path.name)
 
 
+def query_context(question: str, mode: str | None = None, top_k: int | None = None) -> str:
+    """Retrieve context for a question WITHOUT generating an answer.
+
+    Two uses. First, topical prior-decision lookup during minutes compilation -
+    retrieval is what is wanted there, not prose. Second, it is the hook for
+    splitting retrieval from synthesis: the local model retrieves, a subscription
+    writes the answer.
+
+    Returns "" rather than raising when the server is unreachable or does not
+    support the flag - a missing nice-to-have must not fail a compile.
+    """
+    payload: dict[str, object] = {
+        "query": question,
+        "mode": mode or LIGHTRAG_DEFAULT_MODE,
+        "only_need_context": True,
+    }
+    if top_k is not None:
+        payload["top_k"] = top_k
+
+    try:
+        with _client() as client:
+            response = client.post("/query", json=payload)
+            response.raise_for_status()
+            data = response.json()
+    except (httpx.HTTPError, ValueError):
+        return ""
+
+    if isinstance(data, dict):
+        return str(data.get("response") or data.get("context") or "")
+    return str(data)
+
+
 def query(question: str, mode: str | None = None, top_k: int | None = None) -> str:
     """Ask the knowledge base.
 

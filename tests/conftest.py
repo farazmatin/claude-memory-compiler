@@ -40,15 +40,27 @@ if "httpx" not in sys.modules:
         class _HTTPStatusError(_HTTPError):
             pass
 
+        class _Client:
+            """Refuses to connect, like an absent LightRAG server.
+
+            Constructing this raises HTTPError, so index calls take exactly the
+            degradation path they take in production when the server is down:
+            `query_context` returns "" and the compile continues without topical
+            prior context.
+            """
+
+            def __init__(self, *args, **kwargs):
+                raise _HTTPError("httpx stub: no server in tests")
+
         stub.HTTPError = _HTTPError
         stub.HTTPStatusError = _HTTPStatusError
-        stub.Client = object
+        stub.Client = _Client
         sys.modules["httpx"] = stub
 
-import pytest  # noqa: E402
+import pytest
 
-from pipeline import db  # noqa: E402
-from pipeline.config import ensure_dirs  # noqa: E402
+from pipeline import db
+from pipeline.config import ensure_dirs
 
 
 @pytest.fixture()

@@ -74,7 +74,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
                 avg = float(row["avg_sec"] or 0) / 60
                 mx = float(row["max_sec"] or 0) / 60
                 print(
-                    f"  {str(row['stage']):<12} {row['runs']:>5} "
+                    f"  {row['stage']!s:<12} {row['runs']:>5} "
                     f"{row['ok_runs'] or 0:>4} {avg:>8.1f}m {mx:>8.1f}m"
                 )
 
@@ -99,7 +99,8 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     counts = ingest.run()
     print(
         f"\nscanned {counts['scanned']}, ingested {counts['ingested']}, "
-        f"duplicate {counts['duplicate']}, failed {counts['failed']}"
+        f"duplicate {counts['duplicate']}, skipped {counts['skipped']}, "
+        f"failed {counts['failed']}"
     )
     if args.then_run:
         # Skip ingest inside the chain: it just ran, and re-running it would
@@ -162,7 +163,7 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
                 f"    {len(transcript.segments)} segments, "
                 f"{len(transcript.speaker_labels)} speaker(s)"
             )
-        except Exception as exc:  # noqa: BLE001 - one bad file must not kill the batch
+        except Exception as exc:
             failures += 1
             detail = f"{type(exc).__name__}: {exc}"
             print(f"    FAILED {detail}")
@@ -214,7 +215,7 @@ def cmd_speakers(args: argparse.Namespace) -> int:
                 print(f"    {summary}")
                 if unresolved:
                     print(f"    unresolved: {', '.join(unresolved)}")
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 failures += 1
                 detail = f"{type(exc).__name__}: {exc}"
                 print(f"    FAILED {detail}")
@@ -265,7 +266,7 @@ def cmd_minutes(args: argparse.Namespace) -> int:
                     template_version=TEMPLATE_VERSION,
                 )
                 print(f"    {words} words -> {path.name}")
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 failures += 1
                 detail = f"{type(exc).__name__}: {exc}"
                 print(f"    FAILED {detail}")
@@ -365,7 +366,7 @@ def _run_all(args: argparse.Namespace, include_ingest: bool = True) -> int:
         try:
             if handler(stage_args):  # type: ignore[operator]
                 failed.append(name)
-        except Exception as exc:  # noqa: BLE001 - a crashed stage must not hide the rest
+        except Exception as exc:
             failed.append(name)
             print(f"  stage crashed: {type(exc).__name__}: {exc}")
             traceback.print_exc()
@@ -389,6 +390,19 @@ def cmd_query(args: argparse.Namespace) -> int:
         print(index.query(args.question, mode=args.mode, top_k=args.top_k))
     except index.IndexError_ as exc:
         print(f"{exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    from pipeline import backup
+
+    report = backup.run(Path(args.to), include_audio=not args.no_audio)
+    print(report.summary())
+    if report.errors:
+        print(f"\n{len(report.errors)} error(s):")
+        for error in report.errors[:20]:
+            print(f"  {error}")
         return 1
     return 0
 
@@ -484,6 +498,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_query.add_argument("--top-k", type=int, default=None)
     p_query.set_defaults(func=cmd_query)
+
+    p_backup = subparsers.add_parser(
+        "backup", help="back up transcripts, minutes, audio and the manifest"
+    )
+    p_backup.add_argument("--to", required=True, help="destination directory")
+    p_backup.add_argument(
+        "--no-audio", action="store_true",
+        help="skip audio (the bulkiest tier); a restore can then rebuild from "
+             "transcripts but never re-transcribe",
+    )
+    p_backup.set_defaults(func=cmd_backup)
 
     p_retry = subparsers.add_parser("retry", help="requeue failed meetings")
     p_retry.add_argument(

@@ -33,6 +33,29 @@ pipeline = "pipeline.cli:main"
 
 [tool.ruff]
 line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# Explicit rule set, not ruff's default. An unpinned selection means a ruff
+# release can add rules and break CI on an unrelated push - the same failure mode
+# the whisperx upper bound guards against.
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "E501",    # line length is enforced by the formatter, not the linter
+    "B008",    # argparse and dataclass defaults legitimately call functions
+    # Ambiguous-unicode rules. Intended to catch accidentally pasted characters,
+    # but here en/em dashes are deliberate: filename regexes must match both
+    # "11-12" and "11–12", and prose comments use real dashes.
+    "RUF001", "RUF002", "RUF003",
+    # Hand-edited word lists (stopwords, glossary terms) read better as prose
+    # split on spaces than as a long list literal.
+    "SIM905",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests configure MMC_* environment variables before importing pipeline.config,
+# which reads them at import time. Imports therefore cannot come first.
+"tests/conftest.py" = ["E402"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
