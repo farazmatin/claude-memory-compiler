@@ -44,6 +44,8 @@ whole architecture:
 ## Quick start
 
 ```bash
+cp .env.example .env      # then fill in MMC_LIGHTRAG_API_KEY and HF_TOKEN
+
 uv sync                                  # core deps
 uv sync --extra asr                      # + whisperx (heavy: torch, CUDA libs)
 docker compose up -d                     # LightRAG + Ollama
@@ -56,13 +58,44 @@ uv run pipeline run --owner "Your Name"
 uv run pipeline query "what did we decide about pricing?"
 ```
 
-`export HF_TOKEN=hf_...` before the first run, or diarization is skipped — see
-[Prerequisites](#prerequisites).
+Both `.env` values are required: `docker compose` refuses to start without an API
+key, and diarization is silently skipped without `HF_TOKEN` — which means action
+items with no owners. See [Prerequisites](#prerequisites).
+
+## Which model does what
+
+Three LLM jobs, and they cannot all use the same provider:
+
+| Job | Provider | Why |
+|---|---|---|
+| Minutes compilation | Gemini Flash → Codex → Claude | Subscription-backed, tried in order, falls through on failure |
+| Speaker resolution | same chain | ditto |
+| Graph & entity extraction | **local Ollama** | LightRAG needs an HTTP endpoint; no CLI subscription can serve one |
+
+Set the order with `MMC_LLM_PROVIDERS=gemini,codex,claude`. A quota limit or CLI
+hiccup on the preferred provider falls through to the next rather than stalling a
+batch that already paid for transcription.
+
+**The constraint worth understanding, and how it's handled.** Your subscriptions
+can't reach LightRAG's extraction step — it needs an HTTP endpoint, and no
+subscription offers embeddings at all. So two jobs were moved to where the
+subscription *does* reach:
+
+- **The compiler emits the graph.** Minutes include explicit `Entities` and
+  `Relations` sections, written by the frontier model, stored in the manifest, and
+  handed to the index pre-stated. A small model reads an explicit list reliably and
+  discovers the same facts from prose unreliably.
+- **Synthesis is split from retrieval.** LightRAG retrieves; the subscription chain
+  writes the answer. `--local` keeps LightRAG's own generation for comparison, and
+  it's the automatic fallback when no provider is reachable.
+
+What remains local is graph traversal. That's narrowed, not eliminated.
 
 ## Commands
 
 ```bash
 pipeline init                     # create directories and the manifest
+pipeline doctor                   # preflight the environment (run this first)
 pipeline ingest                   # discover + dedup new audio
 pipeline transcribe               # ASR + alignment + diarization  (the slow one)
 pipeline speakers --owner "Name"  # resolve SPEAKER_00 → real names
@@ -72,9 +105,17 @@ pipeline run                      # every pending stage, in order
 pipeline status                   # where everything is, plus real stage timings
 pipeline query "question"         # ask the knowledge base
 pipeline query "..." --mode global   # for answers spanning many meetings
+pipeline query "..." --timing     # retrieval vs synthesis time
+pipeline people                   # the people registry
+pipeline people --merge Mike Michael   # fold a duplicate, rewriting history
+pipeline entities                 # most-mentioned entities (graph health check)
 pipeline minutes --recompile      # rebuild after a template change, no ASR cost
+pipeline backup --to /mnt/backup  # snapshot everything irreplaceable
 pipeline retry                    # requeue whatever failed
 ```
+
+`pipeline run` exits **non-zero if any stage failed**, so a nightly cron reports a
+broken batch instead of silently succeeding.
 
 Each stage claims meetings at one status and advances them to the next, tracked in
 `db/manifest.db`. Stages are independent and resumable — a crash during minutes
@@ -118,6 +159,24 @@ filesystem watcher, or runs will overlap:
 `pipeline status` prints measured per-stage timings so you can check the table
 above against your actual hardware.
 
+## Preflight
+
+```bash
+pipeline doctor
+```
+
+18 checks: ffmpeg, whisperx, the ASR model against your device, **HF token plus
+actual gated-model reachability**, every provider in the chain, LightRAG health and
+whether its storage is file-based, Ollama models, directories, disk headroom,
+manifest state, glossary depth. Each failure prints its fix.
+
+The gated-model check earns its place: a HuggingFace token proves nothing about
+licence acceptance, which is the part people miss, and missing diarization costs
+every action item its owner while printing only a warning mid-batch.
+
+**What it does not tell you:** whether the output is good. That needs one real
+meeting, read against the audio.
+
 ## Prerequisites
 
 - **ffmpeg** on `PATH` (audio normalization and duration probing)
@@ -126,7 +185,78 @@ above against your actual hardware.
   `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0`. Without
   this, diarization is skipped with a warning and you get transcripts with no
   speaker attribution — which means action items with no owners.
+- **`MMC_LIGHTRAG_API_KEY`** — see below.
 - **Docker** for LightRAG + Ollama.
+- At least one of **`gemini`**, **`codex`**, or the **Claude Agent SDK** reachable.
+
+## Security
+
+Both services bind to **loopback only**. This index holds a searchable record of
+every decision, customer conversation, and internal disagreement in the corpus;
+publishing it on `0.0.0.0` would put that on the network unauthenticated. To reach
+the WebUI from another machine, tunnel:
+
+```bash
+ssh -L 9621:127.0.0.1:9621 user@server
+```
+
+`MMC_LIGHTRAG_API_KEY` is required and enforced — `docker compose` fails fast if
+it's unset rather than starting something open.
+
+## Backup
+
+The corpus is not in git, and it is not reconstructible from anything else.
+
+```bash
+pipeline backup --to /mnt/backup            # everything
+pipeline backup --to /mnt/backup --no-audio # skip the bulkiest tier
+```
+
+Uses SQLite's online backup API rather than a file copy, because copying a live
+database can capture a torn page and produce a snapshot that restores as corrupt.
+The snapshot is integrity-checked, and a `BACKUP_INFO.txt` with restore steps is
+written alongside it. The LightRAG index is deliberately **not** backed up — it is
+derived from `minutes/` and rebuilt with `pipeline index`.
+
+Add it to the nightly timer after `run`.
+
+## When the batch fails
+
+`pipeline run` exits non-zero, but on a headless server nothing reads cron's mail.
+Set `MMC_ALERT_COMMAND` and a failure pushes a summary somewhere you'll see it:
+
+```bash
+MMC_ALERT_COMMAND=curl -s -d @- https://ntfy.sh/my-topic
+MMC_ALERT_COMMAND=mail -s "{subject}" me@example.com
+```
+
+The summary arrives on stdin with `{subject}` substituted, names the failed stages,
+and points at `status` / `doctor` / `retry`. A command rather than built-in email
+support because whatever your server already has beats a second notification stack.
+
+## Tests
+
+```bash
+uv sync --extra dev
+uv run pytest
+```
+
+102 tests, no network and no model calls, under half a second. CI runs them plus
+ruff on every push. Regression tests name the failure they prevent, so the reasoning
+survives refactoring.
+
+**What is not covered:** ASR, LightRAG, Postgres, and the Gemini/Codex CLI
+invocations have never been run. The suite covers logic, not integration — see
+[docs/REVIEW.md](docs/REVIEW.md#o2--nothing-verified-against-real-infrastructure).
+
+## Documentation
+
+| Document | For |
+|---|---|
+| [docs/PRD.md](docs/PRD.md) | Problem, goals, non-goals, constraints, success criteria |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions with rationale and what was rejected |
+| [docs/REVIEW.md](docs/REVIEW.md) | Adversarial review: 14 findings fixed, 6 open |
+| [AGENTS.md](AGENTS.md) | Operational reference — env vars, stage internals, gotchas |
 
 Two upstream bugs are already worked around in `docker-compose.yml`: Ollama is
 pinned to `0.12.11` because `0.13.x` breaks LightRAG's embeddings
@@ -174,9 +304,23 @@ original recording.
 filename alone. A visible `SPEAKER_01` is fixable; a confidently wrong name
 silently assigns work to the wrong person.
 
+**Names are normalized, not trusted.** A people registry maps aliases to one
+canonical spelling, because asking a model to spell a name the same way it did four
+months ago isn't a strategy — and each variant becomes a separate graph node. Curate
+it with `pipeline people`.
+
 **ASR sits behind a `Backend` protocol.** Swapping in a paid API or a GPU model
 touches one class and nothing downstream — the designed escape hatch from the CPU
 constraint.
+
+**Re-indexing replaces, never appends.** Each meeting's LightRAG document id is
+recorded in the manifest and the old version is deleted before a recompiled one is
+inserted. If the delete fails, the insert is abandoned rather than leaving two
+contradictory copies of the same meeting in the graph.
+
+**The corpus outlives its index.** `minutes/` is portable markdown. If LightRAG
+stalls, slows down, or gets outgrown, the corpus re-indexes into anything else —
+your data is not hostage to it.
 
 ## Not included
 
@@ -184,4 +328,7 @@ Getting audio off your phone. The pipeline starts from "audio file in a
 directory," so that decision stays independent. Point `inbox/` at a synced folder,
 an rclone mount, or anything else that produces files.
 
-See **[AGENTS.md](AGENTS.md)** for the full technical reference.
+**Known open issues** are tracked honestly in
+[docs/REVIEW.md](docs/REVIEW.md#open) — including the one that matters most: no
+subscription can serve LightRAG's extraction step, so graph quality is capped by a
+small local model regardless of what you pay for.

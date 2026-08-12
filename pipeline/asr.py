@@ -34,11 +34,13 @@ from pipeline.config import (
     ENABLE_DIARIZATION,
     GLOSSARY_FILE,
     HF_TOKEN,
+    IMPLAUSIBLE_SPEAKER_COUNT,
     INITIAL_PROMPT_TOKEN_BUDGET,
+    MAX_SPEAKERS,
+    MIN_SPEAKERS,
     TARGET_SAMPLE_RATE,
     TRANSCRIPTS_DIR,
 )
-
 
 # ── Transcript model ──────────────────────────────────────────────────
 
@@ -66,6 +68,24 @@ class Transcript:
     language: str
     duration_sec: float | None
     segments: list[Segment]
+
+    @property
+    def diarization_warning(self) -> str | None:
+        """A warning when the speaker count looks like over-segmentation.
+
+        A high count is usually pyannote splitting one noisy speaker rather than a
+        real crowd, and it makes every downstream name unreliable. Surfaced rather
+        than corrected: the fix is a bound or a better microphone, not a guess.
+        """
+        count = len(self.speaker_labels)
+        if count > IMPLAUSIBLE_SPEAKER_COUNT:
+            return (
+                f"{count} speakers detected - likely over-segmentation. Speaker names "
+                f"will be unreliable. Consider MMC_MAX_SPEAKERS or better mic placement."
+            )
+        if count == 0:
+            return "no speakers detected - action items will have no owners"
+        return None
 
     @property
     def speaker_labels(self) -> list[str]:
@@ -207,6 +227,8 @@ class WhisperXBackend:
         batch_size: int = ASR_BATCH_SIZE,
         language: str = ASR_LANGUAGE,
         diarize: bool = ENABLE_DIARIZATION,
+        min_speakers: int | None = MIN_SPEAKERS,
+        max_speakers: int | None = MAX_SPEAKERS,
     ) -> None:
         self.model_name = model_name
         self.device = device
@@ -214,6 +236,8 @@ class WhisperXBackend:
         self.batch_size = batch_size
         self.language = language
         self.diarize = diarize
+        self.min_speakers = min_speakers
+        self.max_speakers = max_speakers
         self.name = f"whisperx:{model_name}"
 
     def transcribe(self, audio_path: Path, meeting_id: str, initial_prompt: str) -> Transcript:
@@ -286,14 +310,29 @@ class WhisperXBackend:
                 # Older whisperx used use_auth_token= for the same argument.
                 pipeline = DiarizationPipeline(use_auth_token=HF_TOKEN, device=self.device)
 
-            diarize_segments = pipeline(audio)
+            # Bounds help materially when the meeting shape is known: pyannote
+            # over-segments a noisy 1:1 into three or four speakers, and
+            # under-counts large meetings with overlapping speech.
+            kwargs: dict[str, int] = {}
+            if self.min_speakers:
+                kwargs["min_speakers"] = self.min_speakers
+            if self.max_speakers:
+                kwargs["max_speakers"] = self.max_speakers
+            try:
+                diarize_segments = pipeline(audio, **kwargs)
+            except TypeError:
+                # Older pipelines do not accept the bounds; proceed without them
+                # rather than losing diarization entirely.
+                if kwargs:
+                    print("    speaker bounds unsupported by this pyannote version")
+                diarize_segments = pipeline(audio)
 
             assign = getattr(whisperx, "assign_word_speakers", None)
             if assign is None:
                 from whisperx.diarize import assign_word_speakers as assign  # type: ignore
             return assign(diarize_segments, result)
 
-        except Exception as exc:  # noqa: BLE001 - diarization must never lose a transcript
+        except Exception as exc:
             print(f"    diarization failed ({type(exc).__name__}: {exc})")
             return result
 

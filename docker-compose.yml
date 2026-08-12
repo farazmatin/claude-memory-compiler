@@ -1,15 +1,39 @@
-# LightRAG (graph + vector index) and Ollama (local LLM + embeddings).
+# LightRAG (graph + vector index), Postgres (storage), Ollama (local LLM +
+# embeddings).
 #
-# Every non-obvious setting here works around a known issue. Read the comments
-# before changing anything.
+# Every non-obvious setting works around a known issue or a measured constraint.
+# Read the comments before changing anything.
 #
+#   cp .env.example .env      # fill in MMC_LIGHTRAG_API_KEY and POSTGRES_PASSWORD
 #   docker compose up -d
 #   docker compose exec ollama ollama pull qwen3:4b
 #   docker compose exec ollama ollama pull mxbai-embed-large
 #
-# WebUI: http://localhost:9621
+# WebUI: http://localhost:9621  (loopback only - see the ports comments)
 
 services:
+  postgres:
+    # pgvector, no Apache AGE. The graph runs on PGTableGraphStorage, which uses
+    # plain PostgreSQL 14+ tables and needs no extensions, so the AGE-bundled
+    # image is unnecessary. pgvector is still required for PGVectorStorage.
+    image: pgvector/pgvector:pg17
+    container_name: mmc-postgres
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-lightrag}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      - POSTGRES_DB=${POSTGRES_DATABASE:-rag}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lightrag} -d ${POSTGRES_DATABASE:-rag}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
   ollama:
     # PINNED DELIBERATELY. Ollama 0.13.x breaks LightRAG's embedding integration
     # (HKUDS/LightRAG#2495); 0.12.11 is the last version known to work. Do not
@@ -18,7 +42,9 @@ services:
     container_name: mmc-ollama
     restart: unless-stopped
     ports:
-      - "11434:11434"
+      # Loopback only. Nothing outside this host has any business reaching the
+      # model server.
+      - "127.0.0.1:11434:11434"
     volumes:
       - ollama_data:/root/.ollama
     environment:
@@ -42,26 +68,65 @@ services:
     container_name: mmc-lightrag
     restart: unless-stopped
     ports:
-      - "9621:9621"
+      # LOOPBACK ONLY, DELIBERATELY. This service holds a searchable index of
+      # every decision, customer conversation, and internal disagreement in the
+      # corpus. Publishing it on 0.0.0.0 puts that on the network unauthenticated.
+      # To reach it from another machine, use an SSH tunnel:
+      #   ssh -L 9621:127.0.0.1:9621 user@server
+      - "127.0.0.1:9621:9621"
     depends_on:
+      postgres:
+        condition: service_healthy
       ollama:
         condition: service_healthy
     volumes:
       - ./rag_storage:/app/rag_storage
       - ./minutes:/app/inputs:ro
     environment:
+      # 0.0.0.0 binds inside the container only; the published port above is what
+      # controls host exposure.
       - HOST=0.0.0.0
       - PORT=9621
 
-      # LLM: graph and entity extraction. A ~4B model is the right size here -
-      # extraction is a structured task, and on CPU a 7B+ model turns a 5-minute
-      # document into a 20-minute one.
+      # Required. Set MMC_LIGHTRAG_API_KEY in .env - the pipeline sends it as
+      # X-API-Key. Defence in depth behind the loopback bind.
+      - LIGHTRAG_API_KEY=${MMC_LIGHTRAG_API_KEY:?set MMC_LIGHTRAG_API_KEY in .env}
+
+      # ── Storage ──────────────────────────────────────────────────────
+      # Postgres from day one, not the JSON/NanoVectorDB defaults. Those are
+      # file-based and do not hold this corpus: ~5 meetings/day reaches thousands
+      # of documents and 50-150k graph entities within a couple of years.
+      # Migrating a populated graph later is painful, so this is configured before
+      # any data exists.
+      #
+      # PGTableGraphStorage runs the graph on plain PostgreSQL 14+ tables - no
+      # Apache AGE, no extensions - which is why the standard pgvector image works
+      # instead of an AGE-bundled one.
+      - LIGHTRAG_KV_STORAGE=PGKVStorage
+      - LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage
+      - LIGHTRAG_VECTOR_STORAGE=PGVectorStorage
+      - LIGHTRAG_GRAPH_STORAGE=PGTableGraphStorage
+
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-lightrag}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DATABASE=${POSTGRES_DATABASE:-rag}
+      - POSTGRES_MAX_CONNECTIONS=25
+      # HNSW is correct for 1024-dim embeddings. HNSW_HALFVEC is only needed
+      # above 2000 dimensions, which mxbai-embed-large is well under.
+      - POSTGRES_VECTOR_INDEX_TYPE=HNSW
+
+      # ── Models ───────────────────────────────────────────────────────
+      # LLM: graph and entity extraction. A ~4B model is the right size - the task
+      # is structured, and on CPU a 7B+ model turns a 5-minute document into a
+      # 20-minute one.
       - LLM_BINDING=ollama
       - LLM_BINDING_HOST=http://ollama:11434
       - LLM_MODEL=qwen3:4b
 
-      # Embeddings. EMBEDDING_DIM must match the model: mxbai-embed-large is 1024.
-      # A mismatch fails at insert time with an opaque dimension error.
+      # EMBEDDING_DIM must match the model: mxbai-embed-large is 1024. A mismatch
+      # fails at insert time with an opaque dimension error.
       - EMBEDDING_BINDING=ollama
       - EMBEDDING_BINDING_HOST=http://ollama:11434
       - EMBEDDING_MODEL=mxbai-embed-large
@@ -72,8 +137,9 @@ services:
       # never used; it just has to be non-empty.
       - OPENAI_API_KEY=unused-but-required
 
-      # Keep concurrency low. This runs on the same CPU as ASR, and the nightly
-      # batch would otherwise have transcription and indexing fighting for cores.
+      # ── Concurrency ──────────────────────────────────────────────────
+      # Keep low. This shares a CPU with ASR, and the nightly batch would
+      # otherwise have transcription and indexing fighting for cores.
       - MAX_ASYNC=2
       - MAX_PARALLEL_INSERT=1
 
@@ -86,3 +152,4 @@ services:
 
 volumes:
   ollama_data:
+  postgres_data:

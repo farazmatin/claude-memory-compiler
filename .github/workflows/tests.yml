@@ -1,0 +1,27 @@
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        # Core + dev only. The `asr` extra pulls torch and CUDA libraries and is
+        # not needed: the suite never loads a model or touches the network.
+        run: uv sync --extra dev
+
+      - name: Test
+        run: uv run pytest
+
+      - name: Lint
+        run: uv run --with ruff ruff check pipeline tests
