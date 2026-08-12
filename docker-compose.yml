@@ -1,0 +1,88 @@
+# LightRAG (graph + vector index) and Ollama (local LLM + embeddings).
+#
+# Every non-obvious setting here works around a known issue. Read the comments
+# before changing anything.
+#
+#   docker compose up -d
+#   docker compose exec ollama ollama pull qwen3:4b
+#   docker compose exec ollama ollama pull mxbai-embed-large
+#
+# WebUI: http://localhost:9621
+
+services:
+  ollama:
+    # PINNED DELIBERATELY. Ollama 0.13.x breaks LightRAG's embedding integration
+    # (HKUDS/LightRAG#2495); 0.12.11 is the last version known to work. Do not
+    # move to :latest without verifying embeddings still index.
+    image: ollama/ollama:0.12.11
+    container_name: mmc-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      # This pipeline runs CPU-only. Keeping one model resident avoids reloading
+      # weights between LightRAG's many small extraction calls, which otherwise
+      # dominates runtime.
+      - OLLAMA_KEEP_ALIVE=30m
+      # Serialize generation. LightRAG issues several extraction calls per
+      # document, and running them concurrently on a CPU just thrashes.
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_MAX_LOADED_MODELS=1
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  lightrag:
+    image: ghcr.io/hkuds/lightrag:latest
+    container_name: mmc-lightrag
+    restart: unless-stopped
+    ports:
+      - "9621:9621"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ./rag_storage:/app/rag_storage
+      - ./minutes:/app/inputs:ro
+    environment:
+      - HOST=0.0.0.0
+      - PORT=9621
+
+      # LLM: graph and entity extraction. A ~4B model is the right size here -
+      # extraction is a structured task, and on CPU a 7B+ model turns a 5-minute
+      # document into a 20-minute one.
+      - LLM_BINDING=ollama
+      - LLM_BINDING_HOST=http://ollama:11434
+      - LLM_MODEL=qwen3:4b
+
+      # Embeddings. EMBEDDING_DIM must match the model: mxbai-embed-large is 1024.
+      # A mismatch fails at insert time with an opaque dimension error.
+      - EMBEDDING_BINDING=ollama
+      - EMBEDDING_BINDING_HOST=http://ollama:11434
+      - EMBEDDING_MODEL=mxbai-embed-large
+      - EMBEDDING_DIM=1024
+
+      # REQUIRED EVEN THOUGH NOTHING CALLS OpenAI. The server refuses to boot
+      # without it when using Ollama bindings (HKUDS/LightRAG#2023). The value is
+      # never used; it just has to be non-empty.
+      - OPENAI_API_KEY=unused-but-required
+
+      # Keep concurrency low. This runs on the same CPU as ASR, and the nightly
+      # batch would otherwise have transcription and indexing fighting for cores.
+      - MAX_ASYNC=2
+      - MAX_PARALLEL_INSERT=1
+
+      # Minutes are 600-1200 words, so a chunk this size usually keeps a whole
+      # meeting's decisions in one chunk with its rationale intact.
+      - CHUNK_SIZE=1200
+      - CHUNK_OVERLAP_SIZE=100
+
+      - TIMEZONE=America/Toronto
+
+volumes:
+  ollama_data:
