@@ -205,22 +205,32 @@ def discover(inbox: Path | None = None) -> list[Path]:
 def run(inbox: Path | None = None, verbose: bool = True) -> dict[str, int]:
     """Ingest everything new in the inbox. Returns counts for reporting."""
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-    counts = {"scanned": 0, "ingested": 0, "duplicate": 0, "failed": 0}
+    counts = {"scanned": 0, "ingested": 0, "duplicate": 0, "skipped": 0, "failed": 0}
 
     files = discover(inbox)
     with db.connect() as conn:
         for path in files:
             counts["scanned"] += 1
             try:
+                stat = path.stat()
+
+                # Skip files already processed, without reading them. The inbox is
+                # a synced folder that is never emptied, so by year five a nightly
+                # run would otherwise re-hash ~165 GB to rediscover known files.
+                if db.file_unchanged(conn, str(path), stat.st_size, int(stat.st_mtime)):
+                    counts["skipped"] += 1
+                    continue
+
                 meeting_id = hash_file(path)
 
                 if db.meeting_exists(conn, meeting_id):
                     counts["duplicate"] += 1
+                    db.mark_seen(conn, str(path), stat.st_size, int(stat.st_mtime), None)
                     if verbose:
                         print(f"  dup   {path.name}")
                     continue
 
-                mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=TZ)
+                mtime = datetime.fromtimestamp(stat.st_mtime, tz=TZ)
                 parsed = parse_filename(path, mtime)
                 duration = probe_duration(path)
 
@@ -241,6 +251,7 @@ def run(inbox: Path | None = None, verbose: bool = True) -> dict[str, int]:
                     title_hint=parsed.title_hint,
                     duration_sec=duration,
                 )
+                db.mark_seen(conn, str(path), stat.st_size, int(stat.st_mtime), meeting_id)
                 counts["ingested"] += 1
                 if verbose:
                     mins = f"{duration / 60:.0f}m" if duration else "?"

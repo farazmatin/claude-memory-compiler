@@ -23,7 +23,13 @@ dependencies = [
 # Kept optional so the manifest/minutes/index stages can be installed and tested
 # on machines that will never run transcription.
 asr = [
-    "whisperx>=3.1.1",
+    # Upper bound is deliberate. whisperx moves DiarizationPipeline's auth kwarg
+    # and assign_word_speakers' location between releases; pipeline/asr.py carries
+    # shims for both, but an unpinned major would land mid-batch unannounced.
+    "whisperx>=3.1.1,<4",
+]
+dev = [
+    "pytest>=8.0",
 ]
 
 [project.scripts]
@@ -31,6 +37,34 @@ pipeline = "pipeline.cli:main"
 
 [tool.ruff]
 line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# Explicit rule set, not ruff's default. An unpinned selection means a ruff
+# release can add rules and break CI on an unrelated push - the same failure mode
+# the whisperx upper bound guards against.
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "E501",    # line length is enforced by the formatter, not the linter
+    "B008",    # argparse and dataclass defaults legitimately call functions
+    # Ambiguous-unicode rules. Intended to catch accidentally pasted characters,
+    # but here en/em dashes are deliberate: filename regexes must match both
+    # "11-12" and "11–12", and prose comments use real dashes.
+    "RUF001", "RUF002", "RUF003",
+    # Hand-edited word lists (stopwords, glossary terms) read better as prose
+    # split on spaces than as a long list literal.
+    "SIM905",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests configure MMC_* environment variables before importing pipeline.config,
+# which reads them at import time. Imports therefore cannot come first.
+"tests/conftest.py" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Tests never reach the network or spawn a model; the suite runs in under a second.
+addopts = "-q"
 
 [tool.hatch.build.targets.wheel]
 packages = ["pipeline"]

@@ -30,8 +30,8 @@ import sys
 import traceback
 from pathlib import Path
 
-from pipeline import capture, compile_minutes, db, index, ingest, speakers
-from pipeline.config import TEMPLATE_VERSION, ensure_dirs
+from pipeline import capture, compile_minutes, db, entities, index, ingest, speakers
+from pipeline.config import OWNER_NAME, TEMPLATE_VERSION, ensure_dirs
 
 # Stage names as recorded in stage_runs, for timing analysis.
 STAGE_TRANSCRIBE = "transcribe"
@@ -76,7 +76,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
                 avg = float(row["avg_sec"] or 0) / 60
                 mx = float(row["max_sec"] or 0) / 60
                 print(
-                    f"  {str(row['stage']):<12} {row['runs']:>5} "
+                    f"  {row['stage']!s:<12} {row['runs']:>5} "
                     f"{row['ok_runs'] or 0:>4} {avg:>8.1f}m {mx:>8.1f}m"
                 )
 
@@ -102,13 +102,19 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     linked = capture.reconcile_ingested()
     print(
         f"\nscanned {counts['scanned']}, ingested {counts['ingested']}, "
-        f"duplicate {counts['duplicate']}, failed {counts['failed']}"
+        f"duplicate {counts['duplicate']}, skipped {counts['skipped']}, "
+        f"failed {counts['failed']}"
     )
     if linked:
         print(f"released {linked} local Drive handoff file(s)")
     if args.then_run:
-        return _run_all(argparse.Namespace(limit=None, no_llm=False))
-    return 0
+        # Skip ingest inside the chain: it just ran, and re-running it would
+        # re-hash the whole inbox for nothing.
+        return _run_all(
+            argparse.Namespace(limit=None, no_llm=False, owner=None),
+            include_ingest=False,
+        )
+    return 1 if counts["failed"] else 0
 
 
 def cmd_auth_drive(_args: argparse.Namespace) -> int:
@@ -214,7 +220,9 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
                 f"    {len(transcript.segments)} segments, "
                 f"{len(transcript.speaker_labels)} speaker(s)"
             )
-        except Exception as exc:  # noqa: BLE001 - one bad file must not kill the batch
+            if transcript.diarization_warning:
+                print(f"    WARNING {transcript.diarization_warning}")
+        except Exception as exc:
             failures += 1
             detail = f"{type(exc).__name__}: {exc}"
             print(f"    FAILED {detail}")
@@ -239,6 +247,7 @@ def cmd_speakers(args: argparse.Namespace) -> int:
         print("Nothing to resolve.")
         return 0
 
+    failures = 0
     for position, meeting in enumerate(queue, 1):
         print(f"[{position}/{len(queue)}] {meeting.label}")
         with db.connect() as conn:
@@ -265,7 +274,8 @@ def cmd_speakers(args: argparse.Namespace) -> int:
                 print(f"    {summary}")
                 if unresolved:
                     print(f"    unresolved: {', '.join(unresolved)}")
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
+                failures += 1
                 detail = f"{type(exc).__name__}: {exc}"
                 print(f"    FAILED {detail}")
                 if args.traceback:
@@ -273,7 +283,7 @@ def cmd_speakers(args: argparse.Namespace) -> int:
                 db.finish_stage(conn, run_id, False, detail)
                 db.mark_failed(conn, meeting.id, detail)
 
-    return 0
+    return 1 if failures else 0
 
 
 def cmd_minutes(args: argparse.Namespace) -> int:
@@ -315,7 +325,7 @@ def cmd_minutes(args: argparse.Namespace) -> int:
                     template_version=TEMPLATE_VERSION,
                 )
                 print(f"    {words} words -> {path.name}")
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 failures += 1
                 detail = f"{type(exc).__name__}: {exc}"
                 print(f"    FAILED {detail}")
@@ -326,7 +336,7 @@ def cmd_minutes(args: argparse.Namespace) -> int:
                 # the model call is retryable, so the meeting stays in the queue.
 
     print(f"\nCompiled {len(queue) - failures}/{len(queue)}.")
-    return 0
+    return 1 if failures else 0
 
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -346,6 +356,7 @@ def cmd_index(args: argparse.Namespace) -> int:
         return 0
 
     failures = 0
+    stale = 0
     for position, meeting in enumerate(queue, 1):
         print(f"[{position}/{len(queue)}] {meeting.label}")
         if not meeting.minutes_path:
@@ -359,24 +370,56 @@ def cmd_index(args: argparse.Namespace) -> int:
         with db.connect() as conn:
             run_id = db.start_stage(conn, meeting.id, STAGE_INDEX)
             try:
-                index.insert_minutes(path)
-                db.finish_stage(conn, run_id, True, path.name)
-                db.advance(conn, meeting.id, db.INDEXED)
+                # Append the canonicalized graph block from the manifest. The
+                # local extraction model reads an explicit list reliably and
+                # discovers the same facts from prose unreliably - this is the
+                # mitigation for that ceiling.
+                augment = entities.render_for_index(
+                    db.get_entities(conn, meeting.id),
+                    db.get_relations(conn, meeting.id),
+                )
+                doc_id, replaced = index.replace_minutes(
+                    path, meeting.lightrag_doc_id, augment=augment
+                )
+                if not replaced:
+                    # The old copy is still in the graph. Refusing to insert keeps
+                    # the corpus consistent instead of leaving two contradictory
+                    # versions of the same meeting for retrieval to trip over.
+                    stale += 1
+                    detail = f"stale copy {meeting.lightrag_doc_id} could not be deleted"
+                    print(f"    SKIPPED {detail}")
+                    db.finish_stage(conn, run_id, False, detail)
+                    continue
+                db.finish_stage(conn, run_id, True, f"{path.name} -> {doc_id}")
+                db.advance(conn, meeting.id, db.INDEXED, lightrag_doc_id=doc_id)
                 print("    indexed")
             except index.IndexError_ as exc:
                 failures += 1
                 print(f"    FAILED {exc}")
                 db.finish_stage(conn, run_id, False, str(exc))
 
-    print(f"\nIndexed {len(queue) - failures}/{len(queue)}.")
-    return 0
+    print(f"\nIndexed {len(queue) - failures - stale}/{len(queue)}.")
+    if stale:
+        print(
+            f"{stale} meeting(s) skipped because a previously indexed version "
+            f"could not be removed. Delete them in the LightRAG UI, then re-run."
+        )
+    return 1 if (failures or stale) else 0
 
 
-def _run_all(args: argparse.Namespace) -> int:
-    """Walk every stage in order, oldest meeting first."""
-    stages = [
-        ("capture", cmd_capture, argparse.Namespace(dry_run=False, complete_backfill=False)),
-        ("ingest", cmd_ingest, argparse.Namespace(then_run=False)),
+def _run_all(args: argparse.Namespace, include_ingest: bool = True) -> int:
+    """Walk every stage in order, oldest meeting first.
+
+    Returns non-zero if ANY stage failed. This runs from a nightly timer, and a
+    batch that exits 0 after every stage failed is indistinguishable from success
+    - which means a break in month 4 goes unnoticed until a query comes back
+    empty in month 9.
+    """
+    stages: list[tuple[str, object, argparse.Namespace]] = []
+    if include_ingest:
+        stages.append(("capture", cmd_capture, argparse.Namespace(dry_run=False, complete_backfill=False)))
+        stages.append(("ingest", cmd_ingest, argparse.Namespace(then_run=False)))
+    stages += [
         ("transcribe", cmd_transcribe, argparse.Namespace(
             limit=args.limit, keep_going=True, traceback=False)),
         ("speakers", cmd_speakers, argparse.Namespace(
@@ -386,11 +429,30 @@ def _run_all(args: argparse.Namespace) -> int:
             limit=args.limit, recompile=False, traceback=False)),
         ("index", cmd_index, argparse.Namespace(limit=args.limit)),
     ]
-    failures = 0
+    failed: list[str] = []
+    crashes: list[str] = []
     for name, handler, stage_args in stages:
         print(f"\n=== {name} ===")
-        failures += int(handler(stage_args) or 0)
-    return 1 if failures else 0
+        try:
+            if handler(stage_args):  # type: ignore[operator]
+                failed.append(name)
+        except Exception as exc:
+            failed.append(name)
+            crashes.append(f"{name}: {type(exc).__name__}: {exc}")
+            print(f"  stage crashed: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+
+    if failed:
+        print(f"\nFAILED stages: {', '.join(failed)}")
+        print("Run `pipeline status` for detail.")
+        # A non-zero exit is not enough on a headless server: cron mails the local
+        # user and nobody reads local mail. Push the failure somewhere visible.
+        from pipeline import alert
+
+        alert.send(failed, detail="\n".join(crashes))
+        return 1
+    print("\nAll stages completed.")
+    return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -400,10 +462,111 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_query(args: argparse.Namespace) -> int:
+    from pipeline import answer
+
     try:
-        print(index.query(args.question, mode=args.mode, top_k=args.top_k))
+        result = answer.ask(
+            args.question,
+            mode=args.mode,
+            top_k=args.top_k,
+            synthesize=not args.local,
+        )
     except index.IndexError_ as exc:
         print(f"{exc}", file=sys.stderr)
+        return 1
+
+    print(result.text)
+    if args.timing:
+        print(f"\n{result.timing_line()}")
+    return 0
+
+
+def cmd_people(args: argparse.Namespace) -> int:
+    """Inspect and curate the people registry.
+
+    Curating this is worth the effort: every spelling variant becomes a separate
+    node in the knowledge graph, so one person recorded three ways is three
+    disconnected entities that no query finds together.
+    """
+    db.init_db()
+    with db.connect() as conn:
+        if args.merge:
+            source, target = args.merge
+            rewritten = db.merge_person(conn, source, target)
+            print(f"Merged {source!r} into {target!r} ({rewritten} speaker row(s) rewritten).")
+            return 0
+
+        if args.add:
+            canonical, *aliases = args.add
+            db.add_person(conn, canonical, aliases=aliases)
+            print(f"Registered {canonical!r}" + (f" with aliases {aliases}" if aliases else ""))
+            return 0
+
+        people = db.list_people(conn)
+        if not people:
+            print("No people registered yet. They are added automatically as meetings resolve.")
+            return 0
+        print(f"{'name':<24} {'role':<14} {'meetings':>8}  aliases")
+        for person in people:
+            print(
+                f"{person['canonical']!s:<24} {person['role'] or ''!s:<14} "
+                f"{person['meetings'] or 0:>8}  {person['aliases'] or ''}"
+            )
+    return 0
+
+
+def cmd_entities(args: argparse.Namespace) -> int:
+    """Most-mentioned entities across the corpus.
+
+    A useful health check on graph quality: if the top entries are generic words
+    rather than product and people names, the compiler is emitting noise.
+    """
+    db.init_db()
+    with db.connect() as conn:
+        rows = db.entity_mentions(conn, args.limit)
+    if not rows:
+        print("No entities recorded yet.")
+        return 0
+    print(f"{'entity':<32} {'kind':<12} {'meetings':>8}")
+    for row in rows:
+        print(f"{row['name']!s:<32} {row['kind'] or ''!s:<12} {row['meetings']:>8}")
+    return 0
+
+
+def cmd_doctor(_args: argparse.Namespace) -> int:
+    """Preflight the environment.
+
+    Verifies nothing is obviously broken. It cannot tell you the minutes are any
+    good - only running a real meeting through and reading the result does that.
+    """
+    from pipeline import doctor
+
+    checks, ok = doctor.run()
+    for check in checks:
+        print(f"[{check.symbol}] {check.name:<22} {check.detail}")
+        if check.fix and check.status != doctor.OK:
+            print(f"{'':<9} -> {check.fix}")
+
+    failed = sum(1 for c in checks if c.status == doctor.FAIL)
+    warned = sum(1 for c in checks if c.status == doctor.WARN)
+    print(f"\n{len(checks)} checks: {failed} failed, {warned} warnings")
+    if ok:
+        print(
+            "\nEnvironment looks ready. This does NOT verify output quality - run one "
+            "real meeting and read the transcript against the audio."
+        )
+    return 0 if ok else 1
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    from pipeline import backup
+
+    report = backup.run(Path(args.to), include_audio=not args.no_audio)
+    print(report.summary())
+    if report.errors:
+        print(f"\n{len(report.errors)} error(s):")
+        for error in report.errors[:20]:
+            print(f"  {error}")
         return 1
     return 0
 
@@ -473,8 +636,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_speakers = subparsers.add_parser("speakers", help="resolve speaker labels to names")
     add_common(p_speakers)
     p_speakers.add_argument(
-        "--owner", default=None,
-        help="your own name, used to disambiguate two-speaker recordings",
+        "--owner", default=OWNER_NAME or None,
+        help="your own name, used to disambiguate two-speaker recordings "
+             "(defaults to MMC_OWNER_NAME)",
     )
     p_speakers.add_argument(
         "--no-llm", action="store_true", help="heuristics and overrides only"
@@ -496,7 +660,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_run = subparsers.add_parser("run", help="every pending stage, in order")
     p_run.add_argument("--limit", type=int, default=None)
-    p_run.add_argument("--owner", default=None)
+    p_run.add_argument("--owner", default=OWNER_NAME or None)
     p_run.add_argument("--no-llm", action="store_true")
     p_run.set_defaults(func=cmd_run)
 
@@ -509,7 +673,46 @@ def build_parser() -> argparse.ArgumentParser:
              "whose answer spans many meetings",
     )
     p_query.add_argument("--top-k", type=int, default=None)
+    p_query.add_argument(
+        "--local", action="store_true",
+        help="let LightRAG's local model write the answer instead of the "
+             "subscription chain (faster to start, lower quality)",
+    )
+    p_query.add_argument(
+        "--timing", action="store_true",
+        help="report retrieval vs synthesis time, to see which phase is slow",
+    )
     p_query.set_defaults(func=cmd_query)
+
+    p_people = subparsers.add_parser("people", help="inspect the people registry")
+    p_people.add_argument(
+        "--add", nargs="+", metavar=("CANONICAL", "ALIAS"),
+        help="register a canonical name and optional aliases",
+    )
+    p_people.add_argument(
+        "--merge", nargs=2, metavar=("FROM", "INTO"),
+        help="fold one person into another, rewriting existing records",
+    )
+    p_people.set_defaults(func=cmd_people)
+
+    p_entities = subparsers.add_parser("entities", help="most-mentioned entities")
+    p_entities.add_argument("--limit", type=int, default=50)
+    p_entities.set_defaults(func=cmd_entities)
+
+    subparsers.add_parser(
+        "doctor", help="preflight the environment before a real batch"
+    ).set_defaults(func=cmd_doctor)
+
+    p_backup = subparsers.add_parser(
+        "backup", help="back up transcripts, minutes, audio and the manifest"
+    )
+    p_backup.add_argument("--to", required=True, help="destination directory")
+    p_backup.add_argument(
+        "--no-audio", action="store_true",
+        help="skip audio (the bulkiest tier); a restore can then rebuild from "
+             "transcripts but never re-transcribe",
+    )
+    p_backup.set_defaults(func=cmd_backup)
 
     p_retry = subparsers.add_parser("retry", help="requeue failed meetings")
     p_retry.add_argument(

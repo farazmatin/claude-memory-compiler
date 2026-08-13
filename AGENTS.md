@@ -3,6 +3,11 @@
 Complete technical reference. Written so an agent (or a person) can understand,
 modify, or rebuild this system without reading every source file.
 
+Companion documents: [docs/PRD.md](docs/PRD.md) for goals and scope,
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for design decisions and what was
+rejected, [docs/REVIEW.md](docs/REVIEW.md) for the adversarial review and the residual
+risk that code cannot remove.
+
 ## The compiler analogy
 
 ```
@@ -33,7 +38,8 @@ audio/          archived source                         [Tier 1, never indexed]
   ▼
 transcripts/    <id>.json (word-level + speaker), <id>.md (readable turns)
   │  speakers    SPEAKER_00 → real names
-  │  minutes     Claude Agent SDK + templates/minutes.md + prior context
+  │  minutes     provider chain + templates/minutes.md + prior context
+  │              (also emits entities + relations)
   ▼
 minutes/        YYYY-MM-DD-title-<id8>.md               [Tier 2, THE CORPUS]
   │  index       POST /documents/text
@@ -91,6 +97,20 @@ never by discovery time. The minutes compiler reads earlier minutes to populate
 against its own future. This also makes backfill build the graph in the order
 events actually happened.
 
+`recent_indexed_before()` compares `(date, time)` as a **pair**. A date-only
+comparison made every meeting blind to the other four from the same day, so at five
+meetings a day a decision reversed after lunch was never flagged.
+
+Prior context combines **chronological** (the last few meetings) with **topical** (a
+LightRAG retrieval on this meeting's actual subjects). Recency alone systematically
+missed long-horizon reversals, which are the valuable case — a decision being
+reversed is usually months old.
+
+The topical lookup is safe by construction: minutes compile in stage 4 and index in
+stage 5, so this meeting is not yet in the index and every hit is necessarily from an
+earlier one. No date filter is needed, which is fortunate because LightRAG offers
+none.
+
 **Failure policy differs by stage on purpose.** Transcription failures mark the row
 `failed` (something is wrong with the file or environment; a human should look).
 Minutes failures leave the row at `speakers_resolved` — the transcript is intact
@@ -103,12 +123,27 @@ meetings(   id PK,              -- full sha256 of audio bytes; also the dedup ke
             source_path, source_name, audio_path,
             meeting_date, meeting_time, title_hint, duration_sec,
             status, asr_model, template_version,
-            transcript_path, minutes_path, error, created_at, updated_at)
+            transcript_path, minutes_path,
+            lightrag_doc_id,    -- so a recompile can DELETE before re-inserting
+            error, created_at, updated_at)
 
 speakers(   meeting_id, label, name, confidence,  PK(meeting_id, label))
 
+people(         canonical PK, role, notes, created_at)
+person_aliases( alias PK, canonical FK)          -- lowercased for matching
+
+entities(   meeting_id, name, kind, description,  PK(meeting_id, name))
+relations(  meeting_id, subject, predicate, object,
+            PK(meeting_id, subject, predicate, object))
+
+seen_files( path PK, size, mtime, meeting_id, seen_at)  -- skip re-hashing
+
 stage_runs( meeting_id, stage, started_at, finished_at, ok, detail)
 ```
+
+New columns are applied to existing manifests via `MIGRATIONS` in `db.py`:
+`CREATE TABLE IF NOT EXISTS` silently skips an existing table, so an upgraded install
+would otherwise keep the old shape and fail at the first write.
 
 `stage_runs` exists so the CPU budget is validated against measurements rather
 than estimates — `pipeline status` aggregates it.
@@ -125,8 +160,12 @@ anything already in `meetings`.
 
 **Files are copied, never moved or deleted.** The inbox is expected to be a
 cloud-synced folder — deleting propagates upstream and destroys the original.
-Consequence: every run re-hashes the inbox. That's intentional and cheap (~60s for
-a year's worth), and dedup makes rescanning free.
+
+Consequence: the inbox never empties, so a naive scan re-hashes everything nightly —
+~165 GB read by year five. The `seen_files` table keys on path+size+mtime and skips
+known files **without reading them**. Identity rather than content is deliberate:
+the point is to avoid the read, and a file edited in place with identical size and
+mtime does not happen to finished recordings.
 
 **Filename parsing** handles two conventions:
 
@@ -213,8 +252,20 @@ with resolved names.
 
 ### 4. minutes (`pipeline/compile_minutes.py`)
 
-Claude Agent SDK, no tools, `max_turns=3`. Subscription-covered, which is why the
-highest-value artifact uses it while bulk entity extraction runs on local Ollama.
+Runs through the provider chain in `pipeline/llm.py` — Gemini Flash, then Codex,
+then Claude — falling through on failure. All three are subscription-backed, which
+is why the highest-value artifact uses them while bulk entity extraction runs on
+local Ollama.
+
+**The constraint that shapes this:** none of the three can serve LightRAG, which
+needs an HTTP endpoint rather than a CLI. So graph extraction — the most
+quality-sensitive step in retrieval — is permanently on a small local model. Two
+open mitigations: emit entities and relations from this stage for deterministic
+indexing, and split retrieval from synthesis (`only_need_context`) so a
+subscription writes the final answer.
+
+Prompts reach the CLI providers on **stdin**, never argv: a full transcript is tens
+of thousands of tokens and would risk `ARG_MAX`.
 
 Prompt assembles: `templates/minutes.md` (the spec) + meeting metadata + resolved
 attendees + explicit unresolved-label instructions + excerpts from up to 3 earlier
@@ -231,19 +282,77 @@ of the frontmatter breaks every YAML parser downstream.
 documents built by an older version; `pipeline minutes --recompile` rebuilds them
 from retained transcripts. **This is the payoff for the three-tier design.**
 
+### 4b. entities (`pipeline/entities.py`)
+
+The minutes compiler emits explicit `Entities` and `Relations` sections. These are
+parsed, person names canonicalized through the people registry, stored in the
+`entities` / `relations` tables, and appended to the **indexed text** (never the
+file on disk) as a normalized `## Knowledge Graph` block.
+
+This is the mitigation for the subscription ceiling. LightRAG's extraction runs on a
+~4B local model that reads `Atlas (feature): the platform rewrite` reliably and
+discovers the same fact from narrative prose unreliably. The frontier model already
+running once per meeting states it outright instead.
+
+The parser is tolerant by design — `-` bullets, `[]` brackets, `->`/`→`/`|` arrows,
+missing descriptions — because models produce all of those for one instruction, and
+recovering most of a messy block beats discarding all of a slightly-malformed one.
+
+Storing them in the manifest also means the corpus no longer depends on LightRAG's
+extraction quality: the entities survive independently of the index.
+
 ### 5. index (`pipeline/index.py`)
 
 `POST /documents/text` with `file_source` set to the filename so citations trace
 back to a meeting. Minutes only. Long timeout (default 600s) because CPU-bound
 entity extraction blocks the request.
 
+**Replace, never append.** `compute_doc_id()` mirrors LightRAG's own
+`compute_mdhash_id(content.strip(), prefix="doc-")`, so the document id is knowable
+before insert and stable across restarts. `replace_minutes()` uses it to:
+
+1. Skip entirely when content is unchanged — re-extraction would burn minutes of
+   CPU to reach the same state.
+2. Delete the previous version before inserting a recompiled one.
+3. **Abandon the insert if the delete failed**, returning `replaced=False` so the
+   CLI skips the meeting and reports it.
+
+Step 3 matters: inserting anyway leaves both versions in the graph, so every entity
+and relation from the old copy survives alongside the new one and retrieval starts
+returning contradictory duplicates. That would silently invalidate the entire
+reason transcripts are retained. `delete_document()` tries the current endpoint then
+the older path, since this route has moved between releases; a total failure is
+reported rather than swallowed.
+
 ### 6. query
 
 `POST /query`. Modes: `hybrid` (default, graph + vector), `global` (aggregative,
 spans many meetings), `local` (tight entity lookup), `naive` (plain vector).
 
+Answering is split in two (`pipeline/answer.py`): LightRAG retrieves, and the
+subscription chain writes the answer. `--local` keeps LightRAG's own generation, and
+it is the automatic fallback when no provider is reachable — an answer from the small
+model beats no answer. Empty retrieval short-circuits rather than asking a model to
+answer from nothing, which is how a knowledge base starts inventing.
+
+`--timing` reports retrieval and synthesis separately, so when queries get slow the
+number says which phase is responsible.
+
 For rare verbatim lookups, grep `transcripts/` directly — cheap, precise, no
 embedding cost. That's why they're retained as readable Markdown, not only JSON.
+
+### People registry (`db.people` / `db.person_aliases`)
+
+Every resolved speaker name and every `person` entity normalizes through
+`db.canonical_name()`. Asking a model to spell a name the same way it did four months
+ago is not a strategy, and each variant becomes a separate graph node.
+
+`pipeline people --merge Mike Michael` folds a duplicate and rewrites history across
+`speakers`, `entities`, and **both ends of every relation** — leaving those behind
+would keep two nodes for one person.
+
+Unknown names pass through unchanged: a new person appearing is normal, and dropping
+them would be worse than an unnormalized spelling.
 
 ## Configuration
 
@@ -251,6 +360,16 @@ Everything in `pipeline/config.py`, all overridable by environment variable.
 
 | Variable | Default | Notes |
 |---|---|---|
+| `MMC_LLM_PROVIDERS` | `gemini,codex,claude` | Priority order; falls through on failure |
+| `MMC_ALERT_COMMAND` | unset | Failure summary on stdin, `{subject}` substituted |
+| `MMC_MIN_SPEAKERS` / `MMC_MAX_SPEAKERS` | unset | Bounds passed to pyannote |
+| `MMC_IMPLAUSIBLE_SPEAKERS` | `8` | Above this, warn about over-segmentation |
+| `MMC_MINUTES_TOKEN_BUDGET` | `60000` | Over this, the compiler map-reduces |
+| `MMC_GEMINI_MODEL` | unset | Pin a Flash version; unset lets the CLI choose |
+| `MMC_GEMINI_ARGS` / `MMC_CODEX_ARGS` | `-p -` / `exec -` | Override if a CLI changes its invocation |
+| `MMC_LLM_TIMEOUT` | `900` | Per-call ceiling; a CLI wanting a TTY would otherwise hang the batch |
+| `MMC_LIGHTRAG_API_KEY` | — | **Required**; compose fails fast without it |
+| `MMC_OWNER_NAME` | unset | Default for `--owner` |
 | `MMC_TIMEZONE` | `America/Toronto` | Meeting dates depend on it; wrong value mislabels the corpus |
 | `MMC_ASR_MODEL` | `large-v3-turbo` | `large-v3` only if you have a GPU |
 | `MMC_ASR_DEVICE` | `cpu` | |
@@ -272,6 +391,11 @@ the template it describes.
 | pyannote gating | Diarization fails at *runtime*, not install | `HF_TOKEN` + accept model terms |
 | `EMBEDDING_DIM` mismatch | Opaque dimension error at insert | Must match model (mxbai-embed-large = 1024) |
 
+Both services bind to **loopback only** and `LIGHTRAG_API_KEY` is enforced by
+compose. The index is a searchable record of every decision and customer
+conversation in the corpus; a `0.0.0.0` bind with the default empty key would
+expose that unauthenticated. Reach the WebUI over an SSH tunnel.
+
 CPU contention is also configured for: `MAX_ASYNC=2`, `MAX_PARALLEL_INSERT=1`,
 `OLLAMA_NUM_PARALLEL=1`, `OLLAMA_KEEP_ALIVE=30m`. Transcription and indexing share
 one CPU in the nightly batch; without these they fight for cores and both slow
@@ -288,6 +412,26 @@ calls, and reloading weights between them otherwise dominates runtime.
 
 Total marginal cost per meeting is electricity. The tradeoff is a ~4 hour nightly
 batch, which is why `pipeline run` belongs on a timer rather than a file watcher.
+
+## Backup and restore
+
+`pipeline backup --to PATH`. Priority order reflects what is actually
+irreplaceable:
+
+1. `transcripts/` — immutable source; everything downstream rebuilds from these
+   without re-running ASR.
+2. `audio/` — recreates transcripts, but only at 30-50 CPU-minutes each.
+3. `minutes/` — rebuildable from transcripts, at the cost of LLM quota.
+4. `db/manifest.db` — rebuildable in principle, painful in practice.
+
+Uses `sqlite3.Connection.backup()` plus an integrity check, **not** a file copy: a
+copy of a live database can capture a torn page or miss the WAL, producing a
+snapshot that restores as corrupt. Tree sync is incremental on size+mtime, and
+nothing is ever deleted from the destination — a file vanishing from the source is
+precisely when the copy matters.
+
+`rag_storage/` and the Postgres volume are deliberately excluded. The index is
+derived; `pipeline index` rebuilds it.
 
 ## Extending
 

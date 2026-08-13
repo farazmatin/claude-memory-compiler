@@ -9,10 +9,10 @@ and must never be redone. Improving the minutes template later means re-running
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
 
 from pipeline.config import DB_PATH, now_iso
 
@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS meetings (
     template_version TEXT,
     transcript_path TEXT,
     minutes_path    TEXT,
+    -- LightRAG's id for the indexed copy of this meeting's minutes. Required to
+    -- DELETE the stale version before re-indexing a recompiled document;
+    -- without it a recompile leaves the old entities in the graph forever.
+    lightrag_doc_id TEXT,
     error           TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
@@ -103,6 +107,63 @@ CREATE TABLE IF NOT EXISTS pipeline_settings (
     value   TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- Canonical people. Speaker resolution and entity extraction both normalize
+-- through this, so "Mike", "Michael" and "michael" become one graph node instead
+-- of three. Without it, cross-year spelling consistency depends on the LLM
+-- re-picking the same string every time, which it will not.
+CREATE TABLE IF NOT EXISTS people (
+    canonical   TEXT PRIMARY KEY,
+    role        TEXT,               -- optional: "PM", "engineering", "customer"
+    notes       TEXT,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS person_aliases (
+    alias       TEXT PRIMARY KEY,   -- lowercased for case-insensitive matching
+    canonical   TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (canonical) REFERENCES people(canonical) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_person_aliases_canonical ON person_aliases(canonical);
+
+-- Entities and relations emitted by the minutes compiler. Kept in the manifest as
+-- well as in the indexed document so they survive independently of LightRAG - the
+-- corpus must never be hostage to the index.
+CREATE TABLE IF NOT EXISTS entities (
+    meeting_id  TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    kind        TEXT,               -- person | feature | customer | release | other
+    description TEXT,
+    PRIMARY KEY (meeting_id, name),
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
+
+CREATE TABLE IF NOT EXISTS relations (
+    meeting_id  TEXT NOT NULL,
+    subject     TEXT NOT NULL,
+    predicate   TEXT NOT NULL,
+    object      TEXT NOT NULL,
+    PRIMARY KEY (meeting_id, subject, predicate, object),
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_relations_subject ON relations(subject);
+
+-- Inbox files already seen, keyed by identity rather than content. Lets ingest
+-- skip hashing a file it has already hashed: the inbox is never emptied (it is a
+-- synced folder), so by year five a nightly run would otherwise re-read ~165 GB
+-- just to rediscover known duplicates.
+CREATE TABLE IF NOT EXISTS seen_files (
+    path        TEXT PRIMARY KEY,
+    size        INTEGER NOT NULL,
+    mtime       INTEGER NOT NULL,
+    meeting_id  TEXT,               -- NULL when the file was a duplicate
+    seen_at     TEXT NOT NULL
+);
 """
 
 
@@ -123,6 +184,7 @@ class Meeting:
     template_version: str | None
     transcript_path: str | None
     minutes_path: str | None
+    lightrag_doc_id: str | None
     error: str | None
     created_at: str
     updated_at: str
@@ -163,7 +225,9 @@ class DriveSource:
 
 
 def _row_to_meeting(row: sqlite3.Row) -> Meeting:
-    return Meeting(**{k: row[k] for k in row.keys()})
+    # .keys() is required here: iterating a sqlite3.Row yields VALUES, not keys,
+    # so SIM118's suggested rewrite would silently build a broken mapping.
+    return Meeting(**{k: row[k] for k in row.keys()})  # noqa: SIM118
 
 
 def _row_to_drive_source(row: sqlite3.Row) -> DriveSource:
@@ -188,10 +252,23 @@ def connect(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+#  column -> DDL. Applied to manifests created before the column existed.
+MIGRATIONS: dict[str, str] = {
+    "lightrag_doc_id": "ALTER TABLE meetings ADD COLUMN lightrag_doc_id TEXT",
+}
+
+
 def init_db(db_path: Path | None = None) -> None:
-    """Create tables. Idempotent."""
+    """Create tables and apply pending migrations. Idempotent."""
     with connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        # CREATE TABLE IF NOT EXISTS silently skips an existing table, so new
+        # columns must be added explicitly or an upgraded install keeps running
+        # against the old shape and fails at the first write.
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(meetings)")}
+        for column, ddl in MIGRATIONS.items():
+            if column not in existing:
+                conn.execute(ddl)
 
 
 # ── Meeting rows ──────────────────────────────────────────────────────
@@ -260,35 +337,57 @@ def stale_template(conn: sqlite3.Connection, current_version: str) -> list[Meeti
     This is the recompilation path: bump TEMPLATE_VERSION, re-run the minutes
     stage over these, and years of history gets rebuilt from retained
     transcripts with no ASR cost.
+
+    Restricted to meetings that have already cleared speaker resolution. A
+    meeting still at `transcribed` also has a transcript and a NULL
+    template_version, and compiling it here would jump it straight to
+    minutes_compiled - skipping stage 3 entirely and producing minutes whose
+    action items are owned by "SPEAKER_01".
     """
     sql = """
         SELECT * FROM meetings
         WHERE transcript_path IS NOT NULL
+          AND status IN (?, ?, ?)
           AND (template_version IS NULL OR template_version != ?)
         ORDER BY meeting_date IS NULL, meeting_date, meeting_time, created_at
     """
-    return [_row_to_meeting(r) for r in conn.execute(sql, (current_version,)).fetchall()]
+    params = (SPEAKERS_RESOLVED, MINUTES_COMPILED, INDEXED, current_version)
+    return [_row_to_meeting(r) for r in conn.execute(sql, params).fetchall()]
 
 
 def recent_indexed_before(
-    conn: sqlite3.Connection, meeting_date: str | None, limit: int
+    conn: sqlite3.Connection,
+    meeting_date: str | None,
+    limit: int,
+    meeting_time: str | None = None,
+    exclude_id: str | None = None,
 ) -> list[Meeting]:
-    """Most recent meetings with minutes that predate `meeting_date`.
+    """Most recent meetings with minutes that precede this one.
 
     Feeds prior-decision context into the minutes compiler so it can flag when a
     decision reverses an earlier position.
+
+    Compares (date, time) as a pair, not date alone. At five meetings a day a
+    date-only comparison makes every meeting blind to the other four from the
+    same day, so a decision reversed after lunch would never be flagged.
     """
     if not meeting_date:
         return []
+    # Empty string sorts below any "HH:MM", so an unknown time places the meeting
+    # at the start of its day rather than excluding it.
+    time_key = meeting_time or ""
     sql = """
         SELECT * FROM meetings
         WHERE minutes_path IS NOT NULL
           AND meeting_date IS NOT NULL
-          AND meeting_date < ?
+          AND (meeting_date < ?
+               OR (meeting_date = ? AND COALESCE(meeting_time, '') < ?))
+          AND id != COALESCE(?, '')
         ORDER BY meeting_date DESC, meeting_time DESC
         LIMIT ?
     """
-    return [_row_to_meeting(r) for r in conn.execute(sql, (meeting_date, limit)).fetchall()]
+    params = (meeting_date, meeting_date, time_key, exclude_id, limit)
+    return [_row_to_meeting(r) for r in conn.execute(sql, params).fetchall()]
 
 
 def advance(
@@ -304,7 +403,8 @@ def advance(
     """
     allowed = {
         "audio_path", "meeting_date", "meeting_time", "title_hint", "duration_sec",
-        "asr_model", "template_version", "transcript_path", "minutes_path", "error",
+        "asr_model", "template_version", "transcript_path", "minutes_path",
+        "lightrag_doc_id", "error",
     }
     unknown = set(fields) - allowed
     if unknown:
@@ -381,6 +481,212 @@ def known_speaker_names(conn: sqlite3.Connection, limit: int = 50) -> list[str]:
         (limit,),
     ).fetchall()
     return [r["name"] for r in rows]
+
+
+# ── People registry ───────────────────────────────────────────────────
+#
+# The point of this table is determinism. Asking a model to spell a name the same
+# way it did four months ago is not a reliable strategy, and every variant it
+# invents becomes a separate node in the knowledge graph.
+
+def add_person(
+    conn: sqlite3.Connection,
+    canonical: str,
+    aliases: list[str] | None = None,
+    role: str | None = None,
+) -> None:
+    """Register a canonical name and any aliases that should map to it.
+
+    The canonical name is always registered as an alias of itself, so lookup has
+    a single code path.
+    """
+    canonical = canonical.strip()
+    if not canonical:
+        return
+    ts = now_iso()
+    conn.execute(
+        """
+        INSERT INTO people (canonical, role, created_at) VALUES (?, ?, ?)
+        ON CONFLICT(canonical) DO UPDATE SET role = COALESCE(?, role)
+        """,
+        (canonical, role, ts, role),
+    )
+    for alias in {canonical, *(aliases or [])}:
+        cleaned = alias.strip().lower()
+        if cleaned:
+            conn.execute(
+                """
+                INSERT INTO person_aliases (alias, canonical, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(alias) DO UPDATE SET canonical = ?
+                """,
+                (cleaned, canonical, ts, canonical),
+            )
+
+
+def canonical_name(conn: sqlite3.Connection, name: str | None) -> str | None:
+    """Map any known alias to its canonical spelling.
+
+    Unknown names pass through unchanged rather than being rejected: a new person
+    appearing in a meeting is normal, and silently dropping them would be worse
+    than an unnormalized spelling.
+    """
+    if not name:
+        return name
+    row = conn.execute(
+        "SELECT canonical FROM person_aliases WHERE alias = ?", (name.strip().lower(),)
+    ).fetchone()
+    return row["canonical"] if row else name.strip()
+
+
+def list_people(conn: sqlite3.Connection) -> list[dict[str, object]]:
+    """Every canonical person with their aliases and meeting count."""
+    rows = conn.execute(
+        """
+        SELECT p.canonical, p.role,
+               (SELECT GROUP_CONCAT(a.alias, ', ') FROM person_aliases a
+                 WHERE a.canonical = p.canonical AND a.alias != LOWER(p.canonical)
+               ) AS aliases,
+               (SELECT COUNT(DISTINCT s.meeting_id) FROM speakers s
+                 WHERE s.name = p.canonical) AS meetings
+        FROM people p
+        ORDER BY meetings DESC, p.canonical
+        """
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def merge_person(conn: sqlite3.Connection, from_name: str, into: str) -> int:
+    """Fold one person into another, rewriting existing rows.
+
+    For when the same human was recorded under two names before the registry knew
+    about it. Returns the number of speaker rows rewritten.
+    """
+    from_name, into = from_name.strip(), into.strip()
+    if not from_name or not into or from_name == into:
+        return 0
+
+    add_person(conn, into, aliases=[from_name])
+    cursor = conn.execute(
+        "UPDATE speakers SET name = ? WHERE name = ?", (into, from_name)
+    )
+    # Historic entities and relations must move too, or the graph keeps both nodes.
+    conn.execute("UPDATE entities SET name = ? WHERE name = ?", (into, from_name))
+    conn.execute("UPDATE relations SET subject = ? WHERE subject = ?", (into, from_name))
+    conn.execute("UPDATE relations SET object = ? WHERE object = ?", (into, from_name))
+    conn.execute(
+        "UPDATE person_aliases SET canonical = ? WHERE canonical = ?", (into, from_name)
+    )
+    conn.execute("DELETE FROM people WHERE canonical = ?", (from_name,))
+    return cursor.rowcount
+
+
+# ── Entities and relations ────────────────────────────────────────────
+
+def replace_entities(
+    conn: sqlite3.Connection,
+    meeting_id: str,
+    entities: list[dict[str, str]],
+    relations: list[dict[str, str]],
+) -> None:
+    """Store a meeting's emitted entities and relations, replacing any prior set.
+
+    Replace rather than append: a recompile must not leave the previous run's
+    entities behind, for the same reason re-indexing deletes before inserting.
+    """
+    conn.execute("DELETE FROM entities WHERE meeting_id = ?", (meeting_id,))
+    conn.execute("DELETE FROM relations WHERE meeting_id = ?", (meeting_id,))
+
+    for entity in entities:
+        name = (entity.get("name") or "").strip()
+        if not name:
+            continue
+        conn.execute(
+            """
+            INSERT INTO entities (meeting_id, name, kind, description)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(meeting_id, name) DO UPDATE SET kind = ?, description = ?
+            """,
+            (
+                meeting_id, name, entity.get("kind"), entity.get("description"),
+                entity.get("kind"), entity.get("description"),
+            ),
+        )
+
+    for relation in relations:
+        subject = (relation.get("subject") or "").strip()
+        predicate = (relation.get("predicate") or "").strip()
+        obj = (relation.get("object") or "").strip()
+        if not (subject and predicate and obj):
+            continue
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO relations (meeting_id, subject, predicate, object)
+            VALUES (?, ?, ?, ?)
+            """,
+            (meeting_id, subject, predicate, obj),
+        )
+
+
+def get_entities(conn: sqlite3.Connection, meeting_id: str) -> list[dict[str, object]]:
+    rows = conn.execute(
+        "SELECT name, kind, description FROM entities WHERE meeting_id = ? ORDER BY name",
+        (meeting_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_relations(conn: sqlite3.Connection, meeting_id: str) -> list[dict[str, object]]:
+    rows = conn.execute(
+        """
+        SELECT subject, predicate, object FROM relations
+        WHERE meeting_id = ? ORDER BY subject, predicate, object
+        """,
+        (meeting_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def entity_mentions(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, object]]:
+    """Most-mentioned entities across the corpus, for `pipeline entities`."""
+    rows = conn.execute(
+        """
+        SELECT name, kind, COUNT(DISTINCT meeting_id) AS meetings
+        FROM entities GROUP BY name, kind
+        ORDER BY meetings DESC, name LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Seen-file cache ───────────────────────────────────────────────────
+
+def file_unchanged(conn: sqlite3.Connection, path: str, size: int, mtime: int) -> bool:
+    """True if this exact path/size/mtime has already been processed.
+
+    Identity, not content: the point is to avoid reading the file at all. A file
+    edited in place with the same size and mtime would be missed, which does not
+    happen to finished audio recordings.
+    """
+    row = conn.execute(
+        "SELECT size, mtime FROM seen_files WHERE path = ?", (path,)
+    ).fetchone()
+    return bool(row and row["size"] == size and int(row["mtime"]) == mtime)
+
+
+def mark_seen(
+    conn: sqlite3.Connection, path: str, size: int, mtime: int, meeting_id: str | None
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO seen_files (path, size, mtime, meeting_id, seen_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET
+            size = ?, mtime = ?, meeting_id = ?, seen_at = ?
+        """,
+        (path, size, mtime, meeting_id, now_iso(), size, mtime, meeting_id, now_iso()),
+    )
 
 
 # ── Stage timing ──────────────────────────────────────────────────────
