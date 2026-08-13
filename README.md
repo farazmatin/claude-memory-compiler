@@ -156,6 +156,33 @@ single-user assumption in the PRD, not from an oversight — `--host` refuses a
 non-loopback address unless you also pass `--allow-remote`, which you should only
 do behind your own access control.
 
+### The review queue
+
+The second screen is where a person confirms what the compiler inferred.
+Diarization guesses how many people spoke, one model guesses which label is whose
+name, and another guesses who owns each action item. Two of those are expensive to
+leave wrong:
+
+- **A wrong name fragments the graph.** Every spelling variant becomes its own
+  node, so the damage is not confined to the meeting containing the mistake — it
+  degrades retrieval corpus-wide and compounds with each meeting that repeats it.
+- **An unowned action item is silently useless.** Diarization is skipped with only
+  a warning when `HF_TOKEN` is missing or its gated models were never accepted.
+  Nothing else reports that; a queue of meetings with unresolved `SPEAKER_nn`
+  labels does. Those sort to the front.
+
+**Correcting a name recompiles rather than patches.** The compiler attributed
+decisions and phrased action items around whoever it believed was speaking, so a
+find-and-replace would leave the reasoning wrong. A correction rewinds the meeting
+to `speakers_resolved` and the next `pipeline minutes` run rebuilds it from the
+retained transcript — no ASR cost, which is what retaining transcripts buys.
+
+**Editing minutes re-indexes, and refuses to half-succeed.** An edit changes the
+document's content hash and therefore its LightRAG id. Approving deletes the old
+document before inserting the new one; if that delete fails, the approve is
+refused with a 409 rather than leaving two contradictory copies of the meeting in
+the graph for retrieval to trip over.
+
 Each stage claims meetings at one status and advances them to the next, tracked in
 `db/manifest.db`. Stages are independent and resumable — a crash during minutes
 compilation costs minutes, not the hours of transcription behind it.

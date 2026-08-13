@@ -10,10 +10,14 @@
 <body>
 <header>
   <h1>Meeting Memory</h1>
+  <nav>
+    <button class="tab is-active" data-screen="ask">Ask</button>
+    <button class="tab" data-screen="review">Review <span id="review-count" class="badge" hidden></span></button>
+  </nav>
   <div id="health" class="health" title="LightRAG and manifest status">checking…</div>
 </header>
 
-<main>
+<main id="screen-ask">
   <section id="thread" class="thread" aria-live="polite"></section>
 
   <form id="ask-form" class="ask">
@@ -33,6 +37,21 @@
       <button type="submit" id="submit">Ask</button>
     </div>
   </form>
+</main>
+
+<main id="screen-review" hidden>
+  <div class="review-head">
+    <p class="note">
+      Everything upstream of this is inference. A wrong name becomes its own node
+      in the graph and fragments retrieval across the whole corpus, so correcting
+      one here is cheapest before it repeats.
+    </p>
+    <label class="checkbox">
+      <input type="checkbox" id="show-reviewed"> show already reviewed
+    </label>
+  </div>
+  <p id="review-status" class="banner" role="status" hidden></p>
+  <div id="review-list" class="review-list" aria-live="polite"></div>
 </main>
 
 <dialog id="reader">

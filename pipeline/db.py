@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS meetings (
     -- DELETE the stale version before re-indexing a recompiled document;
     -- without it a recompile leaves the old entities in the graph forever.
     lightrag_doc_id TEXT,
+    -- Set when a human has confirmed this meeting's speakers and minutes. NULL
+    -- means the record is still whatever the compiler guessed.
+    reviewed_at     TEXT,
     error           TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
@@ -185,6 +188,7 @@ class Meeting:
     transcript_path: str | None
     minutes_path: str | None
     lightrag_doc_id: str | None
+    reviewed_at: str | None
     error: str | None
     created_at: str
     updated_at: str
@@ -255,6 +259,7 @@ def connect(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
 #  column -> DDL. Applied to manifests created before the column existed.
 MIGRATIONS: dict[str, str] = {
     "lightrag_doc_id": "ALTER TABLE meetings ADD COLUMN lightrag_doc_id TEXT",
+    "reviewed_at": "ALTER TABLE meetings ADD COLUMN reviewed_at TEXT",
 }
 
 
@@ -510,6 +515,30 @@ def get_speakers(conn: sqlite3.Connection, meeting_id: str) -> dict[str, str]:
         (meeting_id,),
     ).fetchall()
     return {r["label"]: r["name"] for r in rows}
+
+
+def speaker_rows(conn: sqlite3.Connection, meeting_id: str) -> list[dict[str, object]]:
+    """Every diarized label for a meeting, resolved or not.
+
+    `get_speakers` omits unresolved labels because the compiler wants a name map.
+    Review wants the opposite: an unresolved label is the thing most worth
+    showing, since it is an action item whose owner was lost.
+    """
+    rows = conn.execute(
+        "SELECT label, name, confidence FROM speakers WHERE meeting_id = ? ORDER BY label",
+        (meeting_id,),
+    ).fetchall()
+    return [
+        {"label": r["label"], "name": r["name"], "confidence": r["confidence"]} for r in rows
+    ]
+
+
+def mark_reviewed(conn: sqlite3.Connection, meeting_id: str, when: str | None = None) -> None:
+    """Record that a human has confirmed this meeting. `None` clears it."""
+    conn.execute(
+        "UPDATE meetings SET reviewed_at = ?, updated_at = ? WHERE id = ?",
+        (when, now_iso(), meeting_id),
+    )
 
 
 def known_speaker_names(conn: sqlite3.Connection, limit: int = 50) -> list[str]:

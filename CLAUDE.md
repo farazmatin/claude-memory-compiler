@@ -56,8 +56,8 @@ Meetings always process **oldest first**: the minutes compiler reads earlier min
 
 ### Layers
 
-- **`pipeline/`** — the stages plus the CLI. `db.py` is the state machine; `cli.py` orchestrates.
-- **`web/`** — a read-only HTTP surface over the same modules, called in process. No second implementation of query semantics.
+- **`pipeline/`** — the stages plus the CLI. `db.py` is the state machine; `cli.py` orchestrates. `review.py` holds the human-confirmation logic, kept out of the web layer so it stays testable and reusable.
+- **`web/`** — an HTTP surface over the same modules, called in process. No second implementation of query semantics.
 - **`minutes/`, `transcripts/`, `audio/`, `db/`** — runtime data, all gitignored.
 
 ### Key patterns
@@ -65,6 +65,8 @@ Meetings always process **oldest first**: the minutes compiler reads earlier min
 **The subscription ceiling.** Subscription LLMs (Gemini Flash → Codex → Claude, tried in order) cannot serve LightRAG, which needs an HTTP endpoint, and none offers embeddings. So two jobs moved to where the subscription *does* reach: the compiler emits entities and relations explicitly rather than letting a 4B local model discover them from prose, and synthesis is split from retrieval (`answer.py`). What remains local is graph traversal.
 
 **Citations are grounded in retrieval.** `answer.Answer.sources` carries the `file_source` values LightRAG actually returned, parsed off the retrieved context — not off the answer prose, which a model can populate with meetings it never read. `db.meetings_by_minutes_names` resolves those filenames back to manifest rows.
+
+**Corrections recompile, they do not patch.** A speaker fix in `review.py` rewinds the meeting to `speakers_resolved` rather than rewriting names in the finished document — the compiler phrased decisions and action items around whoever it thought was speaking, so patching the string leaves the reasoning wrong. The rebuild costs no ASR time, which is what retaining transcripts buys.
 
 **Recompilation.** `TEMPLATE_VERSION` in `pipeline/config.py` is stamped into every minutes file's frontmatter. Bumping it marks existing minutes stale so `pipeline minutes --recompile` rebuilds them from retained transcripts. `index.replace_minutes` deletes the previous LightRAG document before inserting — skipping that leaves both copies in the graph and retrieval starts returning contradictory duplicates.
 

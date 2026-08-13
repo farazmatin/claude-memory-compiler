@@ -29,7 +29,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from pipeline import answer, db, index
+from pipeline import answer, db, index, review
 from pipeline.compile_minutes import extract_title
 from pipeline.config import MINUTES_DIR
 
@@ -46,6 +46,16 @@ class AskRequest(BaseModel):
     # Exposed for the same reason the CLI exposes it: comparing the two is how
     # you tell a retrieval problem from a synthesis problem.
     local: bool = False
+
+
+class SpeakersRequest(BaseModel):
+    # label -> name. An empty string clears a name back to unresolved, which is
+    # the honest state when nobody can tell who spoke.
+    names: dict[str, str]
+
+
+class MinutesRequest(BaseModel):
+    markdown: str = Field(min_length=1)
 
 
 class Citation(BaseModel):
@@ -184,6 +194,77 @@ def create_app() -> FastAPI:
             "duration_sec": meeting.duration_sec,
             "markdown": path.read_text(encoding="utf-8"),
         }
+
+    # ── review queue ──────────────────────────────────────────────────
+
+    def _load(conn, meeting_id: str) -> db.Meeting:
+        meeting = db.get_meeting(conn, meeting_id)
+        if meeting is None:
+            raise HTTPException(status_code=404, detail="No such meeting.")
+        return meeting
+
+    @app.get("/api/review")
+    def review_queue(include_reviewed: bool = False) -> dict:
+        with db.connect() as conn:
+            items = review.queue(conn, include_reviewed=include_reviewed)
+        return {
+            "items": [
+                {
+                    "meeting_id": item.meeting.id,
+                    "date": item.meeting.meeting_date,
+                    "time": item.meeting.meeting_time,
+                    "title": item.title,
+                    "status": item.meeting.status,
+                    "speakers": item.speakers,
+                    "unresolved_labels": item.unresolved_labels,
+                    "unresolved_in_minutes": item.unresolved_in_minutes,
+                    "needs_attention": item.needs_attention,
+                    "reviewed": item.reviewed,
+                }
+                for item in items
+            ]
+        }
+
+    @app.post("/api/meetings/{meeting_id}/speakers")
+    def save_speakers(meeting_id: str, request: SpeakersRequest) -> dict:
+        with db.connect() as conn:
+            meeting = _load(conn, meeting_id)
+            try:
+                recompiling = review.save_speakers(conn, meeting, request.names)
+            except review.ReviewError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "recompiling": recompiling,
+            "detail": (
+                "Names changed - the meeting was rewound so `pipeline minutes` "
+                "rebuilds it from the retained transcript, at no ASR cost."
+                if recompiling
+                else "Speakers confirmed as they were."
+            ),
+        }
+
+    @app.put("/api/meetings/{meeting_id}/minutes")
+    def save_minutes(meeting_id: str, request: MinutesRequest) -> dict:
+        with db.connect() as conn:
+            meeting = _load(conn, meeting_id)
+            _minutes_file(meeting)  # containment check before writing
+            try:
+                path = review.save_minutes(conn, meeting, request.markdown)
+            except review.ReviewError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"saved": path.name, "status": db.MINUTES_COMPILED}
+
+    @app.post("/api/meetings/{meeting_id}/approve")
+    def approve(meeting_id: str) -> dict:
+        with db.connect() as conn:
+            meeting = _load(conn, meeting_id)
+            try:
+                doc_id = review.approve(conn, meeting)
+            except review.ReviewError as exc:
+                # 409, not 500: the corpus is intact and the operator has a
+                # concrete next step, which a server-error page would hide.
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"indexed": True, "lightrag_doc_id": doc_id}
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
