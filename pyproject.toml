@@ -1,13 +1,40 @@
 [project]
-name = "llm-personal-kb"
+name = "meeting-minutes-compiler"
 version = "0.1.0"
-description = "Personal knowledge base compiled from AI conversations - inspired by Karpathy's LLM KB architecture"
+description = "Compiles meeting audio into structured minutes and a graph-RAG knowledge base"
 requires-python = ">=3.12"
 dependencies = [
+    # Minutes generation (subscription-covered, no API key needed)
     "claude-agent-sdk>=0.1.29",
+    # LightRAG server client
+    "httpx>=0.27.0",
+    # Config / time
     "python-dotenv>=1.0.0",
     "tzdata>=2024.1",
+    "pyyaml>=6.0",
+    # Private Drive collection. Imported lazily so non-capture commands remain light.
+    "google-api-python-client>=2.0.0",
+    "google-auth-httplib2>=0.2.0",
+    "google-auth-oauthlib>=1.2.0",
 ]
+
+[project.optional-dependencies]
+# ASR is a heavy, platform-specific install (torch, CUDA libs, rust-built deps).
+# Kept optional so the manifest/minutes/index stages can be installed and tested
+# on machines that will never run transcription.
+asr = [
+    "whisperx>=3.1.1",
+]
+
+[project.scripts]
+pipeline = "pipeline.cli:main"
 
 [tool.ruff]
 line-length = 100
+
+[tool.hatch.build.targets.wheel]
+packages = ["pipeline"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,518 +1,313 @@
-# AGENTS.md - Personal Knowledge Base Schema
+# AGENTS.md — Meeting Minutes Compiler Reference
 
-> Adapted from [Andrej Karpathy's LLM Knowledge Base](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) architecture.
-> Instead of ingesting external articles, this system compiles knowledge from your own AI conversations.
+Complete technical reference. Written so an agent (or a person) can understand,
+modify, or rebuild this system without reading every source file.
 
-## The Compiler Analogy
+## The compiler analogy
 
 ```
-daily/          = source code    (your conversations - the raw material)
-LLM             = compiler       (extracts and organizes knowledge)
-knowledge/      = executable     (structured, queryable knowledge base)
-lint            = test suite     (health checks for consistency)
-queries         = runtime        (using the knowledge)
+audio/        = raw input      (recordings, immutable)
+transcripts/  = source code    (verbatim, immutable, retained forever)
+LLM           = compiler       (extracts structure and rationale)
+minutes/      = object code    (the corpus that gets indexed)
+LightRAG      = linked binary  (knowledge graph + vector index)
+queries       = runtime
 ```
 
-You don't manually organize your knowledge. You have conversations, and the LLM handles the synthesis, cross-referencing, and maintenance.
-
----
+The critical property: **the compile step is repeatable.** Source is retained, so
+a better compiler (an improved `templates/minutes.md`) can rebuild every artifact
+without re-acquiring the source. Transcription is the only irreversible cost, and
+it happens exactly once per recording.
 
 ## Architecture
 
-### Layer 1: `daily/` - Conversation Logs (Immutable Source)
-
-Daily logs capture what happened in your AI coding sessions. These are the "raw sources" - append-only, never edited after the fact.
-
 ```
-daily/
-├── 2026-04-01.md
-├── 2026-04-02.md
-├── ...
-```
-
-Each file follows this format:
-
-```markdown
-# Daily Log: YYYY-MM-DD
-
-## Sessions
-
-### Session (HH:MM) - Brief Title
-
-**Context:** What the user was working on.
-
-**Key Exchanges:**
-- User asked about X, assistant explained Y
-- Decided to use Z approach because...
-- Discovered that W doesn't work when...
-
-**Decisions Made:**
-- Chose library X over Y because...
-- Architecture: went with pattern Z
-
-**Lessons Learned:**
-- Always do X before Y to avoid...
-- The gotcha with Z is that...
-
-**Action Items:**
-- [ ] Follow up on X
-- [ ] Refactor Y when time permits
+Google Drive     durable private source (Easy Voice Recorder Pro / backfill)
+  │  capture     read-only API → verified local handoff in inbox/drive/
+  ▼
+inbox/          audio arrives (Drive handoff, cloud-synced folder, rclone mount)
+  │  ingest      sha256 → dedup → parse filename → ffprobe → copy to audio/
+  ▼
+audio/          archived source                         [Tier 1, never indexed]
+  │  transcribe  ffmpeg 16k mono → ASR → align → diarize
+  ▼
+transcripts/    <id>.json (word-level + speaker), <id>.md (readable turns)
+  │  speakers    SPEAKER_00 → real names
+  │  minutes     Claude Agent SDK + templates/minutes.md + prior context
+  ▼
+minutes/        YYYY-MM-DD-title-<id8>.md               [Tier 2, THE CORPUS]
+  │  index       POST /documents/text
+  ▼
+LightRAG        knowledge graph + vector index          [Tier 3, derived]
+  │  query
+  ▼
+answers with citations
 ```
 
-### Layer 2: `knowledge/` - Compiled Knowledge (LLM-Owned)
+### Why three tiers
 
-The LLM owns this directory entirely. Humans read it but rarely edit it directly.
+Raw transcripts must not reach the index. A one-hour meeting is ~10,000 spoken
+words with maybe 500 words of durable signal — roughly a 5% ratio. Four failure
+modes follow from indexing that directly:
+
+1. **No chunk boundaries.** Speech has no headings; chunks land mid-thought.
+2. **Referential collapse.** "Let's do that instead" is a decision in context and
+   noise as a standalone chunk. Chunking destroys the anaphora that resolved it.
+3. **Embedding dilution.** A 90%-filler chunk embeds toward the centroid of
+   generic meeting talk. Everything resembles everything; precision degrades as
+   the corpus grows — the opposite of what a multi-year archive needs.
+4. **Graph poisoning.** Entity extraction over transcript mints a node per casual
+   mention and an edge per incidental co-occurrence, burying real structure.
+
+Minutes fix all four: structured, dense, entity-preserving, ~600–1200 words.
+
+### Why LightRAG rather than vector RAG
+
+Product-management questions are entity-centric and **aggregative**: "why did we
+deprioritize X", "everything customer Y has said", "history of this request". The
+answers span dozens of meetings. Top-k vector retrieval structurally cannot answer
+a question whose answer lives in 40 documents — it returns 5. LightRAG's graph
+layer plus `global` query mode addresses exactly that shape.
+
+## Stage machine
+
+State lives in `db/manifest.db`. Each stage claims rows at one status and
+advances them.
 
 ```
-knowledge/
-├── index.md              # Master catalog - every article with one-line summary
-├── log.md                # Append-only chronological build log
-├── concepts/             # Atomic knowledge articles
-├── connections/          # Cross-cutting insights linking 2+ concepts
-└── qa/                   # Filed query answers (compounding knowledge)
+discovered ──transcribe──▶ transcribed ──speakers──▶ speakers_resolved
+    ▲                                                        │
+    │                                                     minutes
+  retry                                                      ▼
+    │                                                 minutes_compiled
+  failed ◀── any stage on unrecoverable error              index
+                                                             ▼
+                                                          indexed
 ```
 
-### Layer 3: This File (AGENTS.md)
+**Ordering is load-bearing.** `db.pending()` sorts by `meeting_date, meeting_time`,
+never by discovery time. The minutes compiler reads earlier minutes to populate
+*Changed From Previous Position*; compiling out of order would compare a meeting
+against its own future. This also makes backfill build the graph in the order
+events actually happened.
 
-The schema that tells the LLM how to compile and maintain the knowledge base. This is the "compiler specification."
+**Failure policy differs by stage on purpose.** Transcription failures mark the row
+`failed` (something is wrong with the file or environment; a human should look).
+Minutes failures leave the row at `speakers_resolved` — the transcript is intact
+and a model call is retryable, so the next batch picks it up automatically.
 
----
+### Schema
 
-## Structural Files
+```sql
+meetings(   id PK,              -- full sha256 of audio bytes; also the dedup key
+            source_path, source_name, audio_path,
+            meeting_date, meeting_time, title_hint, duration_sec,
+            status, asr_model, template_version,
+            transcript_path, minutes_path, error, created_at, updated_at)
 
-### `knowledge/index.md` - Master Catalog
+speakers(   meeting_id, label, name, confidence,  PK(meeting_id, label))
 
-A table listing every knowledge article. This is the primary retrieval mechanism - the LLM reads this FIRST when answering any query, then selects relevant articles to read in full.
-
-Format:
-
-```markdown
-# Knowledge Base Index
-
-| Article | Summary | Compiled From | Updated |
-|---------|---------|---------------|---------|
-| [[concepts/supabase-auth]] | Row-level security patterns and JWT gotchas | daily/2026-04-02.md | 2026-04-02 |
-| [[connections/auth-and-webhooks]] | Token verification patterns shared across Supabase auth and Stripe webhooks | daily/2026-04-02.md, daily/2026-04-04.md | 2026-04-04 |
+stage_runs( meeting_id, stage, started_at, finished_at, ok, detail)
 ```
 
-### `knowledge/log.md` - Build Log
+`stage_runs` exists so the CPU budget is validated against measurements rather
+than estimates — `pipeline status` aggregates it.
 
-Append-only chronological record of every compile, query, and lint operation.
+`id` is the **full** sha256, not a truncated prefix. It is the primary key and the
+dedup key; the hashing cost is trivial next to the transcription it protects.
 
-Format:
+## Stages in detail
 
-```markdown
-# Build Log
+### 1. ingest (`pipeline/ingest.py`)
 
-## [2026-04-01T14:30:00] compile | Daily Log 2026-04-01
-- Source: daily/2026-04-01.md
-- Articles created: [[concepts/nextjs-project-structure]], [[concepts/tailwind-setup]]
-- Articles updated: (none)
+Walks `inbox/` recursively for known audio extensions, hashes each file, skips
+anything already in `meetings`.
 
-## [2026-04-02T09:00:00] query | "How do I handle auth redirects?"
-- Consulted: [[concepts/supabase-auth]], [[concepts/nextjs-middleware]]
-- Filed to: [[qa/auth-redirect-handling]]
-```
+**Files are copied, never moved or deleted.** The inbox is expected to be a
+cloud-synced folder — deleting propagates upstream and destroys the original.
+Consequence: every run re-hashes the inbox. That's intentional and cheap (~60s for
+a year's worth), and dedup makes rescanning free.
 
----
+**Filename parsing** handles two conventions:
 
-## Article Formats
+- Pixel Recorder: `Ali Aug 10 at 11-12 a.m..m4a` → date `2026-08-10`, time
+  `11:00`, hint `Ali`. Month-name dates carry no year, so the file's mtime year
+  fills in.
+- ISO: `2026-08-10T1100_roadmap-review.m4a` → hint `roadmap review`.
 
-### Concept Articles (`knowledge/concepts/`)
+The date span is **masked out before searching for a time**. In
+`2026-08-10T1100` the `T` separator is legitimately preceded by a digit, which the
+compact-time lookbehind would otherwise reject; masking also prevents a date from
+overlapping a time pattern (`2026_0810`). Masking preserves string length so match
+offsets stay valid. Unparseable names fall back to mtime, so nothing is ever
+dropped for having a bad name.
 
-One article per atomic piece of knowledge. These are facts, patterns, decisions, preferences, and lessons extracted from your conversations.
+### 0. capture (`pipeline/capture.py`)
 
-```markdown
----
-title: "Concept Name"
-aliases: [alternate-name, abbreviation]
-tags: [domain, topic]
-sources:
-  - "daily/2026-04-01.md"
-  - "daily/2026-04-03.md"
-created: 2026-04-01
-updated: 2026-04-03
----
+The optional Drive capture stage reads only the configured private `future` and
+one-time `backfill` folders. It stages a download through a `.part` file, checks
+the Drive byte count and MD5 when available, then atomically hands it to
+`inbox/drive/`. It never writes, moves, or deletes Drive files.
 
-# Concept Name
+`drive_sources` records the Drive file ID and version, metadata, parsed recording
+date, state, local handoff path, and linked meeting. The collector is safe to
+rerun. The backfill accepts only an explicit filename date on or after
+`2026-06-09`; ambiguous names are held for review. Once it is ingested,
+`pipeline capture --complete-backfill` disables that source.
 
-[2-4 sentence core explanation]
+After a Drive-backed audio file is transcribed, its local archive is deleted and
+the transcript remains. Re-transcription re-downloads only if Drive still serves
+the same file version, never silently substituting modified audio.
 
-## Key Points
+### 2. transcribe (`pipeline/asr.py`)
 
-- [Bullet points, each self-contained]
+Three distinct models doing three orthogonal jobs:
 
-## Details
+| Job | Input → Output | Model |
+|---|---|---|
+| ASR | audio → text | faster-whisper (`large-v3-turbo`) |
+| Alignment | audio + text → per-word times | wav2vec2 |
+| Diarization | audio → who-spoke-when | pyannote |
 
-[Deeper explanation, encyclopedia-style paragraphs]
+Diarization produces **no words**; ASR has **no idea who is speaking**. Merging
+them via `assign_word_speakers` is what makes action-item ownership possible.
 
-## Related Concepts
+Audio is normalized to **16 kHz mono** first. Every ASR model resamples to this
+internally, so it costs no accuracy and turns ~18 MB/hr into ~2–4 MB/hr.
 
-- [[concepts/related-concept]] - How it connects
+`glossary.md` becomes Whisper's `initial_prompt`, capped at ~224 tokens
+(estimated at 4 chars/token, erring small — overrunning silently drops the tail).
+File order is priority order.
 
-## Sources
+Degradation is graceful and loud: a missing alignment model logs and continues
+with segment-level timestamps; a missing `HF_TOKEN` or failed diarization logs and
+continues without speaker labels. A transcript is always worth keeping.
 
-- [[daily/2026-04-01.md]] - Initial discovery during project setup
-- [[daily/2026-04-03.md]] - Updated after debugging session
-```
+`WhisperXBackend` implements the `Backend` protocol
+(`transcribe(path, meeting_id, initial_prompt) -> Transcript`). Swapping in a paid
+API or a GPU model touches this one class — the designed escape hatch from CPU.
 
-### Connection Articles (`knowledge/connections/`)
+Version tolerance: `DiarizationPipeline` is constructed with `token=`, falling back
+to `use_auth_token=` on `TypeError`; `assign_word_speakers` is looked up on both
+`whisperx` and `whisperx.diarize`. Both moved between releases.
 
-Cross-cutting synthesis linking 2+ concepts. Created when a conversation reveals a non-obvious relationship.
+### 3. speakers (`pipeline/speakers.py`)
 
-```markdown
----
-title: "Connection: X and Y"
-connects:
-  - "concepts/concept-x"
-  - "concepts/concept-y"
-sources:
-  - "daily/2026-04-04.md"
-created: 2026-04-04
-updated: 2026-04-04
----
+Cascade, later sources winning:
 
-# Connection: X and Y
+1. **Filename hint** — applied *only* when the meeting has exactly two speakers,
+   the hint is one or two words, and `--owner` is known. The dominant speaker is
+   assumed to be the recorder. All three conditions must hold; otherwise which
+   label to assign is a coin flip.
+2. **LLM pass** over the first four minutes, looking for self-introductions. Given
+   names from previous meetings so recurring attendees get consistent spelling —
+   "Mike" and "Michael" as separate graph nodes is a real failure.
+3. **`speaker-overrides.yaml`** — ground truth, beats everything.
 
-## The Connection
+**Unresolved labels stay unresolved.** The prompt explicitly instructs `null` over
+a guess. A visible `SPEAKER_01` is fixable; a confidently wrong name silently
+assigns work to the wrong person and nobody notices.
 
-[What links these concepts]
+The JSON transcript keeps raw labels as ground truth; the Markdown is rewritten
+with resolved names.
 
-## Key Insight
+### 4. minutes (`pipeline/compile_minutes.py`)
 
-[The non-obvious relationship discovered]
+Claude Agent SDK, no tools, `max_turns=3`. Subscription-covered, which is why the
+highest-value artifact uses it while bulk entity extraction runs on local Ollama.
 
-## Evidence
+Prompt assembles: `templates/minutes.md` (the spec) + meeting metadata + resolved
+attendees + explicit unresolved-label instructions + excerpts from up to 3 earlier
+minutes + turn-merged dialogue.
 
-[Specific examples from conversations]
+Dialogue is **turn-merged**, not segment-per-line: speech chopped every few
+seconds reads as noise and loses track of who is arguing what.
 
-## Related Concepts
+Output is validated to start with `---`. A fence wrapping the whole document is
+stripped first — models fence markdown even when told not to, and a stray ``` ahead
+of the frontmatter breaks every YAML parser downstream.
 
-- [[concepts/concept-x]]
-- [[concepts/concept-y]]
-```
+`template_version` is stamped into frontmatter. `db.stale_template()` finds
+documents built by an older version; `pipeline minutes --recompile` rebuilds them
+from retained transcripts. **This is the payoff for the three-tier design.**
 
-### Q&A Articles (`knowledge/qa/`)
+### 5. index (`pipeline/index.py`)
 
-Filed answers from queries. Every complex question answered by the system can be permanently stored, making future queries smarter.
+`POST /documents/text` with `file_source` set to the filename so citations trace
+back to a meeting. Minutes only. Long timeout (default 600s) because CPU-bound
+entity extraction blocks the request.
 
-```markdown
----
-title: "Q: Original Question"
-question: "The exact question asked"
-consulted:
-  - "concepts/article-1"
-  - "concepts/article-2"
-filed: 2026-04-05
----
-
-# Q: Original Question
-
-## Answer
-
-[The synthesized answer with [[wikilinks]] to sources]
-
-## Sources Consulted
-
-- [[concepts/article-1]] - Relevant because...
-- [[concepts/article-2]] - Provided context on...
-
-## Follow-Up Questions
-
-- What about edge case X?
-- How does this change if Y?
-```
-
----
-
-## Core Operations
-
-### 1. Compile (daily/ -> knowledge/)
-
-When processing a daily log:
-
-1. Read the daily log file
-2. Read `knowledge/index.md` to understand current knowledge state
-3. Read existing articles that may need updating
-4. For each piece of knowledge found in the log:
-   - If an existing concept article covers this topic: UPDATE it with new information, add the daily log as a source
-   - If it's a new topic: CREATE a new `concepts/` article
-5. If the log reveals a non-obvious connection between 2+ existing concepts: CREATE a `connections/` article
-6. UPDATE `knowledge/index.md` with new/modified entries
-7. APPEND to `knowledge/log.md`
-
-**Important guidelines:**
-- A single daily log may touch 3-10 knowledge articles
-- Prefer updating existing articles over creating near-duplicates
-- Use Obsidian-style `[[wikilinks]]` with full relative paths from knowledge/
-- Write in encyclopedia style - factual, concise, self-contained
-- Every article must have YAML frontmatter
-- Every article must link back to its source daily logs
-
-### 2. Query (Ask the Knowledge Base)
-
-1. Read `knowledge/index.md` (the master catalog)
-2. Based on the question, identify 3-10 relevant articles from the index
-3. Read those articles in full
-4. Synthesize an answer with `[[wikilink]]` citations
-5. If `--file-back` is specified: create a `knowledge/qa/` article and update index.md and log.md
-
-**Why this works without RAG:** At personal knowledge base scale (50-500 articles), the LLM reading a structured index outperforms cosine similarity. The LLM understands what the question is really asking and selects pages accordingly. Embeddings find similar words; the LLM finds relevant concepts.
-
-### 3. Lint (Health Checks)
-
-Seven checks, run periodically:
-
-1. **Broken links** - `[[wikilinks]]` pointing to non-existent articles
-2. **Orphan pages** - Articles with zero inbound links from other articles
-3. **Orphan sources** - Daily logs that haven't been compiled yet
-4. **Stale articles** - Source daily log changed since article was last compiled
-5. **Contradictions** - Conflicting claims across articles (requires LLM judgment)
-6. **Missing backlinks** - A links to B but B doesn't link back to A
-7. **Sparse articles** - Below 200 words, likely incomplete
-
-Output: a markdown report with severity levels (error, warning, suggestion).
-
----
-
-## Conventions
-
-- **Wikilinks:** Use Obsidian-style `[[path/to/article]]` without `.md` extension
-- **Writing style:** Encyclopedia-style, factual, third-person where appropriate
-- **Dates:** ISO 8601 (YYYY-MM-DD for dates, full ISO for timestamps in log.md)
-- **File naming:** lowercase, hyphens for spaces (e.g., `supabase-row-level-security.md`)
-- **Frontmatter:** Every article must have YAML frontmatter with at minimum: title, sources, created, updated
-- **Sources:** Always link back to the daily log(s) that contributed to an article
-
----
-
-## Full Project Structure
-
-```
-llm-personal-kb/
-|-- .claude/
-|   |-- settings.json                # Hook configuration (auto-activates in Claude Code)
-|-- .gitignore                       # Excludes runtime state, temp files, caches
-|-- AGENTS.md                        # This file - schema + full technical reference
-|-- README.md                        # Concise overview + quick start
-|-- pyproject.toml                   # Dependencies (at root so hooks can find it)
-|-- daily/                           # "Source code" - conversation logs (immutable)
-|-- knowledge/                       # "Executable" - compiled knowledge (LLM-owned)
-|   |-- index.md                     #   Master catalog - THE retrieval mechanism
-|   |-- log.md                       #   Append-only build log
-|   |-- concepts/                    #   Atomic knowledge articles
-|   |-- connections/                 #   Cross-cutting insights linking 2+ concepts
-|   |-- qa/                          #   Filed query answers (compounding knowledge)
-|-- scripts/                         # CLI tools
-|   |-- compile.py                   #   Compile daily logs -> knowledge articles
-|   |-- query.py                     #   Ask questions (index-guided, no RAG)
-|   |-- lint.py                      #   7 health checks
-|   |-- flush.py                     #   Extract memories from conversations (background)
-|   |-- config.py                    #   Path constants
-|   |-- utils.py                     #   Shared helpers
-|-- hooks/                           # Claude Code hooks
-|   |-- session-start.py             #   Injects knowledge into every session
-|   |-- session-end.py               #   Extracts conversation -> daily log
-|   |-- pre-compact.py               #   Safety net: captures context before compaction
-|-- reports/                         # Lint reports (gitignored)
-```
-
----
-
-## Hook System (Automatic Capture)
-
-Hooks are configured in `.claude/settings.json` and fire automatically when you use Claude Code in this project.
-
-### `.claude/settings.json` Format
-
-```json
-{
-  "hooks": {
-    "SessionStart": [{ "matcher": "", "hooks": [{ "type": "command", "command": "uv run python hooks/session-start.py", "timeout": 15 }] }],
-    "PreCompact": [{ "matcher": "", "hooks": [{ "type": "command", "command": "uv run python hooks/pre-compact.py", "timeout": 10 }] }],
-    "SessionEnd": [{ "matcher": "", "hooks": [{ "type": "command", "command": "uv run python hooks/session-end.py", "timeout": 10 }] }]
-  }
-}
-```
-
-Commands use simple relative paths from the project root. Empty `matcher` catches all events.
-
-### Hook Details
-
-**`session-start.py`** (SessionStart)
-- Pure local I/O, no API calls, runs in under 1 second
-- Reads `knowledge/index.md` and the most recent daily log
-- Outputs JSON to stdout: `{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "..."}}`
-- Claude sees the knowledge base index at the start of every session
-- Max context: 20,000 characters
-
-**`session-end.py`** (SessionEnd)
-- Reads hook input from stdin (JSON with `session_id`, `transcript_path`, `cwd`)
-- Copies the raw JSONL transcript to a temp file (no parsing in the hook - keeps it fast)
-- Spawns `flush.py` as a fully detached background process
-- Recursion guard: exits immediately if `CLAUDE_INVOKED_BY` env var is set
-
-**`pre-compact.py`** (PreCompact)
-- Same architecture as session-end.py
-- Fires before Claude Code auto-compacts the context window
-- Guards against empty `transcript_path` (known Claude Code bug #13668)
-- Critical for long sessions: captures context before summarization discards it
-
-**Why both PreCompact and SessionEnd?** Long-running sessions may trigger multiple auto-compactions before you close the session. Without PreCompact, intermediate context is lost to summarization before SessionEnd ever fires.
-
-### Background Flush Process (`flush.py`)
-
-Spawned by both hooks as a fully detached background process:
-- **Windows:** `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS` flags
-- **Mac/Linux:** `start_new_session=True`
-
-This ensures flush.py survives after Claude Code's hook process exits.
-
-**What flush.py does:**
-1. Sets `CLAUDE_INVOKED_BY=memory_flush` env var (prevents recursive hook firing)
-2. Reads the pre-extracted conversation context from the temp `.md` file
-3. Skips if context is empty or if same session was flushed within 60 seconds (deduplication)
-4. Calls Claude Agent SDK (`query()` with `allowed_tools=[]`, `max_turns=2`)
-5. Claude decides what's worth saving - returns structured bullet points or `FLUSH_OK`
-6. Appends result to `daily/YYYY-MM-DD.md`
-7. Cleans up temp context file
-8. **End-of-day auto-compilation:** If it's past 6 PM local time (`COMPILE_AFTER_HOUR = 18`) and today's daily log has changed since its last compilation (hash comparison against `state.json`), spawns `compile.py` as another detached background process. This means compilation happens automatically once a day without needing a cron job or manual trigger.
-
-### JSONL Transcript Format
-
-Claude Code stores conversations as `.jsonl` files. Messages are nested under a `message` key:
-
-```python
-entry = json.loads(line)
-msg = entry.get("message", {})
-role = msg.get("role", "")     # "user" or "assistant"
-content = msg.get("content", "")  # string or list of content blocks
-```
-
-Content can be a string or a list of blocks (`{"type": "text", "text": "..."}` dicts).
+### 6. query
 
----
+`POST /query`. Modes: `hybrid` (default, graph + vector), `global` (aggregative,
+spans many meetings), `local` (tight entity lookup), `naive` (plain vector).
 
-## Script Details
+For rare verbatim lookups, grep `transcripts/` directly — cheap, precise, no
+embedding cost. That's why they're retained as readable Markdown, not only JSON.
 
-### compile.py - The Compiler
-
-Uses the Claude Agent SDK's async streaming `query()`:
-
-```python
-async for message in query(
-    prompt=compile_prompt,
-    options=ClaudeAgentOptions(
-        cwd=str(ROOT_DIR),
-        system_prompt={"type": "preset", "preset": "claude_code"},
-        allowed_tools=["Read", "Write", "Edit", "Glob", "Grep"],
-        permission_mode="acceptEdits",
-        max_turns=30,
-    ),
-):
-```
+## Configuration
 
-- Builds a prompt with: AGENTS.md schema, current index, all existing articles, and the daily log
-- Claude reads the daily log, decides what concepts to extract, and writes files directly
-- `permission_mode="acceptEdits"` auto-approves all file operations
-- Incremental: tracks SHA-256 hashes of daily logs in `state.json`, skips unchanged files
-- Cost: ~$0.45-0.65 per daily log (increases as KB grows)
+Everything in `pipeline/config.py`, all overridable by environment variable.
 
-**CLI:**
-```bash
-uv run python scripts/compile.py              # compile new/changed only
-uv run python scripts/compile.py --all        # force recompile everything
-uv run python scripts/compile.py --file daily/2026-04-01.md
-uv run python scripts/compile.py --dry-run
-```
+| Variable | Default | Notes |
+|---|---|---|
+| `MMC_TIMEZONE` | `America/Toronto` | Meeting dates depend on it; wrong value mislabels the corpus |
+| `MMC_ASR_MODEL` | `large-v3-turbo` | `large-v3` only if you have a GPU |
+| `MMC_ASR_DEVICE` | `cpu` | |
+| `MMC_ASR_COMPUTE_TYPE` | `int8` | `float16` on GPU |
+| `MMC_DIARIZATION` | `1` | `0` disables (much faster, no owners) |
+| `HF_TOKEN` | — | Required for diarization |
+| `MMC_LIGHTRAG_URL` | `http://localhost:9621` | |
+| `MMC_INBOX` / `_AUDIO` / `_TRANSCRIPTS` / `_MINUTES` / `_DB_DIR` | repo-relative | Point Tier 1 at bulk storage |
 
-### query.py - Index-Guided Retrieval
+`TEMPLATE_VERSION` is a code constant, not an env var — it must move together with
+the template it describes.
 
-Loads the entire knowledge base into context (index + all articles). No RAG.
+## Known upstream issues, already worked around
 
-At personal KB scale (50-500 articles), the LLM reading a structured index outperforms vector similarity. The LLM understands what you're really asking; cosine similarity just finds similar words.
+| Issue | Symptom | Workaround (in `docker-compose.yml`) |
+|---|---|---|
+| [LightRAG#2495](https://github.com/HKUDS/LightRAG/issues/2495) | Embeddings fail on Ollama 0.13.x | Pin `ollama/ollama:0.12.11` |
+| [LightRAG#2023](https://github.com/HKUDS/LightRAG/issues/2023) | Server won't boot on Ollama bindings | Set a dummy `OPENAI_API_KEY` |
+| pyannote gating | Diarization fails at *runtime*, not install | `HF_TOKEN` + accept model terms |
+| `EMBEDDING_DIM` mismatch | Opaque dimension error at insert | Must match model (mxbai-embed-large = 1024) |
 
-**CLI:**
-```bash
-uv run python scripts/query.py "What auth patterns do I use?"
-uv run python scripts/query.py "What's my error handling strategy?" --file-back
-```
+CPU contention is also configured for: `MAX_ASYNC=2`, `MAX_PARALLEL_INSERT=1`,
+`OLLAMA_NUM_PARALLEL=1`, `OLLAMA_KEEP_ALIVE=30m`. Transcription and indexing share
+one CPU in the nightly batch; without these they fight for cores and both slow
+down. `OLLAMA_KEEP_ALIVE` matters because LightRAG makes many small extraction
+calls, and reloading weights between them otherwise dominates runtime.
 
-With `--file-back`, creates a Q&A article in `knowledge/qa/` and updates the index and log. This is the compounding loop - every question makes the KB smarter.
+## Cost model
 
-### lint.py - Health Checks
+- **Transcription** — free, CPU time only. ~30–50 min per meeting.
+- **Minutes** — Claude subscription, no metered cost. One call per meeting.
+- **Indexing** — free, local Ollama. Several extraction calls per document,
+  ~5–20 min on CPU.
+- **Queries** — free, local Ollama.
 
-Seven checks:
+Total marginal cost per meeting is electricity. The tradeoff is a ~4 hour nightly
+batch, which is why `pipeline run` belongs on a timer rather than a file watcher.
 
-| Check | Type | Catches |
-|-------|------|---------|
-| Broken links | Structural | `[[wikilinks]]` to non-existent articles |
-| Orphan pages | Structural | Articles with zero inbound links |
-| Orphan sources | Structural | Daily logs not yet compiled |
-| Stale articles | Structural | Source logs changed since compilation |
-| Missing backlinks | Structural | A links to B but B doesn't link back |
-| Sparse articles | Structural | Under 200 words |
-| Contradictions | LLM | Conflicting claims across articles |
+## Extending
 
-**CLI:**
-```bash
-uv run python scripts/lint.py                    # all checks
-uv run python scripts/lint.py --structural-only  # skip LLM check (free)
-```
+**Better ASR** — implement `Backend` in `pipeline/asr.py`. Candidates as of
+mid-2026: Granite Speech 4.1 2B and Cohere Transcribe 2B lead the open leaderboard;
+Parakeet TDT leads on speed. Note leaderboard WER is measured on clean read
+speech — fractional-percent gaps are noise next to what far-field meeting audio
+does to accuracy. Measure on your own recordings first.
 
-Reports saved to `reports/lint-YYYY-MM-DD.md`.
+**Better diarization** — Sortformer v2 and DiariZen benchmark ahead of pyannote
+specifically on meeting audio, though both are GPU-oriented. pyannote 4.0
+community-1 supersedes the 3.1 that whisperx bundles.
 
----
+**True temporal reasoning** — *Changed From Previous Position* is a pragmatic
+approximation. If "which decision is current?" becomes the dominant question,
+Graphiti offers real bi-temporal modeling: facts carry validity windows and are
+invalidated rather than deleted when superseded. It's a library, not a service, and
+needs Neo4j or FalkorDB — a deliberate escalation, not a starting point.
 
-## State Tracking
-
-`scripts/state.json` tracks:
-- `ingested` - map of daily log filenames to SHA-256 hashes, compilation timestamps, and costs
-- `query_count` - total queries run
-- `last_lint` - timestamp of most recent lint
-- `total_cost` - cumulative API cost
-
-`scripts/last-flush.json` tracks flush deduplication (session_id + timestamp).
-
-Both are gitignored and regenerated automatically.
-
----
-
-## Dependencies
-
-`pyproject.toml` (at project root):
-- `claude-agent-sdk>=0.1.29` - Claude Agent SDK for LLM calls with tool use
-- `python-dotenv>=1.0.0` - Environment variable management
-- `tzdata>=2024.1` - Timezone data
-- Python 3.12+, managed by [uv](https://docs.astral.sh/uv/)
-
-No API key needed - uses Claude Code's built-in credentials at `~/.claude/.credentials.json`.
-
----
-
-## Costs
-
-| Operation | Cost |
-|-----------|------|
-| Compile one daily log | $0.45-0.65 |
-| Query (no file-back) | ~$0.15-0.25 |
-| Query (with file-back) | ~$0.25-0.40 |
-| Full lint (with contradictions) | ~$0.15-0.25 |
-| Structural lint only | $0.00 |
-| Memory flush (per session) | ~$0.02-0.05 |
-
----
-
-## Customization
-
-### Additional Article Types
-
-Add directories like `people/`, `projects/`, `tools/` to `knowledge/`. Define the article format in this file (AGENTS.md) and update `utils.py`'s `list_wiki_articles()` to include them.
-
-### Obsidian Integration
-
-The knowledge base is pure markdown with `[[wikilinks]]` - works natively in Obsidian. Point a vault at `knowledge/` for graph view, backlinks, and search.
-
-### Scaling Beyond Index-Guided Retrieval
-
-At ~2,000+ articles / ~2M+ tokens, the index becomes too large for the context window. At that point, add hybrid RAG (keyword + semantic search) as a retrieval layer before the LLM. See Karpathy's recommendation of `qmd` by Tobi Lutke for search at scale.
+**Claude Code integration** — a `SessionStart` hook could inject the LightRAG index
+into coding sessions. The previous system in this repo did something similar but
+inlined the *entire* knowledge base into every prompt, so cost and context grew
+linearly with corpus size. Query the index; never dump it.
