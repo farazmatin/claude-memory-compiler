@@ -27,7 +27,10 @@ it happens exactly once per recording.
 ## Architecture
 
 ```
-inbox/          audio arrives (cloud-synced folder, rclone mount, anything)
+Google Drive     durable private source (Easy Voice Recorder Pro / backfill)
+  │  capture     read-only API → verified local handoff in inbox/drive/
+  ▼
+inbox/          audio arrives (Drive handoff, cloud-synced folder, rclone mount)
   │  ingest      sha256 → dedup → parse filename → ffprobe → copy to audio/
   ▼
 audio/          archived source                         [Tier 1, never indexed]
@@ -177,6 +180,23 @@ compact-time lookbehind would otherwise reject; masking also prevents a date fro
 overlapping a time pattern (`2026_0810`). Masking preserves string length so match
 offsets stay valid. Unparseable names fall back to mtime, so nothing is ever
 dropped for having a bad name.
+
+### 0. capture (`pipeline/capture.py`)
+
+The optional Drive capture stage reads only the configured private `future` and
+one-time `backfill` folders. It stages a download through a `.part` file, checks
+the Drive byte count and MD5 when available, then atomically hands it to
+`inbox/drive/`. It never writes, moves, or deletes Drive files.
+
+`drive_sources` records the Drive file ID and version, metadata, parsed recording
+date, state, local handoff path, and linked meeting. The collector is safe to
+rerun. The backfill accepts only an explicit filename date on or after
+`2026-06-09`; ambiguous names are held for review. Once it is ingested,
+`pipeline capture --complete-backfill` disables that source.
+
+After a Drive-backed audio file is transcribed, its local archive is deleted and
+the transcript remains. Re-transcription re-downloads only if Drive still serves
+the same file version, never silently substituting modified audio.
 
 ### 2. transcribe (`pipeline/asr.py`)
 

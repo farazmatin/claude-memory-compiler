@@ -73,6 +73,7 @@ uv run pipeline run
 
 less minutes/*.md                              # read what it wrote
 uv run pipeline query "what did we decide?"
+uv run pipeline dashboard --open               # or browse it all in a UI
 ```
 
 Expect ~30–50 minutes for a one-hour recording on CPU.
@@ -124,10 +125,21 @@ subscription *does* reach:
 
 What remains local is graph traversal. That's narrowed, not eliminated.
 
+For automatic phone capture, follow [USER_GUIDE.md](USER_GUIDE.md). It covers
+Easy Voice Recorder Pro, private Google Drive setup, the June 9, 2026 backfill
+cutoff, and a real end-to-end acceptance test.
+
+For the speaker-label workflow—including diarization, identity resolution,
+recurring attendees, new guests, and manual overrides—see
+[SPEAKER_GUIDE.md](SPEAKER_GUIDE.md).
+
 ## Commands
 
 ```bash
 pipeline init                     # create directories and the manifest
+pipeline auth-drive               # one-time private Drive authorization
+pipeline capture --dry-run        # preview approved Drive recordings
+pipeline capture                  # download approved Drive recordings
 pipeline doctor                   # preflight the environment (run this first)
 pipeline ingest                   # discover + dedup new audio
 pipeline transcribe               # ASR + alignment + diarization  (the slow one)
@@ -136,6 +148,7 @@ pipeline minutes                  # compile structured minutes
 pipeline index                    # push minutes into LightRAG
 pipeline run                      # every pending stage, in order
 pipeline status                   # where everything is, plus real stage timings
+pipeline dashboard --open         # local, read-only meeting library and RAG search
 pipeline query "question"         # ask the knowledge base
 pipeline query "..." --mode global   # for answers spanning many meetings
 pipeline query "..." --timing     # retrieval vs synthesis time
@@ -145,10 +158,26 @@ pipeline entities                 # most-mentioned entities (graph health check)
 pipeline minutes --recompile      # rebuild after a template change, no ASR cost
 pipeline backup --to /mnt/backup  # snapshot everything irreplaceable
 pipeline retry                    # requeue whatever failed
+pipeline capture --complete-backfill  # permanently disable the one-time backfill folder
 ```
 
 `pipeline run` exits **non-zero if any stage failed**, so a nightly cron reports a
 broken batch instead of silently succeeding.
+
+## Meeting Memory dashboard
+
+After the local index is running, open the operator view with:
+
+```powershell
+uv run pipeline dashboard --open
+```
+
+It listens only on `127.0.0.1:8765` by default and never changes Drive, the
+manifest, transcripts, minutes, or speaker records. It provides the meeting
+library, compiled minutes, a link back to the original private Drive audio,
+speaker-review signals, and the same evidence-backed RAG search as `pipeline
+query`. Press `Ctrl+C` in its terminal to stop it. Use `--port 8766` if the
+default port is occupied.
 
 Each stage claims meetings at one status and advances them to the next, tracked in
 `db/manifest.db`. Stages are independent and resumable — a crash during minutes

@@ -12,6 +12,10 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "tzdata>=2024.1",
     "pyyaml>=6.0",
+    # Private Drive collection. Imported lazily so non-capture commands remain light.
+    "google-api-python-client>=2.0.0",
+    "google-auth-httplib2>=0.2.0",
+    "google-auth-oauthlib>=1.2.0",
 ]
 
 [project.optional-dependencies]

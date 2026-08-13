@@ -77,6 +77,37 @@ CREATE TABLE IF NOT EXISTS stage_runs (
 
 CREATE INDEX IF NOT EXISTS idx_stage_runs_meeting ON stage_runs(meeting_id, stage);
 
+CREATE TABLE IF NOT EXISTS drive_sources (
+    drive_file_id   TEXT NOT NULL,
+    drive_version   TEXT NOT NULL,
+    folder_kind     TEXT NOT NULL,      -- future | backfill
+    source_name     TEXT NOT NULL,
+    mime_type       TEXT,
+    byte_size       INTEGER,
+    md5_checksum    TEXT,
+    created_time    TEXT,
+    modified_time   TEXT,
+    web_view_link   TEXT,
+    recording_date  TEXT,
+    state           TEXT NOT NULL,      -- staged | ingested | excluded | ambiguous
+    local_path      TEXT,
+    meeting_id      TEXT,
+    error           TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (drive_file_id, drive_version),
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_drive_sources_state ON drive_sources(state);
+CREATE INDEX IF NOT EXISTS idx_drive_sources_meeting ON drive_sources(meeting_id);
+
+CREATE TABLE IF NOT EXISTS pipeline_settings (
+    key     TEXT PRIMARY KEY,
+    value   TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 -- Canonical people. Speaker resolution and entity extraction both normalize
 -- through this, so "Mike", "Michael" and "michael" become one graph node instead
 -- of three. Without it, cross-year spelling consistency depends on the LLM
@@ -170,10 +201,39 @@ class Meeting:
         return f"{date} {hint} ({self.short_id})"
 
 
+@dataclass
+class DriveSource:
+    """One immutable Drive file version tracked by the capture stage."""
+
+    drive_file_id: str
+    drive_version: str
+    folder_kind: str
+    source_name: str
+    mime_type: str | None
+    byte_size: int | None
+    md5_checksum: str | None
+    created_time: str | None
+    modified_time: str | None
+    web_view_link: str | None
+    recording_date: str | None
+    state: str
+    local_path: str | None
+    meeting_id: str | None
+    error: str | None
+    created_at: str
+    updated_at: str
+
+
 def _row_to_meeting(row: sqlite3.Row) -> Meeting:
     # .keys() is required here: iterating a sqlite3.Row yields VALUES, not keys,
     # so SIM118's suggested rewrite would silently build a broken mapping.
     return Meeting(**{k: row[k] for k in row.keys()})  # noqa: SIM118
+
+
+def _row_to_drive_source(row: sqlite3.Row) -> DriveSource:
+    # .keys() is required: iterating a sqlite3.Row yields VALUES, not keys, so
+    # SIM118's suggested rewrite would silently build a broken mapping.
+    return DriveSource(**{k: row[k] for k in row.keys()})  # noqa: SIM118
 
 
 @contextmanager
@@ -675,3 +735,108 @@ def stage_timings(conn: sqlite3.Connection) -> list[dict[str, object]]:
         """
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── Drive capture ────────────────────────────────────────────────────
+
+def get_drive_source(
+    conn: sqlite3.Connection, drive_file_id: str, drive_version: str
+) -> DriveSource | None:
+    row = conn.execute(
+        "SELECT * FROM drive_sources WHERE drive_file_id = ? AND drive_version = ?",
+        (drive_file_id, drive_version),
+    ).fetchone()
+    return _row_to_drive_source(row) if row else None
+
+
+def get_drive_source_for_meeting(conn: sqlite3.Connection, meeting_id: str) -> DriveSource | None:
+    row = conn.execute(
+        "SELECT * FROM drive_sources WHERE meeting_id = ? ORDER BY updated_at DESC LIMIT 1",
+        (meeting_id,),
+    ).fetchone()
+    return _row_to_drive_source(row) if row else None
+
+
+def upsert_drive_source(
+    conn: sqlite3.Connection,
+    *,
+    drive_file_id: str,
+    drive_version: str,
+    folder_kind: str,
+    source_name: str,
+    mime_type: str | None,
+    byte_size: int | None,
+    md5_checksum: str | None,
+    created_time: str | None,
+    modified_time: str | None,
+    web_view_link: str | None,
+    recording_date: str | None,
+    state: str,
+    local_path: str | None = None,
+    error: str | None = None,
+) -> None:
+    """Record capture state without overwriting a linked meeting."""
+    ts = now_iso()
+    conn.execute(
+        """
+        INSERT INTO drive_sources (
+            drive_file_id, drive_version, folder_kind, source_name, mime_type,
+            byte_size, md5_checksum, created_time, modified_time, web_view_link,
+            recording_date, state, local_path, error, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(drive_file_id, drive_version) DO UPDATE SET
+            folder_kind = excluded.folder_kind,
+            source_name = excluded.source_name,
+            mime_type = excluded.mime_type,
+            byte_size = excluded.byte_size,
+            md5_checksum = excluded.md5_checksum,
+            created_time = excluded.created_time,
+            modified_time = excluded.modified_time,
+            web_view_link = excluded.web_view_link,
+            recording_date = excluded.recording_date,
+            state = excluded.state,
+            local_path = excluded.local_path,
+            error = excluded.error,
+            updated_at = excluded.updated_at
+        """,
+        (
+            drive_file_id, drive_version, folder_kind, source_name, mime_type,
+            byte_size, md5_checksum, created_time, modified_time, web_view_link,
+            recording_date, state, local_path, error, ts, ts,
+        ),
+    )
+
+
+def staged_drive_sources(conn: sqlite3.Connection) -> list[DriveSource]:
+    rows = conn.execute(
+        "SELECT * FROM drive_sources WHERE state = 'staged' ORDER BY created_at"
+    ).fetchall()
+    return [_row_to_drive_source(row) for row in rows]
+
+
+def link_drive_source_to_meeting(
+    conn: sqlite3.Connection, drive_file_id: str, drive_version: str, meeting_id: str
+) -> None:
+    conn.execute(
+        """
+        UPDATE drive_sources
+        SET state = 'ingested', meeting_id = ?, local_path = NULL, error = NULL, updated_at = ?
+        WHERE drive_file_id = ? AND drive_version = ?
+        """,
+        (meeting_id, now_iso(), drive_file_id, drive_version),
+    )
+
+
+def get_setting(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM pipeline_settings WHERE key = ?", (key,)).fetchone()
+    return str(row["value"]) if row else None
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO pipeline_settings (key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (key, value, now_iso()),
+    )

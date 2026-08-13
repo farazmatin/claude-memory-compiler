@@ -270,6 +270,7 @@ def build_prompt(
     transcript: Transcript,
     speaker_names: dict[str, str],
     prior_context: str,
+    source_audio: str,
     dialogue: str | None = None,
     condensed: bool = False,
 ) -> str:
@@ -284,7 +285,6 @@ def build_prompt(
         if unresolved
         else ""
     )
-    audio_rel = _relative(meeting.audio_path)
     transcript_rel = _relative(meeting.transcript_path)
     body = dialogue if dialogue is not None else render_dialogue(transcript, speaker_names)
 
@@ -314,7 +314,7 @@ structured minutes that follow the specification exactly.
 - Duration: {format_timestamp(transcript.duration_sec)}
 - Resolved attendees: {", ".join(attendees)}{unresolved_note}
 - template_version: "{TEMPLATE_VERSION}"
-- source_audio: {audio_rel}
+- source_audio: {source_audio}
 - source_transcript: {transcript_rel}
 
 ## Earlier minutes, for detecting reversals
@@ -405,6 +405,7 @@ def compile_meeting(
         # Topical retrieval uses the full dialogue, not the condensed form, so
         # term extraction sees what was actually said.
         load_prior_context(conn, meeting, dialogue=full_dialogue),
+        source_audio_reference(conn, meeting),
         dialogue=dialogue,
         condensed=condensed,
     )
@@ -428,3 +429,11 @@ def compile_meeting(
     path = minutes_path(meeting, extract_title(document))
     path.write_text(document + "\n", encoding="utf-8")
     return path, document
+
+
+def source_audio_reference(conn, meeting: db.Meeting) -> str:
+    """Prefer the permanent Drive reference after local audio has been reclaimed."""
+    drive_source = db.get_drive_source_for_meeting(conn, meeting.id)
+    if drive_source and drive_source.web_view_link:
+        return drive_source.web_view_link
+    return _relative(meeting.audio_path)

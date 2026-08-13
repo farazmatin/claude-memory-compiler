@@ -39,7 +39,7 @@ type: standup | one-on-one | stakeholder | discovery | review | planning | other
 attendees: [Name, Name]
 entities: [Feature or project names, customers, releases discussed]
 template_version: "N"
-source_audio: relative/path/to/audio
+source_audio: relative/path/to/audio-or-private-drive-link
 source_transcript: relative/path/to/transcript
 ---
 

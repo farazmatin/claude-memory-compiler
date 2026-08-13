@@ -6,12 +6,15 @@ costs 30-50 CPU-minutes per meeting and must never be repeated, so a crash durin
 minutes compilation loses minutes of work rather than hours.
 
     pipeline init                  create dirs and the manifest
+    pipeline auth-drive            authorize the private Drive collector
+    pipeline capture               download new Drive audio into the inbox
     pipeline ingest                discover + dedup new audio
     pipeline transcribe            ASR + align + diarize      (the expensive one)
     pipeline speakers              resolve SPEAKER_xx -> names
     pipeline minutes               compile structured minutes
     pipeline index                 push minutes into LightRAG
     pipeline run                   every pending stage, in order
+    pipeline dashboard             browse and search the local meeting record
     pipeline query "question"      ask the knowledge base
     pipeline status                where everything is, plus stage timings
     pipeline retry                 requeue failed meetings
@@ -28,8 +31,14 @@ import sys
 import traceback
 from pathlib import Path
 
-from pipeline import compile_minutes, db, entities, index, ingest, speakers
-from pipeline.config import OWNER_NAME, TEMPLATE_VERSION, ensure_dirs
+from pipeline import capture, compile_minutes, db, entities, index, ingest, speakers
+from pipeline.config import (
+    DASHBOARD_HOST,
+    DASHBOARD_PORT,
+    OWNER_NAME,
+    TEMPLATE_VERSION,
+    ensure_dirs,
+)
 
 # Stage names as recorded in stage_runs, for timing analysis.
 STAGE_TRANSCRIBE = "transcribe"
@@ -97,11 +106,14 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     db.init_db()
     print("Scanning inbox...")
     counts = ingest.run()
+    linked = capture.reconcile_ingested()
     print(
         f"\nscanned {counts['scanned']}, ingested {counts['ingested']}, "
         f"duplicate {counts['duplicate']}, skipped {counts['skipped']}, "
         f"failed {counts['failed']}"
     )
+    if linked:
+        print(f"released {linked} local Drive handoff file(s)")
     if args.then_run:
         # Skip ingest inside the chain: it just ran, and re-running it would
         # re-hash the whole inbox for nothing.
@@ -109,6 +121,42 @@ def cmd_ingest(args: argparse.Namespace) -> int:
             argparse.Namespace(limit=None, no_llm=False, owner=None),
             include_ingest=False,
         )
+    return 1 if counts["failed"] else 0
+
+
+def cmd_auth_drive(_args: argparse.Namespace) -> int:
+    try:
+        capture.authorize()
+    except capture.CaptureError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_capture(args: argparse.Namespace) -> int:
+    if args.complete_backfill:
+        try:
+            capture.complete_backfill()
+        except capture.CaptureError as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        print("Backfill folder disabled. Future recordings remain enabled.")
+        return 0
+
+    try:
+        counts = capture.run(dry_run=args.dry_run)
+    except capture.CaptureError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    if not any(counts.values()):
+        print("Drive capture is not configured; skipping.")
+        return 0
+    verb = "eligible" if args.dry_run else "downloaded"
+    print(
+        f"Drive capture: scanned {counts['scanned']}, {verb} {counts[verb]}, "
+        f"known {counts['already_known']}, excluded {counts['excluded']}, "
+        f"ambiguous {counts['ambiguous']}, failed {counts['failed']}"
+    )
     return 1 if counts["failed"] else 0
 
 
@@ -134,7 +182,18 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
     failures = 0
     for position, meeting in enumerate(queue, 1):
         print(f"[{position}/{len(queue)}] {meeting.label}")
-        if not meeting.audio_path:
+        audio_path = meeting.audio_path
+        if not audio_path:
+            try:
+                audio_path = str(capture.rehydrate_audio(meeting))
+                print("    rehydrated archived source from Drive")
+            except capture.CaptureError as exc:
+                with db.connect() as conn:
+                    db.mark_failed(conn, meeting.id, str(exc))
+                failures += 1
+                print(f"    FAILED {exc}")
+                continue
+        if not audio_path:
             with db.connect() as conn:
                 db.mark_failed(conn, meeting.id, "no audio_path recorded")
             failures += 1
@@ -144,7 +203,7 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
             run_id = db.start_stage(conn, meeting.id, STAGE_TRANSCRIBE)
         try:
             transcript = backend.transcribe(
-                Path(meeting.audio_path), meeting.id, prompt
+                Path(audio_path), meeting.id, prompt
             )
             json_path = asr.save_transcript(transcript)
             with db.connect() as conn:
@@ -159,6 +218,11 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
                     asr_model=transcript.model,
                     duration_sec=transcript.duration_sec or meeting.duration_sec,
                 )
+            try:
+                if capture.cleanup_transcribed_audio(meeting.id, audio_path):
+                    print("    released local Drive audio")
+            except capture.CaptureError as exc:
+                print(f"    WARNING {exc}")
             print(
                 f"    {len(transcript.segments)} segments, "
                 f"{len(transcript.speaker_labels)} speaker(s)"
@@ -360,6 +424,7 @@ def _run_all(args: argparse.Namespace, include_ingest: bool = True) -> int:
     """
     stages: list[tuple[str, object, argparse.Namespace]] = []
     if include_ingest:
+        stages.append(("capture", cmd_capture, argparse.Namespace(dry_run=False, complete_backfill=False)))
         stages.append(("ingest", cmd_ingest, argparse.Namespace(then_run=False)))
     stages += [
         # keep_going stays False here. It means "exit 0 despite failures", which is
@@ -376,7 +441,6 @@ def _run_all(args: argparse.Namespace, include_ingest: bool = True) -> int:
             limit=args.limit, recompile=False, traceback=False)),
         ("index", cmd_index, argparse.Namespace(limit=args.limit)),
     ]
-
     failed: list[str] = []
     crashes: list[str] = []
     for name, handler, stage_args in stages:
@@ -426,6 +490,14 @@ def cmd_query(args: argparse.Namespace) -> int:
     print(result.text)
     if args.timing:
         print(f"\n{result.timing_line()}")
+    return 0
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Open the local, read-only meeting-memory control room."""
+    from pipeline import dashboard
+
+    dashboard.run(host=args.host, port=args.port, open_browser=args.open)
     return 0
 
 
@@ -560,6 +632,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ingest.set_defaults(func=cmd_ingest)
 
+    subparsers.add_parser("auth-drive", help="authorize private Google Drive access").set_defaults(
+        func=cmd_auth_drive
+    )
+    p_capture = subparsers.add_parser("capture", help="download approved Drive audio")
+    p_capture.add_argument("--dry-run", action="store_true", help="preview eligible Drive files")
+    p_capture.add_argument(
+        "--complete-backfill",
+        action="store_true",
+        help="disable the one-time backfill folder after it has been ingested",
+    )
+    p_capture.set_defaults(func=cmd_capture)
+
     p_transcribe = subparsers.add_parser(
         "transcribe", help="ASR + alignment + diarization (slow)"
     )
@@ -621,6 +705,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="report retrieval vs synthesis time, to see which phase is slow",
     )
     p_query.set_defaults(func=cmd_query)
+
+    p_dashboard = subparsers.add_parser(
+        "dashboard", help="browse and search the local meeting record"
+    )
+    p_dashboard.add_argument(
+        "--host", default=DASHBOARD_HOST,
+        help="bind address (default: loopback only)",
+    )
+    p_dashboard.add_argument(
+        "--port", type=int, default=DASHBOARD_PORT,
+        help=f"listen port (default: {DASHBOARD_PORT})",
+    )
+    p_dashboard.add_argument(
+        "--open", action="store_true", help="open the dashboard in the default browser"
+    )
+    p_dashboard.set_defaults(func=cmd_dashboard)
 
     p_people = subparsers.add_parser("people", help="inspect the people registry")
     p_people.add_argument(

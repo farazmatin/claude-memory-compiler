@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 INBOX_DIR = Path(os.environ.get("MMC_INBOX", ROOT_DIR / "inbox"))
+DRIVE_HANDOFF_DIR = INBOX_DIR / "drive"
 AUDIO_DIR = Path(os.environ.get("MMC_AUDIO", ROOT_DIR / "audio"))
 TRANSCRIPTS_DIR = Path(os.environ.get("MMC_TRANSCRIPTS", ROOT_DIR / "transcripts"))
 MINUTES_DIR = Path(os.environ.get("MMC_MINUTES", ROOT_DIR / "minutes"))
@@ -27,7 +28,9 @@ GLOSSARY_FILE = ROOT_DIR / "glossary.md"
 MINUTES_TEMPLATE_FILE = TEMPLATES_DIR / "minutes.md"
 SPEAKER_OVERRIDES_FILE = ROOT_DIR / "speaker-overrides.yaml"
 
-ALL_DIRS = [INBOX_DIR, AUDIO_DIR, TRANSCRIPTS_DIR, MINUTES_DIR, DB_DIR, TEMPLATES_DIR]
+ALL_DIRS = [
+    INBOX_DIR, DRIVE_HANDOFF_DIR, AUDIO_DIR, TRANSCRIPTS_DIR, MINUTES_DIR, DB_DIR, TEMPLATES_DIR,
+]
 
 # Audio extensions we will pick up out of the inbox.
 AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".opus", ".mp4"}
@@ -148,6 +151,31 @@ LIGHTRAG_TIMEOUT = float(os.environ.get("MMC_LIGHTRAG_TIMEOUT", "600"))
 # hybrid = graph + vector. Use "global" for aggregative questions whose answer
 # spans many meetings ("summarize all budget discussion this year").
 LIGHTRAG_DEFAULT_MODE = os.environ.get("MMC_LIGHTRAG_MODE", "hybrid")
+
+# ── Local meeting-memory dashboard ────────────────────────────────────
+# It renders private minutes and Drive links, so LAN exposure requires an explicit
+# environment override. The default remains available only on this machine.
+DASHBOARD_HOST = os.environ.get("MMC_DASHBOARD_HOST", "127.0.0.1")
+DASHBOARD_PORT = int(os.environ.get("MMC_DASHBOARD_PORT", "8765"))
+
+# ── Google Drive capture ─────────────────────────────────────────────
+# Audio reaches this pipeline through a private Drive folder populated by Easy
+# Voice Recorder Pro. Drive is the durable raw-audio archive; this machine only
+# keeps an audio file long enough to make the retained transcript.
+APP_DATA_DIR = Path(
+    os.environ.get(
+        "MMC_APP_DATA",
+        Path(os.environ.get("LOCALAPPDATA", ROOT_DIR / ".local")) / "MeetingMinutesCompiler",
+    )
+)
+DRIVE_CREDENTIALS_FILE = Path(
+    os.environ.get("MMC_DRIVE_CREDENTIALS", APP_DATA_DIR / "drive-client.json")
+)
+DRIVE_TOKEN_FILE = Path(os.environ.get("MMC_DRIVE_TOKEN", APP_DATA_DIR / "drive-token.json"))
+DRIVE_FUTURE_FOLDER_ID = os.environ.get("MMC_DRIVE_FUTURE_FOLDER_ID", "")
+DRIVE_BACKFILL_FOLDER_ID = os.environ.get("MMC_DRIVE_BACKFILL_FOLDER_ID", "")
+DRIVE_BACKFILL_CUTOFF = os.environ.get("MMC_DRIVE_BACKFILL_CUTOFF", "2026-06-09")
+DRIVE_SCOPES = ("https://www.googleapis.com/auth/drive.readonly",)
 
 
 # ── Time helpers ──────────────────────────────────────────────────────

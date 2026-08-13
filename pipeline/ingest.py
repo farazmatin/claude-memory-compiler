@@ -149,6 +149,12 @@ def parse_filename(path: Path, mtime: datetime) -> ParsedName:
     )
 
 
+def parse_explicit_filename_date(path: Path, fallback_year: int) -> str | None:
+    """Return only an explicitly encoded recording date, never an mtime fallback."""
+    date, _ = _parse_date(path.stem, fallback_year)
+    return date
+
+
 # ── Audio probing ─────────────────────────────────────────────────────
 
 def probe_duration(path: Path) -> float | None:
