@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>Meeting Memory</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="masthead">
+        <div>
+          <p class="eyebrow">PRIVATE MEETING ARCHIVE</p>
+          <h1>Meeting<br /><em>Memory</em></h1>
+        </div>
+        <div class="masthead-note">
+          <span class="live-dot" aria-hidden="true"></span>
+          <span id="rag-health">Checking local index…</span>
+          <p>Minutes are the record.<br />Audio stays in Drive.</p>
+        </div>
+      </header>
+
+      <section class="signal-strip" aria-label="Archive status">
+        <article><strong id="meeting-count">—</strong><span>meetings held</span></article>
+        <article><strong id="indexed-count">—</strong><span>ready to search</span></article>
+        <article><strong id="review-count">—</strong><span>speaker checks</span></article>
+        <article><strong id="failed-count">—</strong><span>needs attention</span></article>
+      </section>
+
+      <section class="question-room" aria-labelledby="ask-title">
+        <div>
+          <p class="eyebrow">ASK THE RECORD</p>
+          <h2 id="ask-title">What did we decide?</h2>
+        </div>
+        <form id="query-form">
+          <label class="sr-only" for="question">Question about the meeting archive</label>
+          <textarea id="question" rows="2" placeholder="e.g. Why did we choose the Drive capture approach?"></textarea>
+          <div class="query-actions">
+            <select id="query-mode" aria-label="Search depth">
+              <option value="hybrid">Focused answer</option>
+              <option value="global">Across all meetings</option>
+              <option value="local">One topic or person</option>
+            </select>
+            <button type="submit">Ask archive <span aria-hidden="true">↗</span></button>
+          </div>
+        </form>
+        <article id="answer" class="answer empty" aria-live="polite">
+          <p>Ask a question to retrieve the relevant meeting record, then have the answer written from that evidence.</p>
+        </article>
+      </section>
+
+      <section class="archive" aria-labelledby="archive-title">
+        <div class="archive-heading">
+          <div>
+            <p class="eyebrow">THE LEDGER</p>
+            <h2 id="archive-title">Meetings, not fragments.</h2>
+          </div>
+          <label class="search"><span aria-hidden="true">⌕</span><input id="meeting-search" type="search" placeholder="Filter by title or date" /></label>
+        </div>
+        <div class="archive-layout">
+          <div id="meeting-list" class="meeting-list" aria-live="polite"></div>
+          <article id="meeting-reader" class="meeting-reader">
+            <p class="reader-kicker">SELECT A MEETING</p>
+            <h3>Your compiled minutes appear here.</h3>
+            <p>The record remains readable Markdown, with links back to the original private audio when available.</p>
+          </article>
+        </div>
+      </section>
+
+      <footer>Local-only dashboard · Read-only view of your private archive</footer>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>

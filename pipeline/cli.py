@@ -14,6 +14,7 @@ minutes compilation loses minutes of work rather than hours.
     pipeline minutes               compile structured minutes
     pipeline index                 push minutes into LightRAG
     pipeline run                   every pending stage, in order
+    pipeline dashboard             browse and search the local meeting record
     pipeline query "question"      ask the knowledge base
     pipeline status                where everything is, plus stage timings
     pipeline retry                 requeue failed meetings
@@ -31,7 +32,13 @@ import traceback
 from pathlib import Path
 
 from pipeline import capture, compile_minutes, db, entities, index, ingest, speakers
-from pipeline.config import OWNER_NAME, TEMPLATE_VERSION, ensure_dirs
+from pipeline.config import (
+    DASHBOARD_HOST,
+    DASHBOARD_PORT,
+    OWNER_NAME,
+    TEMPLATE_VERSION,
+    ensure_dirs,
+)
 
 # Stage names as recorded in stage_runs, for timing analysis.
 STAGE_TRANSCRIBE = "transcribe"
@@ -481,6 +488,14 @@ def cmd_query(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Open the local, read-only meeting-memory control room."""
+    from pipeline import dashboard
+
+    dashboard.run(host=args.host, port=args.port, open_browser=args.open)
+    return 0
+
+
 def cmd_people(args: argparse.Namespace) -> int:
     """Inspect and curate the people registry.
 
@@ -683,6 +698,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="report retrieval vs synthesis time, to see which phase is slow",
     )
     p_query.set_defaults(func=cmd_query)
+
+    p_dashboard = subparsers.add_parser(
+        "dashboard", help="browse and search the local meeting record"
+    )
+    p_dashboard.add_argument(
+        "--host", default=DASHBOARD_HOST,
+        help="bind address (default: loopback only)",
+    )
+    p_dashboard.add_argument(
+        "--port", type=int, default=DASHBOARD_PORT,
+        help=f"listen port (default: {DASHBOARD_PORT})",
+    )
+    p_dashboard.add_argument(
+        "--open", action="store_true", help="open the dashboard in the default browser"
+    )
+    p_dashboard.set_defaults(func=cmd_dashboard)
 
     p_people = subparsers.add_parser("people", help="inspect the people registry")
     p_people.add_argument(

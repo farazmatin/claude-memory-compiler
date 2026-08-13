@@ -155,6 +155,33 @@ does not start a second run while the first is still active. Check progress with
 uv run pipeline status
 ```
 
+## 7. Review minutes and search the archive
+
+Open the local Meeting Memory dashboard after a run:
+
+```powershell
+uv run pipeline dashboard --open
+```
+
+The browser shows every meeting, its compiled minutes, a link back to the
+original private Drive audio, and any speaker-review signal. Enter a question
+such as “What did we decide about the Drive capture approach?” to search the
+same RAG knowledge base used by `pipeline query`.
+
+The dashboard is read-only and defaults to `http://127.0.0.1:8765`; it does not
+upload, alter, or delete recordings, minutes, or speaker names. Leave the
+terminal open while using it and press `Ctrl+C` when finished. If the default
+port is in use, choose another one:
+
+```powershell
+uv run pipeline dashboard --port 8766 --open
+```
+
+If a meeting says **Speaker review** or **No diarization**, the minutes are still
+available, but ownership should be checked before relying on assigned actions.
+Follow [SPEAKER_GUIDE.md](SPEAKER_GUIDE.md) for the one-time identity and new
+speaker process.
+
 ## Troubleshooting
 
 - **Drive is not authorized:** run `uv run pipeline auth-drive` again.

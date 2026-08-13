@@ -56,6 +56,7 @@ uv run pipeline init
 cp ~/recordings/*.m4a inbox/
 uv run pipeline run --owner "Your Name"
 uv run pipeline query "what did we decide about pricing?"
+uv run pipeline dashboard --open
 ```
 
 Both `.env` values are required: `docker compose` refuses to start without an API
@@ -114,6 +115,7 @@ pipeline minutes                  # compile structured minutes
 pipeline index                    # push minutes into LightRAG
 pipeline run                      # every pending stage, in order
 pipeline status                   # where everything is, plus real stage timings
+pipeline dashboard --open         # local, read-only meeting library and RAG search
 pipeline query "question"         # ask the knowledge base
 pipeline query "..." --mode global   # for answers spanning many meetings
 pipeline query "..." --timing     # retrieval vs synthesis time
@@ -128,6 +130,21 @@ pipeline capture --complete-backfill  # permanently disable the one-time backfil
 
 `pipeline run` exits **non-zero if any stage failed**, so a nightly cron reports a
 broken batch instead of silently succeeding.
+
+## Meeting Memory dashboard
+
+After the local index is running, open the operator view with:
+
+```powershell
+uv run pipeline dashboard --open
+```
+
+It listens only on `127.0.0.1:8765` by default and never changes Drive, the
+manifest, transcripts, minutes, or speaker records. It provides the meeting
+library, compiled minutes, a link back to the original private Drive audio,
+speaker-review signals, and the same evidence-backed RAG search as `pipeline
+query`. Press `Ctrl+C` in its terminal to stop it. Use `--port 8766` if the
+default port is occupied.
 
 Each stage claims meetings at one status and advances them to the next, tracked in
 `db/manifest.db`. Stages are independent and resumable — a crash during minutes

@@ -152,6 +152,12 @@ LIGHTRAG_TIMEOUT = float(os.environ.get("MMC_LIGHTRAG_TIMEOUT", "600"))
 # spans many meetings ("summarize all budget discussion this year").
 LIGHTRAG_DEFAULT_MODE = os.environ.get("MMC_LIGHTRAG_MODE", "hybrid")
 
+# ── Local meeting-memory dashboard ────────────────────────────────────
+# It renders private minutes and Drive links, so LAN exposure requires an explicit
+# environment override. The default remains available only on this machine.
+DASHBOARD_HOST = os.environ.get("MMC_DASHBOARD_HOST", "127.0.0.1")
+DASHBOARD_PORT = int(os.environ.get("MMC_DASHBOARD_PORT", "8765"))
+
 # ── Google Drive capture ─────────────────────────────────────────────
 # Audio reaches this pipeline through a private Drive folder populated by Easy
 # Voice Recorder Pro. Drive is the durable raw-audio archive; this machine only
