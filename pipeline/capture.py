@@ -116,7 +116,7 @@ def run(
                 _set_recording_timestamp(destination, remote.created_time)
                 _save_staged_source(db_path, remote, source.kind, recording_date, destination)
                 counts["downloaded"] += 1
-            except Exception as exc:  # noqa: BLE001 - remote client errors vary by transport
+            except Exception as exc:
                 _save_failed_source(db_path, remote, source.kind, recording_date, str(exc))
                 counts["failed"] += 1
     return counts

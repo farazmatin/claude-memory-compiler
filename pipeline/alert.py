@@ -19,10 +19,26 @@ substituted into {subject} if present:
 
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
 
 from pipeline.config import ALERT_COMMAND, ALERT_TIMEOUT_SEC, now_iso
+
+
+def split_command(command: str) -> list[str]:
+    """Split a command string into argv, correctly on Windows too.
+
+    `shlex.split` defaults to POSIX mode, where a backslash is an escape
+    character. On Windows that silently destroys every path in the command:
+    `tee C:\\Users\\me\\alert.txt` becomes `tee C:Usersmealert.txt`, and the alert
+    is written to a garbage filename in the current directory instead of failing.
+
+    This was found in the wild - it left two files with mangled names in the repo
+    root of a Windows checkout. Non-POSIX mode keeps backslashes literal, which is
+    what a Windows path needs.
+    """
+    return shlex.split(command, posix=os.name != "nt")
 
 
 def build_summary(failed_stages: list[str], detail: str = "") -> tuple[str, str]:
@@ -60,7 +76,7 @@ def send(failed_stages: list[str], detail: str = "") -> bool:
 
     subject, body = build_summary(failed_stages, detail)
     try:
-        argv = [part.replace("{subject}", subject) for part in shlex.split(ALERT_COMMAND)]
+        argv = [part.replace("{subject}", subject) for part in split_command(ALERT_COMMAND)]
     except ValueError as exc:
         print(f"  alert command is not parseable ({exc}); not sent")
         return False

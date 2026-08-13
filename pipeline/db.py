@@ -231,7 +231,9 @@ def _row_to_meeting(row: sqlite3.Row) -> Meeting:
 
 
 def _row_to_drive_source(row: sqlite3.Row) -> DriveSource:
-    return DriveSource(**{k: row[k] for k in row.keys()})
+    # .keys() is required: iterating a sqlite3.Row yields VALUES, not keys, so
+    # SIM118's suggested rewrite would silently build a broken mapping.
+    return DriveSource(**{k: row[k] for k in row.keys()})  # noqa: SIM118
 
 
 @contextmanager

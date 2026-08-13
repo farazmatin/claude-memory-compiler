@@ -19,6 +19,11 @@ minutes/
 # Manifest database (rebuildable from audio/ + transcripts/, but slow - back it up)
 db/
 
+# Test artifacts. A Windows shlex bug once wrote alert output to mangled
+# filenames in the repo root; the bug is fixed, this is belt and braces.
+*pytest-of-*
+alert.txt
+
 # Local state and logs
 *.log
 speaker-overrides.yaml

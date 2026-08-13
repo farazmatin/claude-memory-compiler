@@ -44,24 +44,58 @@ whole architecture:
 ## Quick start
 
 ```bash
-cp .env.example .env      # then fill in MMC_LIGHTRAG_API_KEY and HF_TOKEN
-
-uv sync                                  # core deps
-uv sync --extra asr                      # + whisperx (heavy: torch, CUDA libs)
-docker compose up -d                     # LightRAG + Ollama
-docker compose exec ollama ollama pull qwen3:4b
-docker compose exec ollama ollama pull mxbai-embed-large
-
-uv run pipeline init
-cp ~/recordings/*.m4a inbox/
-uv run pipeline run --owner "Your Name"
-uv run pipeline query "what did we decide about pricing?"
-.\scripts\open-dashboard.ps1
+git clone https://github.com/farazmatin/claude-memory-compiler
+cd claude-memory-compiler
+./setup.sh
 ```
 
-Both `.env` values are required: `docker compose` refuses to start without an API
-key, and diarization is silently skipped without `HF_TOKEN` — which means action
-items with no owners. See [Prerequisites](#prerequisites).
+`setup.sh` checks prerequisites, installs dependencies, generates secrets, starts
+the services, pulls the local models, and runs preflight checks. It's safe to
+re-run and never overwrites an existing `.env`.
+
+**One thing it can't do for you.** Speaker detection needs a HuggingFace token
+*and* two accepted licences:
+
+1. Put a **read** token in `.env` as `HF_TOKEN` — https://huggingface.co/settings/tokens
+2. Accept both — the token alone is not enough:
+   - https://hf.co/pyannote/speaker-diarization-3.1
+   - https://hf.co/pyannote/segmentation-3.0
+
+Skip this and you get transcripts with no speaker names, which means action items
+with nobody assigned. `./setup.sh` reminds you at the end; `pipeline doctor`
+confirms when it's right.
+
+Then your first meeting:
+
+```bash
+cp ~/some-recording.m4a inbox/
+uv run pipeline run
+
+less minutes/*.md                              # read what it wrote
+uv run pipeline query "what did we decide?"
+uv run pipeline dashboard --open               # foreground dashboard server
+# Windows: .\scripts\open-dashboard.ps1        # background server + browser
+```
+
+Expect ~30–50 minutes for a one-hour recording on CPU.
+
+**New here?** [docs/USER_GUIDE.md](docs/USER_GUIDE.md) walks through setup, daily
+use, and how to judge whether the output is any good.
+
+<details>
+<summary>Manual setup, if you'd rather not run a script</summary>
+
+```bash
+cp .env.example .env      # then fill in MMC_LIGHTRAG_API_KEY, POSTGRES_PASSWORD, HF_TOKEN
+uv sync --extra asr
+docker compose up -d
+docker compose exec ollama ollama pull qwen3:4b
+docker compose exec ollama ollama pull mxbai-embed-large
+uv run pipeline init
+uv run pipeline doctor
+```
+
+</details>
 
 ## Which model does what
 
@@ -280,24 +314,40 @@ support because whatever your server already has beats a second notification sta
 
 ```bash
 uv sync --extra dev
-uv run pytest
+sudo apt-get install ffmpeg   # functional tests generate real audio
+
+uv run pytest                 # everything
+uv run pytest -m "not e2e"    # unit only, <1s
+uv run pytest -m e2e          # functional only
 ```
 
-102 tests, no network and no model calls, under half a second. CI runs them plus
-ruff on every push. Regression tests name the failure they prevent, so the reasoning
-survives refactoring.
+**187 tests in two layers**, both gating CI:
 
-**What is not covered:** ASR, LightRAG, Postgres, and the Gemini/Codex CLI
-invocations have never been run. The suite covers logic, not integration — see
-[docs/REVIEW.md](docs/REVIEW.md#o2--nothing-verified-against-real-infrastructure).
+- **165 unit tests** — functions in isolation, no network, under a second.
+- **22 functional tests** — drive the real CLI end to end over a throwaway tree
+  with real audio, real ffmpeg, a real SQLite manifest and real HTTP to a
+  LightRAG-shaped server. Only the ASR model, the LLM and LightRAG's internals are
+  substituted, and the LLM fake is an actual executable so the subprocess/stdin
+  provider path is genuinely exercised.
+
+The functional layer earns its keep: it caught two bugs the unit suite could not
+see, including one where the nightly batch reported success after a total
+transcription failure. Details in
+[docs/TESTING.md](docs/TESTING.md).
+
+**Still not covered:** real Whisper, real pyannote, real LightRAG, real Postgres,
+and the actual `gemini`/`codex` binaries. The functional tests prove the app's own
+wiring; they cannot prove the transcript is accurate.
 
 ## Documentation
 
 | Document | For |
 |---|---|
+| [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | **Start here** — setup, daily use, troubleshooting |
 | [docs/PRD.md](docs/PRD.md) | Problem, goals, non-goals, constraints, success criteria |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions with rationale and what was rejected |
-| [docs/REVIEW.md](docs/REVIEW.md) | Adversarial review: 14 findings fixed, 6 open |
+| [docs/REVIEW.md](docs/REVIEW.md) | Adversarial review: 20 findings, all addressed |
+| [docs/TESTING.md](docs/TESTING.md) | Test strategy and what each layer covers |
 | [AGENTS.md](AGENTS.md) | Operational reference — env vars, stage internals, gotchas |
 
 Two upstream bugs are already worked around in `docker-compose.yml`: Ollama is

@@ -63,6 +63,20 @@ from pipeline import db
 from pipeline.config import ensure_dirs
 
 
+@pytest.fixture(autouse=True)
+def block_live_lightrag_in_unit_tests(request, monkeypatch):
+    """Keep unit tests offline even when httpx is installed locally.
+
+    Functional tests provide a LightRAG-shaped HTTP server explicitly. Unit tests
+    must not accidentally query the developer's real archive while compiling
+    minutes; that makes the suite slow, non-deterministic, and privacy-unsafe.
+    """
+    if "e2e" not in request.keywords:
+        from pipeline import index
+
+        monkeypatch.setattr(index, "query_context", lambda *args, **kwargs: "")
+
+
 @pytest.fixture()
 def manifest(tmp_path, monkeypatch):
     """A fresh manifest database per test."""
