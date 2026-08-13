@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from pipeline import alert, answer, index
+import os
+
+import pytest
+
+from pipeline import alert, answer, index, llm
 from pipeline.llm import LLMError
 
 # ── retrieval + synthesis ─────────────────────────────────────────────
@@ -11,10 +15,11 @@ def test_local_model_retrieves_and_subscription_writes(monkeypatch):
     """The whole point of the split: each job on the right model."""
     monkeypatch.setattr(index, "query_context", lambda *a, **k: "RETRIEVED CONTEXT")
     monkeypatch.setattr(answer, "complete", lambda prompt: f"answered from: {prompt[-30:]}")
-    monkeypatch.setattr(answer, "last_provider", "gemini")
+    monkeypatch.setattr(llm, "last_provider", "gemini")
 
     result = answer.ask("why did we defer Atlas?")
 
+    assert result.provider == "gemini", "must report which provider actually answered"
     assert result.synthesized is True
     assert result.context_chars == len("RETRIEVED CONTEXT")
     assert "answered from" in result.text
@@ -73,7 +78,7 @@ def test_timing_is_reported_per_phase(monkeypatch):
     """Latency at scale must be attributable: traversal or generation?"""
     monkeypatch.setattr(index, "query_context", lambda *a, **k: "context")
     monkeypatch.setattr(answer, "complete", lambda prompt: "answer")
-    monkeypatch.setattr(answer, "last_provider", "codex")
+    monkeypatch.setattr(llm, "last_provider", "codex")
 
     result = answer.ask("q")
     line = result.timing_line()
@@ -110,22 +115,46 @@ def test_no_alert_configured_is_not_an_error(monkeypatch):
     assert alert.send(["transcribe"]) is False
 
 
+@pytest.mark.skipif(os.name == "nt", reason="needs a POSIX shell")
 def test_alert_delivers_summary_on_stdin(tmp_path, monkeypatch):
-    """The summary goes on stdin so it is not limited by argv length."""
-    target = tmp_path / "alert.txt"
-    monkeypatch.setattr(alert, "ALERT_COMMAND", f"tee {target}")
+    """The summary goes on stdin so it is not limited by argv length.
+
+    Runs from inside tmp_path: an earlier version passed an absolute path into the
+    command, and on Windows shlex mangled it into a relative filename that landed
+    in whatever directory pytest happened to be in - which is how two junk files
+    ended up committed to a checkout.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(alert, "ALERT_COMMAND", "tee alert.txt")
 
     assert alert.send(["transcribe"], detail="detail here") is True
-    written = target.read_text(encoding="utf-8")
+    written = (tmp_path / "alert.txt").read_text(encoding="utf-8")
     assert "transcribe" in written
     assert "detail here" in written
 
 
+@pytest.mark.skipif(os.name == "nt", reason="needs a POSIX shell")
 def test_subject_is_substituted(tmp_path, monkeypatch):
-    target = tmp_path / "out.txt"
-    monkeypatch.setattr(alert, "ALERT_COMMAND", f'sh -c "echo {{subject}} > {target}"')
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(alert, "ALERT_COMMAND", 'sh -c "echo {subject} > out.txt"')
     alert.send(["minutes"])
-    assert "minutes" in target.read_text(encoding="utf-8")
+    assert "minutes" in (tmp_path / "out.txt").read_text(encoding="utf-8")
+
+
+def test_windows_paths_survive_command_splitting():
+    """Regression: shlex defaults to POSIX mode, where backslashes are escapes.
+
+    On Windows that turned `tee C:\\Users\\me\\alert.txt` into
+    `tee C:Usersmealert.txt`, writing to a garbage filename instead of failing.
+    """
+    argv = alert.split_command(r'tee C:\Users\me\alert.txt') if os.name == "nt" else None
+    if argv is not None:
+        assert argv[1] == r"C:\Users\me\alert.txt"
+
+    # The POSIX path must keep working wherever the tests actually run.
+    assert alert.split_command("mail -s subject me@example.com") == [
+        "mail", "-s", "subject", "me@example.com"
+    ]
 
 
 def test_failing_alert_command_does_not_raise(monkeypatch):

@@ -63,8 +63,12 @@ ignore = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# Tests never reach the network or spawn a model; the suite runs in under a second.
 addopts = "-q"
+markers = [
+    # Functional tests: drive the real CLI over a throwaway tree with real audio,
+    # real ffmpeg, a real manifest and real HTTP. Require ffmpeg on PATH.
+    "e2e: end-to-end functional test (needs ffmpeg)",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["pipeline"]

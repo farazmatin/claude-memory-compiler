@@ -163,15 +163,36 @@ alert.
 
 ---
 
+## Second pass — found by functional testing
+
+After the review was closed, a functional test layer was added (see
+[TESTING.md](TESTING.md)). It immediately found two defects that the 165 unit tests
+could not, both with passing unit tests alongside them.
+
+| # | Finding | Fix |
+|---|---|---|
+| F1 | `_run_all` passed `keep_going=True` to transcribe, and that flag makes the stage return 0 **even when every meeting failed**. The nightly batch would exit 0 after transcribing nothing, and no alert would fire — reintroducing B1 through a flag. | The batch never sets `keep_going`. Continuing past a bad file is unconditional; reporting success anyway is an interactive convenience only. |
+| F2 | `answer.py` imported `last_provider` **by value**, so `--timing` always printed `via None` instead of naming the provider that answered. | Read it off the module. |
+
+F2 is the more instructive one: its unit test patched the same stale name and
+passed, so the test mirrored the implementation rather than checking the behaviour.
+The functional replacement asserts on real CLI output, which cannot pass unless the
+whole path works.
+
+Both bugs lived in the *wiring between* correct components — which is precisely the
+category unit tests are blind to.
+
+---
+
 ## Residual risk
 
 Two things remain true that no amount of code changes:
 
 1. **Nothing has been run against real audio, real LightRAG, or the real CLIs.**
-   165 tests cover logic. `pipeline doctor` will tell you the environment is sound.
-   Neither tells you the minutes are any good. That requires one real meeting, read
-   against the audio, counting errors only on names, product terms, numbers and
-   dates.
+   187 tests now cover logic *and* the app's own wiring, and `pipeline doctor` will
+   tell you the environment is sound. Neither tells you the minutes are any good.
+   That requires one real meeting, read against the audio, counting errors only on
+   names, product terms, numbers and dates.
 2. **Graph traversal quality is still bounded by a small local model.** O1a moves
    entity *identification* upstream to a frontier model, which is the larger half of
    the problem, but the traversal that answers a question still runs locally.
