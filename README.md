@@ -56,7 +56,7 @@ uv run pipeline init
 cp ~/recordings/*.m4a inbox/
 uv run pipeline run --owner "Your Name"
 uv run pipeline query "what did we decide about pricing?"
-uv run pipeline dashboard --open
+.\scripts\open-dashboard.ps1
 ```
 
 Both `.env` values are required: `docker compose` refuses to start without an API
@@ -133,18 +133,31 @@ broken batch instead of silently succeeding.
 
 ## Meeting Memory dashboard
 
-After the local index is running, open the operator view with:
+Open the operator view with:
 
 ```powershell
-uv run pipeline dashboard --open
+.\scripts\open-dashboard.ps1
 ```
+
+The launcher starts the local server in the background when it is not already
+running, then opens the browser. To start it automatically after every Windows
+sign-in, install the one-time user-level sign-in setup:
+
+```powershell
+.\scripts\install-dashboard-task.ps1
+```
+
+It uses a Scheduled Task when Windows permits it and otherwise installs a Startup
+shortcut for the current user. Neither option requires administrator access.
 
 It listens only on `127.0.0.1:8765` by default and never changes Drive, the
 manifest, transcripts, minutes, or speaker records. It provides the meeting
 library, compiled minutes, a link back to the original private Drive audio,
 speaker-review signals, and the same evidence-backed RAG search as `pipeline
-query`. Press `Ctrl+C` in its terminal to stop it. Use `--port 8766` if the
-default port is occupied.
+query`. Use `-Port 8766` with either script if the default port is occupied.
+
+`pipeline dashboard --open` remains available for a temporary foreground server;
+press `Ctrl+C` in that terminal to stop it.
 
 Each stage claims meetings at one status and advances them to the next, tracked in
 `db/manifest.db`. Stages are independent and resumable — a crash during minutes

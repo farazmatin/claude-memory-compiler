@@ -160,7 +160,7 @@ uv run pipeline status
 Open the local Meeting Memory dashboard after a run:
 
 ```powershell
-uv run pipeline dashboard --open
+.\scripts\open-dashboard.ps1
 ```
 
 The browser shows every meeting, its compiled minutes, a link back to the
@@ -168,13 +168,23 @@ original private Drive audio, and any speaker-review signal. Enter a question
 such as “What did we decide about the Drive capture approach?” to search the
 same RAG knowledge base used by `pipeline query`.
 
+The launcher keeps the dashboard running in the background, so closing the
+PowerShell window does not close the browser page. To start it automatically
+after every Windows sign-in, install the one-time user-level sign-in setup:
+
+```powershell
+.\scripts\install-dashboard-task.ps1
+```
+
+It uses a Scheduled Task when Windows permits it and otherwise installs a Startup
+shortcut for the current user. Neither option requires administrator access.
+
 The dashboard is read-only and defaults to `http://127.0.0.1:8765`; it does not
-upload, alter, or delete recordings, minutes, or speaker names. Leave the
-terminal open while using it and press `Ctrl+C` when finished. If the default
+upload, alter, or delete recordings, minutes, or speaker names. If the default
 port is in use, choose another one:
 
 ```powershell
-uv run pipeline dashboard --port 8766 --open
+.\scripts\open-dashboard.ps1 -Port 8766
 ```
 
 If a meeting says **Speaker review** or **No diarization**, the minutes are still
