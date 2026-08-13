@@ -152,6 +152,12 @@ LIGHTRAG_TIMEOUT = float(os.environ.get("MMC_LIGHTRAG_TIMEOUT", "600"))
 # spans many meetings ("summarize all budget discussion this year").
 LIGHTRAG_DEFAULT_MODE = os.environ.get("MMC_LIGHTRAG_MODE", "hybrid")
 
+# ── Web UI ────────────────────────────────────────────────────────────
+# Loopback by default (N5). This UI has no auth model because the corpus is
+# single-user; binding it to 0.0.0.0 publishes every meeting to the network.
+WEB_HOST = os.environ.get("MMC_WEB_HOST", "127.0.0.1")
+WEB_PORT = int(os.environ.get("MMC_WEB_PORT", "8080"))
+
 # ── Google Drive capture ─────────────────────────────────────────────
 # Audio reaches this pipeline through a private Drive folder populated by Easy
 # Voice Recorder Pro. Drive is the durable raw-audio archive; this machine only

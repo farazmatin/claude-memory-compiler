@@ -215,7 +215,9 @@ def test_prior_context_includes_earlier_minutes(manifest, tmp_path):
 def test_unresolved_speakers_are_flagged_in_prompt(manifest):
     """The prompt must tell the model not to guess names."""
     meeting = make_meeting(manifest, "m1", "2026-08-10")
-    prompt = cm.build_prompt(meeting, build_transcript(), {"SPEAKER_00": "Faraz"}, "none")
+    prompt = cm.build_prompt(
+        meeting, build_transcript(), {"SPEAKER_00": "Faraz"}, "none", "audio/m1.wav"
+    )
     assert "SPEAKER_01" in prompt
     assert "do not" in prompt.lower()
 

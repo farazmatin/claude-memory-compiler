@@ -15,6 +15,7 @@ minutes compilation loses minutes of work rather than hours.
     pipeline index                 push minutes into LightRAG
     pipeline run                   every pending stage, in order
     pipeline query "question"      ask the knowledge base
+    pipeline serve                 browse and ask in a browser
     pipeline status                where everything is, plus stage timings
     pipeline retry                 requeue failed meetings
 
@@ -31,7 +32,7 @@ import traceback
 from pathlib import Path
 
 from pipeline import capture, compile_minutes, db, entities, index, ingest, speakers
-from pipeline.config import OWNER_NAME, TEMPLATE_VERSION, ensure_dirs
+from pipeline.config import OWNER_NAME, TEMPLATE_VERSION, WEB_HOST, WEB_PORT, ensure_dirs
 
 # Stage names as recorded in stage_runs, for timing analysis.
 STAGE_TRANSCRIBE = "transcribe"
@@ -481,6 +482,37 @@ def cmd_query(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Serve the browser UI.
+
+    Loopback by default. There is no auth model - the corpus is single-user by
+    design (see the PRD) - so a non-loopback host publishes every meeting to
+    whatever network this machine is on. That is refused rather than warned
+    about, because the warning would scroll past and the mistake is unrecoverable.
+    """
+    try:
+        import uvicorn
+    except ImportError:
+        print(
+            "The web UI needs its extra dependencies: uv sync --extra web",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not args.allow_remote:
+        print(
+            f"Refusing to bind {args.host}: the UI has no authentication and the corpus "
+            "is sensitive. Pass --allow-remote if you have your own access control in front.",
+            file=sys.stderr,
+        )
+        return 1
+
+    db.init_db()
+    print(f"Meeting Memory on http://{args.host}:{args.port}")
+    uvicorn.run("web.app:app", host=args.host, port=args.port, log_level="info")
+    return 0
+
+
 def cmd_people(args: argparse.Namespace) -> int:
     """Inspect and curate the people registry.
 
@@ -683,6 +715,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="report retrieval vs synthesis time, to see which phase is slow",
     )
     p_query.set_defaults(func=cmd_query)
+
+    p_serve = subparsers.add_parser("serve", help="browse and ask in a browser")
+    p_serve.add_argument("--host", default=WEB_HOST)
+    p_serve.add_argument("--port", type=int, default=WEB_PORT)
+    p_serve.add_argument(
+        "--allow-remote", action="store_true",
+        help="permit binding a non-loopback address (the UI has no authentication)",
+    )
+    p_serve.set_defaults(func=cmd_serve)
 
     p_people = subparsers.add_parser("people", help="inspect the people registry")
     p_people.add_argument(

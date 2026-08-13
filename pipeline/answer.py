@@ -21,11 +21,26 @@ answer from a small model beats no answer.
 
 from __future__ import annotations
 
+import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pipeline import index
 from pipeline.llm import LLMError, complete, last_provider
+
+# Minutes are inserted with `file_source` set to the filename, and LightRAG
+# carries it back in the retrieved context. Reading the sources off the context
+# rather than out of the prose means a citation names a meeting that was
+# actually retrieved, which a model summarizing its own reading cannot promise.
+_SOURCE_FILE = re.compile(r"[\w.\-]+\.md")
+
+
+def extract_sources(context: str) -> list[str]:
+    """Minutes filenames present in retrieved context, in first-seen order."""
+    seen: dict[str, None] = {}
+    for name in _SOURCE_FILE.findall(context):
+        seen.setdefault(name, None)
+    return list(seen)
 
 
 @dataclass
@@ -36,6 +51,7 @@ class Answer:
     provider: str | None
     context_chars: int
     synthesized: bool
+    sources: list[str] = field(default_factory=list)
 
     @property
     def total_sec(self) -> float:
@@ -117,6 +133,7 @@ def ask(
             synthesized=False,
         )
 
+    sources = extract_sources(context)
     started = time.monotonic()
     try:
         text = complete(build_synthesis_prompt(question, context))
@@ -128,6 +145,7 @@ def ask(
             provider=last_provider,
             context_chars=len(context),
             synthesized=True,
+            sources=sources,
         )
     except LLMError as exc:
         # An answer from the small local model beats no answer.
@@ -141,4 +159,5 @@ def ask(
             provider=None,
             context_chars=len(context),
             synthesized=False,
+            sources=sources,
         )

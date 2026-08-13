@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meeting Memory</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>&#128220;</text></svg>">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>Meeting Memory</h1>
+  <div id="health" class="health" title="LightRAG and manifest status">checking…</div>
+</header>
+
+<main>
+  <section id="thread" class="thread" aria-live="polite"></section>
+
+  <form id="ask-form" class="ask">
+    <textarea id="question" rows="2" placeholder="What did we decide about…?" required></textarea>
+    <div class="controls">
+      <label>Mode
+        <select id="mode">
+          <option value="">hybrid (default)</option>
+          <option value="global">global — spans many meetings</option>
+          <option value="local">local — one entity</option>
+          <option value="naive">naive — plain vector</option>
+        </select>
+      </label>
+      <label class="checkbox">
+        <input type="checkbox" id="local"> local synthesis
+      </label>
+      <button type="submit" id="submit">Ask</button>
+    </div>
+  </form>
+</main>
+
+<dialog id="reader">
+  <div class="reader-head">
+    <h2 id="reader-title"></h2>
+    <button id="reader-close" aria-label="Close">×</button>
+  </div>
+  <pre id="reader-body"></pre>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

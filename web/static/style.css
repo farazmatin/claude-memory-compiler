@@ -1,0 +1,203 @@
+:root {
+  --bg: #fbfaf8;
+  --panel: #ffffff;
+  --ink: #1c1a17;
+  --muted: #6b6560;
+  --line: #e3ded7;
+  --accent: #9a5b34;
+  --accent-soft: #f3e9e1;
+  --warn: #8a5a00;
+  --bad: #9a2f2f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161513;
+    --panel: #1e1d1a;
+    --ink: #ece8e2;
+    --muted: #9b948c;
+    --line: #322f2b;
+    --accent: #d08b5c;
+    --accent-soft: #2c241d;
+    --warn: #d1a24a;
+    --bad: #d97070;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--line);
+}
+
+h1 { font-size: 1.05rem; margin: 0; letter-spacing: .01em; }
+
+.health { font-size: .8rem; color: var(--muted); }
+.health.bad { color: var(--bad); }
+
+main {
+  max-width: 820px;
+  margin: 0 auto;
+  padding: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.thread { display: flex; flex-direction: column; gap: 1.25rem; }
+
+.turn { display: flex; flex-direction: column; gap: .6rem; }
+
+.question {
+  font-weight: 600;
+  padding-left: .75rem;
+  border-left: 3px solid var(--accent);
+}
+
+.answer {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1rem 1.1rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.answer.error { border-color: var(--bad); color: var(--bad); white-space: normal; }
+
+.citations { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; }
+
+.citations .label { font-size: .78rem; color: var(--muted); margin-right: .15rem; }
+
+.cite {
+  font: inherit;
+  font-size: .8rem;
+  background: var(--accent-soft);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: .2rem .65rem;
+  cursor: pointer;
+}
+
+.cite:hover { border-color: var(--accent); }
+.cite[disabled] { cursor: default; opacity: .6; }
+
+.meta { font-size: .75rem; color: var(--muted); }
+.meta.local { color: var(--warn); }
+
+.ask {
+  position: sticky;
+  bottom: 0;
+  background: var(--bg);
+  padding-top: .5rem;
+  display: flex;
+  flex-direction: column;
+  gap: .5rem;
+}
+
+textarea {
+  width: 100%;
+  font: inherit;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: .7rem .85rem;
+  resize: vertical;
+}
+
+textarea:focus, select:focus, button:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .75rem;
+  font-size: .82rem;
+  color: var(--muted);
+}
+
+.controls label { display: flex; align-items: center; gap: .35rem; }
+.checkbox { cursor: pointer; }
+
+select {
+  font: inherit;
+  font-size: .82rem;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: .25rem .4rem;
+}
+
+button[type="submit"] {
+  margin-left: auto;
+  font: inherit;
+  font-weight: 600;
+  background: var(--accent);
+  color: #fff;
+  border: 0;
+  border-radius: 8px;
+  padding: .45rem 1.1rem;
+  cursor: pointer;
+}
+
+button[type="submit"][disabled] { opacity: .55; cursor: progress; }
+
+dialog {
+  width: min(760px, 92vw);
+  max-height: 82vh;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 0;
+}
+
+dialog::backdrop { background: rgba(0, 0, 0, .45); }
+
+.reader-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: .85rem 1.1rem;
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+}
+
+.reader-head h2 { font-size: .95rem; margin: 0; }
+
+#reader-close {
+  font-size: 1.3rem;
+  line-height: 1;
+  background: none;
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+#reader-body {
+  margin: 0;
+  padding: 1.1rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-y: auto;
+  max-height: calc(82vh - 3.4rem);
+}

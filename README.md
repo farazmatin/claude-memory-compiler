@@ -117,6 +117,7 @@ pipeline status                   # where everything is, plus real stage timings
 pipeline query "question"         # ask the knowledge base
 pipeline query "..." --mode global   # for answers spanning many meetings
 pipeline query "..." --timing     # retrieval vs synthesis time
+pipeline serve                    # the same questions, in a browser
 pipeline people                   # the people registry
 pipeline people --merge Mike Michael   # fold a duplicate, rewriting history
 pipeline entities                 # most-mentioned entities (graph health check)
@@ -128,6 +129,32 @@ pipeline capture --complete-backfill  # permanently disable the one-time backfil
 
 `pipeline run` exits **non-zero if any stage failed**, so a nightly cron reports a
 broken batch instead of silently succeeding.
+
+## Asking in a browser
+
+```bash
+uv sync --extra web
+uv run pipeline serve        # http://127.0.0.1:8080
+```
+
+Same retrieval and synthesis path as `pipeline query`, called in process — there
+is no second implementation of query semantics. What the browser adds is the
+citation drill-down: every answer lists the meetings it was actually built from,
+and clicking one opens those minutes.
+
+**Citations come from retrieval, not from the answer text.** The synthesis prompt
+asks the model to cite its meetings, but a model summarizing its own reading can
+name a meeting it never read. The chips under each answer are the `file_source`
+values LightRAG returned, resolved against the manifest — so a citation is a
+claim about what was retrieved, which is checkable, rather than a claim the
+model makes about itself. A retrieved file with no manifest row still appears,
+greyed out and unclickable; hiding it would overstate how much of the answer is
+traceable.
+
+**It binds to loopback and has no authentication.** That follows from the
+single-user assumption in the PRD, not from an oversight — `--host` refuses a
+non-loopback address unless you also pass `--allow-remote`, which you should only
+do behind your own access control.
 
 Each stage claims meetings at one status and advances them to the next, tracked in
 `db/manifest.db`. Stages are independent and resumable — a crash during minutes

@@ -331,6 +331,52 @@ def pending(conn: sqlite3.Connection, status: str, limit: int | None = None) -> 
     return [_row_to_meeting(r) for r in conn.execute(sql, params).fetchall()]
 
 
+def list_meetings(
+    conn: sqlite3.Connection,
+    statuses: list[str] | None = None,
+    limit: int | None = None,
+) -> list[Meeting]:
+    """Meetings for display, most recent first.
+
+    The inverse of `pending`'s ordering: stages want the oldest unprocessed work,
+    a reader wants the newest meeting.
+    """
+    sql = "SELECT * FROM meetings"
+    params: list[object] = []
+    if statuses:
+        sql += f" WHERE status IN ({','.join('?' * len(statuses))})"
+        params.extend(statuses)
+    sql += " ORDER BY meeting_date IS NULL, meeting_date DESC, meeting_time DESC, created_at DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return [_row_to_meeting(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def meetings_by_minutes_names(
+    conn: sqlite3.Connection, names: list[str]
+) -> dict[str, Meeting]:
+    """Resolve minutes filenames back to the meetings that produced them.
+
+    Retrieval cites the filename it indexed; a citation the reader can open needs
+    the meeting row behind it. Names that match nothing are simply absent from the
+    result - minutes deleted off disk should degrade a citation, not fail a query.
+    """
+    found: dict[str, Meeting] = {}
+    for name in names:
+        # `_` is a single-character wildcard in LIKE, and minutes filenames can
+        # contain one, so an unescaped pattern would match a neighbouring meeting.
+        pattern = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        row = conn.execute(
+            "SELECT * FROM meetings WHERE minutes_path LIKE ? ESCAPE '\\' "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (f"%{pattern}",),
+        ).fetchone()
+        if row is not None:
+            found[name] = _row_to_meeting(row)
+    return found
+
+
 def stale_template(conn: sqlite3.Connection, current_version: str) -> list[Meeting]:
     """Meetings whose minutes were built by an older template.
 
