@@ -1,0 +1,14 @@
+meeting pipeline FAILED: transcribe
+When: 2026-08-12T22:33:53-04:00
+
+Failed stages: transcribe
+
+detail here
+
+Investigate with:
+  pipeline status     # per-meeting state and stage timings
+  pipeline doctor     # environment problems
+  pipeline retry      # requeue parked meetings
+
+Nothing is lost - transcripts and audio are retained, and stages are
+resumable. The next run picks up where this one stopped.
