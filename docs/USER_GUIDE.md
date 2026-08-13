@@ -52,10 +52,26 @@ design:
 
 ## 2. First-time setup
 
+### The short version
+
+```bash
+git clone https://github.com/farazmatin/claude-memory-compiler
+cd claude-memory-compiler
+./setup.sh
+```
+
+That handles everything except the HuggingFace token — see
+[§2.2](#22-configure), which the script also reminds you about at the end. It is
+safe to re-run and never overwrites an existing `.env`.
+
+If it reports a missing prerequisite, install that and run it again.
+
+The rest of this section is what `setup.sh` does, for when you want to do it by
+hand or something went wrong.
+
 ### 2.1 Install
 
 ```bash
-git clone <your-repo> && cd claude-memory-compiler
 uv sync --extra asr          # heavy: torch and friends
 sudo apt-get install ffmpeg  # or brew install ffmpeg
 ```

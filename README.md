@@ -44,23 +44,56 @@ whole architecture:
 ## Quick start
 
 ```bash
-cp .env.example .env      # then fill in MMC_LIGHTRAG_API_KEY and HF_TOKEN
-
-uv sync                                  # core deps
-uv sync --extra asr                      # + whisperx (heavy: torch, CUDA libs)
-docker compose up -d                     # LightRAG + Ollama
-docker compose exec ollama ollama pull qwen3:4b
-docker compose exec ollama ollama pull mxbai-embed-large
-
-uv run pipeline init
-cp ~/recordings/*.m4a inbox/
-uv run pipeline run --owner "Your Name"
-uv run pipeline query "what did we decide about pricing?"
+git clone https://github.com/farazmatin/claude-memory-compiler
+cd claude-memory-compiler
+./setup.sh
 ```
 
-Both `.env` values are required: `docker compose` refuses to start without an API
-key, and diarization is silently skipped without `HF_TOKEN` — which means action
-items with no owners. See [Prerequisites](#prerequisites).
+`setup.sh` checks prerequisites, installs dependencies, generates secrets, starts
+the services, pulls the local models, and runs preflight checks. It's safe to
+re-run and never overwrites an existing `.env`.
+
+**One thing it can't do for you.** Speaker detection needs a HuggingFace token
+*and* two accepted licences:
+
+1. Put a **read** token in `.env` as `HF_TOKEN` — https://huggingface.co/settings/tokens
+2. Accept both — the token alone is not enough:
+   - https://hf.co/pyannote/speaker-diarization-3.1
+   - https://hf.co/pyannote/segmentation-3.0
+
+Skip this and you get transcripts with no speaker names, which means action items
+with nobody assigned. `./setup.sh` reminds you at the end; `pipeline doctor`
+confirms when it's right.
+
+Then your first meeting:
+
+```bash
+cp ~/some-recording.m4a inbox/
+uv run pipeline run
+
+less minutes/*.md                              # read what it wrote
+uv run pipeline query "what did we decide?"
+```
+
+Expect ~30–50 minutes for a one-hour recording on CPU.
+
+**New here?** [docs/USER_GUIDE.md](docs/USER_GUIDE.md) walks through setup, daily
+use, and how to judge whether the output is any good.
+
+<details>
+<summary>Manual setup, if you'd rather not run a script</summary>
+
+```bash
+cp .env.example .env      # then fill in MMC_LIGHTRAG_API_KEY, POSTGRES_PASSWORD, HF_TOKEN
+uv sync --extra asr
+docker compose up -d
+docker compose exec ollama ollama pull qwen3:4b
+docker compose exec ollama ollama pull mxbai-embed-large
+uv run pipeline init
+uv run pipeline doctor
+```
+
+</details>
 
 ## Which model does what
 
