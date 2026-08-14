@@ -44,3 +44,6 @@ rag_storage/
 Thumbs.db
 
 .obsidian/
+
+# Local backups made before migrations. Contain private minutes and transcripts.
+pre-postgres-backup/
