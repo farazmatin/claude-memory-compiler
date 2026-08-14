@@ -80,8 +80,13 @@ services:
       ollama:
         condition: service_healthy
     volumes:
-      - ./rag_storage:/app/rag_storage
-      - ./minutes:/app/inputs:ro
+      # These MUST match the image's own WORKING_DIR and INPUT_DIR. The image
+      # sets /app/data/rag_storage and /app/data/inputs; mounting /app/rag_storage
+      # and /app/inputs instead looks correct and silently does nothing, leaving
+      # the index inside the container's writable layer where a rebuild destroys
+      # it. Verified with `docker exec mmc-lightrag printenv` on 2026-08-14.
+      - ./rag_storage:/app/data/rag_storage
+      - ./minutes:/app/data/inputs:ro
     environment:
       # 0.0.0.0 binds inside the container only; the published port above is what
       # controls host exposure.

@@ -12,8 +12,18 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from dotenv import load_dotenv
+
 # ── Paths ─────────────────────────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parent.parent
+
+# Load .env before any os.environ.get below reads a default. python-dotenv was
+# already a declared dependency but nothing called it, so .env configured only
+# docker compose and never the pipeline: MMC_LIGHTRAG_API_KEY stayed empty and
+# requests went out unauthenticated, and HF_TOKEN stayed empty so diarization
+# silently produced no speakers. Real environment variables still win, which is
+# what a server deployment needs.
+load_dotenv(ROOT_DIR / ".env", override=False)
 
 INBOX_DIR = Path(os.environ.get("MMC_INBOX", ROOT_DIR / "inbox"))
 DRIVE_HANDOFF_DIR = INBOX_DIR / "drive"

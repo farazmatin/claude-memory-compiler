@@ -24,6 +24,14 @@ os.environ.update(
     MMC_MINUTES=str(_WORK / "minutes"),
     MMC_DB_DIR=str(_WORK / "db"),
     MMC_TIMEZONE="America/Toronto",
+    # Blanked explicitly. config.py loads .env with override=False, so anything
+    # set here wins - but anything NOT set here would be inherited from a
+    # developer's real .env, making the suite pass locally and fail in CI (or
+    # worse, reach a real service). These are the credential-bearing values.
+    HF_TOKEN="",
+    MMC_LIGHTRAG_API_KEY="test-key",
+    MMC_DRIVE_FUTURE_FOLDER_ID="",
+    MMC_DRIVE_BACKFILL_FOLDER_ID="",
 )
 
 # httpx is only needed by the index module's HTTP calls, which these tests never

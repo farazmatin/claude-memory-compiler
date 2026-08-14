@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 
 from pipeline import db
@@ -27,6 +28,8 @@ from pipeline.config import (
     ASR_MODEL,
     AUDIO_DIR,
     DB_PATH,
+    DRIVE_CREDENTIALS_FILE,
+    DRIVE_TOKEN_FILE,
     ENABLE_DIARIZATION,
     GLOSSARY_FILE,
     HF_TOKEN,
@@ -330,16 +333,119 @@ def check_ollama() -> list[Check]:
     return [Check("ollama models", OK, "extraction and embedding models present")]
 
 
+def check_postgres() -> list[Check]:
+    """Postgres holds LightRAG's KV, vector, doc-status and graph data.
+
+    Without it, LightRAG silently falls back to file-based storage which does
+    not hold thousands of documents. This is the most common undetected failure
+    after HF_TOKEN: everything appears to work, but the index lives in
+    throwaway JSON files instead of the durable pgvector tables.
+    """
+    if not shutil.which("docker"):
+        return [Check("postgres", WARN, "docker not on PATH; cannot verify")]
+    try:
+        result = subprocess.run(
+            ["docker", "exec", "mmc-postgres", "pg_isready", "-U", "lightrag", "-d", "rag"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [Check("postgres", WARN, f"could not query: {type(exc).__name__}")]
+
+    if result.returncode != 0:
+        return [
+            Check(
+                "postgres", FAIL,
+                "mmc-postgres not running - LightRAG falls back to file-based storage",
+                "docker compose up -d",
+            )
+        ]
+    return [Check("postgres", OK, "accepting connections")]
+
+
+def check_drive() -> list[Check]:
+    """Google Drive OAuth credentials for nightly audio capture.
+
+    Drive capture is optional - the pipeline works with local inbox drops - but
+    the nightly unattended mode depends on it.
+    """
+    checks = []
+    if DRIVE_CREDENTIALS_FILE.exists():
+        checks.append(Check("drive client", OK, "configured"))
+    else:
+        checks.append(
+            Check(
+                "drive client", WARN,
+                f"missing: {DRIVE_CREDENTIALS_FILE}",
+                "download OAuth client JSON from Google Cloud Console",
+            )
+        )
+
+    if DRIVE_TOKEN_FILE.exists():
+        checks.append(Check("drive token", OK, "configured"))
+    else:
+        checks.append(
+            Check(
+                "drive token", WARN,
+                f"missing: {DRIVE_TOKEN_FILE}",
+                "run: pipeline auth-drive",
+            )
+        )
+    return checks
+
+
+def check_nightly_task() -> list[Check]:
+    """Windows Scheduled Task for unattended nightly runs.
+
+    Only checked on Windows; other platforms use cron, which is out of scope.
+    """
+    if sys.platform != "win32":
+        return []  # Not applicable on non-Windows
+
+    task_name = "Meeting Minutes Compiler - Nightly"
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f'Get-ScheduledTask -TaskName "{task_name}" -ErrorAction Stop '
+             f'| Select-Object -ExpandProperty State'],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [Check("nightly task", WARN, f"could not check: {type(exc).__name__}")]
+
+    if result.returncode != 0:
+        return [
+            Check(
+                "nightly task", WARN,
+                "not installed - pipeline will not run automatically",
+                'run: .\\scripts\\install-nightly-task.ps1 -Owner "Your Name"',
+            )
+        ]
+
+    state = result.stdout.strip()
+    if state == "Ready":
+        return [Check("nightly task", OK, "scheduled and ready")]
+    return [
+        Check(
+            "nightly task", WARN,
+            f"exists but state is '{state}'",
+            "check Task Scheduler for errors",
+        )
+    ]
+
+
 ALL_CHECKS = (
     check_ffmpeg,
     check_asr,
     check_diarization,
     check_providers,
+    check_postgres,
     check_lightrag,
     check_ollama,
+    check_drive,
     check_storage,
     check_manifest,
     check_glossary,
+    check_nightly_task,
 )
 
 

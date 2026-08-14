@@ -30,10 +30,21 @@ class IndexError_(RuntimeError):
 
 
 def _headers() -> dict[str, str]:
-    headers = {"Content-Type": "application/json"}
-    if LIGHTRAG_API_KEY:
-        headers["X-API-Key"] = LIGHTRAG_API_KEY
-    return headers
+    """Build request headers, refusing to proceed without an API key.
+
+    This used to degrade silently: with no key the header was simply omitted, the
+    request succeeded against an unauthenticated server, and nothing anywhere
+    reported a problem. That is how a LightRAG instance holding every meeting
+    record ran open to the network for a day without being noticed. Failing here
+    means a missing key surfaces as an error at the first call instead of as an
+    index that quietly accepts anonymous requests.
+    """
+    if not LIGHTRAG_API_KEY:
+        raise IndexError_(
+            "MMC_LIGHTRAG_API_KEY is not set. Refusing to send unauthenticated "
+            "requests to LightRAG - set it in .env and restart the stack."
+        )
+    return {"Content-Type": "application/json", "X-API-Key": LIGHTRAG_API_KEY}
 
 
 def _client() -> httpx.Client:
