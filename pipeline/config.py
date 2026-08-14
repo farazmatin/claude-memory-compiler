@@ -3,6 +3,11 @@
 Everything configurable lives here or in the environment. Environment variables
 win over the defaults below so a server deployment can be retuned without
 editing code.
+
+`.env` is loaded first, before anything below reads `os.environ`, and never over
+a variable that is already set. Without that, `.env` configured the containers
+and nothing else: a HuggingFace token written there reached compose and never
+reached diarization.
 """
 
 from __future__ import annotations
@@ -12,8 +17,13 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from pipeline import env
+
+env.load()
+
 # ── Paths ─────────────────────────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parent.parent
+ENV_FILE = env.ENV_FILE
 
 INBOX_DIR = Path(os.environ.get("MMC_INBOX", ROOT_DIR / "inbox"))
 DRIVE_HANDOFF_DIR = INBOX_DIR / "drive"

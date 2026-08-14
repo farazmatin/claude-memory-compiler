@@ -28,6 +28,9 @@ alert.txt
 *.log
 speaker-overrides.yaml
 
+# Pre-migration snapshots written by scripts/migrate-to-postgres.ps1
+backups/
+
 # Secrets
 .env
 drive-client.json

@@ -43,27 +43,50 @@ whole architecture:
 
 ## Quick start
 
+```powershell
+# Windows
+git clone https://github.com/farazmatin/claude-memory-compiler
+cd claude-memory-compiler
+.\scripts\setup.ps1
+```
+
 ```bash
+# Linux / macOS
 git clone https://github.com/farazmatin/claude-memory-compiler
 cd claude-memory-compiler
 ./setup.sh
 ```
 
-`setup.sh` checks prerequisites, installs dependencies, generates secrets, starts
-the services, pulls the local models, and runs preflight checks. It's safe to
-re-run and never overwrites an existing `.env`.
+Either script checks prerequisites, installs dependencies, generates secrets,
+starts the services, pulls the local models, and runs preflight checks. Both are
+safe to re-run and never overwrite an existing `.env`. `setup.ps1` goes further:
+it installs ffmpeg and uv through winget or Chocolatey, waits for Docker Desktop,
+registers the nightly batch as a Scheduled Task, and finishes with a full
+verification pass (`.\scripts\setup.ps1 -VerifyOnly` runs that pass on its own).
 
-**One thing it can't do for you.** Speaker detection needs a HuggingFace token
-*and* two accepted licences:
+**Two things no script can do for you**, because both are tied to your accounts
+and need a browser. `setup.ps1` prompts for the first and opens the second.
 
-1. Put a **read** token in `.env` as `HF_TOKEN` — https://huggingface.co/settings/tokens
+*1. A HuggingFace token, plus two accepted licences.*
+
+1. Create a **read** token — https://huggingface.co/settings/tokens
 2. Accept both — the token alone is not enough:
    - https://hf.co/pyannote/speaker-diarization-3.1
    - https://hf.co/pyannote/segmentation-3.0
 
 Skip this and you get transcripts with no speaker names, which means action items
-with nobody assigned. `./setup.sh` reminds you at the end; `pipeline doctor`
-confirms when it's right.
+with nobody assigned. `pipeline doctor` confirms when it's right — it checks that
+the gated model is actually reachable, not just that a token is present.
+
+*2. Google Drive consent.* Save an OAuth **desktop** client from
+https://console.cloud.google.com/apis/credentials to
+`%LOCALAPPDATA%\MeetingMinutesCompiler\drive-client.json`, then run
+`uv run pipeline auth-drive` once and approve read-only access. The refresh token
+keeps the nightly Drive capture running unattended after that.
+
+Secrets are entered with the input hidden and written straight to `.env`; nothing
+prints a value back. `pipeline config show` reports each one as `configured` or
+`missing`, which is all the setup scripts and `doctor` ever report.
 
 Then your first meeting:
 
@@ -86,14 +109,20 @@ use, and how to judge whether the output is any good.
 <summary>Manual setup, if you'd rather not run a script</summary>
 
 ```bash
-cp .env.example .env      # then fill in MMC_LIGHTRAG_API_KEY, POSTGRES_PASSWORD, HF_TOKEN
 uv sync --extra asr
+uv run pipeline config init          # creates .env, generates the two local secrets
+echo "hf_xxx" | uv run pipeline config set HF_TOKEN
 docker compose up -d
 docker compose exec ollama ollama pull qwen3:4b
 docker compose exec ollama ollama pull mxbai-embed-large
 uv run pipeline init
 uv run pipeline doctor
 ```
+
+`config init` copies `.env.example` and fills `MMC_LIGHTRAG_API_KEY` and
+`POSTGRES_PASSWORD` with fresh URL-safe secrets, leaving any existing value
+alone — re-running it never rotates the password the running database expects.
+`config set` reads from stdin so the value never lands in shell history.
 
 </details>
 
@@ -138,6 +167,9 @@ recurring attendees, new guests, and manual overrides—see
 
 ```bash
 pipeline init                     # create directories and the manifest
+pipeline config init              # create .env and generate the local secrets
+pipeline config show              # which secrets are configured (never the values)
+pipeline config set HF_TOKEN      # set one key, value read from stdin
 pipeline auth-drive               # one-time private Drive authorization
 pipeline capture --dry-run        # preview approved Drive recordings
 pipeline capture                  # download approved Drive recordings
@@ -157,6 +189,8 @@ pipeline people                   # the people registry
 pipeline people --merge Mike Michael   # fold a duplicate, rewriting history
 pipeline entities                 # most-mentioned entities (graph health check)
 pipeline minutes --recompile      # rebuild after a template change, no ASR cost
+pipeline reindex                  # re-push minutes after the index is replaced
+pipeline doctor --json            # the same checks, for scripts to branch on
 pipeline backup --to /mnt/backup  # snapshot everything irreplaceable
 pipeline retry                    # requeue whatever failed
 pipeline capture --complete-backfill  # permanently disable the one-time backfill folder
@@ -241,14 +275,29 @@ above against your actual hardware.
 pipeline doctor
 ```
 
-18 checks: ffmpeg, whisperx, the ASR model against your device, **HF token plus
-actual gated-model reachability**, every provider in the chain, LightRAG health and
-whether its storage is file-based, Ollama models, directories, disk headroom,
-manifest state, glossary depth. Each failure prints its fix.
+Everything that can go wrong quietly: `.env` and each secret it should carry,
+ffmpeg, whisperx, the ASR model against your device, **HF token plus actual
+gated-model reachability**, every provider in the chain, LightRAG health, whether
+all four of its stores are really on Postgres, the Postgres container itself,
+Ollama models, **Drive authorization tested against the real folder**, the
+dashboard, **whether anything is scheduled to run the batch unattended**,
+directories, disk headroom, manifest state, glossary depth. Each failure prints
+its fix.
 
-The gated-model check earns its place: a HuggingFace token proves nothing about
-licence acceptance, which is the part people miss, and missing diarization costs
-every action item its owner while printing only a warning mid-batch.
+Configuration is reported as `configured` or `missing` — never as a value — so a
+`doctor` report is safe to paste into a bug report. `pipeline doctor --json` emits
+the same checks for scripts; that is what `setup.ps1` branches on rather than
+parsing the table.
+
+Three checks earn their place by catching failures that are otherwise invisible:
+
+- **Gated-model reachability.** A HuggingFace token proves nothing about licence
+  acceptance, which is the part people miss, and missing diarization costs every
+  action item its owner while printing only a warning mid-batch.
+- **Drive authorization.** A revoked refresh token looks exactly like a quiet week
+  with no meetings.
+- **The nightly schedule.** Everything else can pass and the corpus still stops
+  growing, because nothing ever invokes `pipeline run`.
 
 **What it does not tell you:** whether the output is good. That needs one real
 meeting, read against the audio.
@@ -295,6 +344,40 @@ written alongside it. The LightRAG index is deliberately **not** backed up — i
 derived from `minutes/` and rebuilt with `pipeline index`.
 
 Add it to the nightly timer after `run`.
+
+## Moving the index onto Postgres
+
+`docker-compose.yml` configures Postgres storage from day one, because the
+file-based defaults do not hold thousands of documents and migrating a populated
+graph later is painful. If you started before that — or on the JSON defaults for
+any other reason — this moves you across without risking the corpus:
+
+```powershell
+.\scripts\migrate-to-postgres.ps1
+```
+
+The index is derived data, so nothing is copied between stores: the minutes are
+simply re-inserted into an empty one. The order is the safety.
+
+1. Back up the manifest, transcripts and minutes first. The manifest is the only
+   record of which meeting each transcript belongs to.
+2. Copy `rag_storage/` aside before the new configuration starts, so the old index
+   survives as a rollback path.
+3. **Refuse to re-index until LightRAG actually reports Postgres storage.** All
+   four stores — KV, vectors, doc-status, graph — have to move together. Re-indexing
+   into the store you are trying to leave achieves nothing and costs hours of
+   CPU-bound extraction.
+4. Verify by asking a real question, not by trusting exit codes, then re-run the
+   Drive capture dry run and `doctor`.
+
+Nothing is deleted. On any platform the same thing by hand is `pipeline backup`,
+`docker compose up -d`, `pipeline reindex`, `pipeline query`.
+
+`pipeline reindex` is the piece that is easy to get wrong alone: it clears each
+meeting's recorded LightRAG document id. Left in place, the index stage tries to
+delete a document the new store has never seen, correctly refuses to insert a
+possible duplicate, and skips every meeting — a migration that reports success and
+indexes nothing.
 
 ## When the batch fails
 

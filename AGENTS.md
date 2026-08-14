@@ -358,6 +358,28 @@ them would be worse than an unnormalized spelling.
 
 Everything in `pipeline/config.py`, all overridable by environment variable.
 
+`pipeline/env.py` loads `.env` into `os.environ` once, at `pipeline.config` import,
+before anything reads a variable. A real environment variable always wins over the
+file. This matters more than it looks: `docker compose` reads `.env` on its own, so
+before this existed a token written there configured the containers and never
+reached the pipeline — and the symptom was diarization failing the way it always
+fails, silently, with unowned action items.
+
+The same module owns writing. `pipeline config init` seeds `.env` from
+`.env.example` and generates `MMC_LIGHTRAG_API_KEY` and `POSTGRES_PASSWORD`,
+filling only blanks — re-running setup must never rotate the password the running
+database still expects. `pipeline config set KEY` takes the value on **stdin**, not
+as an argument, so it stays out of shell history and out of `ps`. Nothing in
+`config`, `doctor`, or the setup scripts ever prints a value; they report
+`configured` or `missing`. `pipeline config show --key KEY` answers in its exit
+code, which is how `scripts/setup.ps1` asks instead of growing a second `.env`
+parser that would drift from this one.
+
+The parser deliberately matches what compose accepts — `export` prefixes, single
+quotes as literals, double quotes with escapes, inline comments only after
+whitespace — because one file configures both readers and a value that means two
+different things in the two is worse than one that fails in both.
+
 | Variable | Default | Notes |
 |---|---|---|
 | `MMC_LLM_PROVIDERS` | `gemini,codex,claude` | Priority order; falls through on failure |
@@ -369,6 +391,7 @@ Everything in `pipeline/config.py`, all overridable by environment variable.
 | `MMC_GEMINI_ARGS` / `MMC_CODEX_ARGS` | `-p -` / `exec -` | Override if a CLI changes its invocation |
 | `MMC_LLM_TIMEOUT` | `900` | Per-call ceiling; a CLI wanting a TTY would otherwise hang the batch |
 | `MMC_LIGHTRAG_API_KEY` | — | **Required**; compose fails fast without it |
+| `MMC_ENV_FILE` | `<repo>/.env` | Which file `env.load()` reads; tests point it elsewhere |
 | `MMC_OWNER_NAME` | unset | Default for `--owner` |
 | `MMC_TIMEZONE` | `America/Toronto` | Meeting dates depend on it; wrong value mislabels the corpus |
 | `MMC_ASR_MODEL` | `large-v3-turbo` | `large-v3` only if you have a GPU |
@@ -432,6 +455,41 @@ precisely when the copy matters.
 
 `rag_storage/` and the Postgres volume are deliberately excluded. The index is
 derived; `pipeline index` rebuilds it.
+
+## Replacing the index (`pipeline reindex`)
+
+Because the index is derived, moving stores means re-inserting the minutes, not
+migrating data. `pipeline reindex` rewinds every `indexed` meeting to
+`minutes_compiled` **and clears its `lightrag_doc_id`**.
+
+Clearing the id is the whole point. `index.replace_minutes` refuses to insert when
+a previously recorded document cannot be deleted first — that check is what stops
+a recompile leaving two contradictory copies of one meeting in the graph. Against
+an empty store every one of those deletes fails, because the documents were never
+there, so without clearing the id the migration skips every meeting and reports
+success.
+
+`scripts/migrate-to-postgres.ps1` wraps this in the order that makes it safe:
+back up the non-derived data, copy `rag_storage/` aside as a rollback path, and
+**refuse to re-index until `doctor` reports all four LightRAG stores on Postgres**.
+Re-indexing into the store you are trying to leave costs hours of CPU-bound
+extraction and changes nothing.
+
+## Windows setup (`scripts/`)
+
+| Script | Does |
+|---|---|
+| `setup.ps1` | The whole install: ffmpeg and uv via winget/Chocolatey, Docker Desktop, `.env` and its secrets, dependencies, containers and models, folders, Drive consent, Scheduled Tasks, verification. `-VerifyOnly` runs the verification alone |
+| `migrate-to-postgres.ps1` | Backup → Postgres-backed stack → `reindex` → verify, refusing to proceed if the index is still file-based |
+| `lib.ps1` | Shared output, `Invoke-Pipeline`, `Test-Configured`, `Get-DoctorReport` |
+| `install-nightly-task.ps1` | The 1 AM batch. `-Owner` optional; unset, `pipeline run` takes it from `MMC_OWNER_NAME` |
+| `install-dashboard-task.ps1` / `open-dashboard.ps1` | Dashboard at sign-in, Startup shortcut as fallback |
+
+Two conventions hold across all of them. They set
+`$PSNativeCommandUseErrorActionPreference = $false`, because `pipeline doctor`
+exits non-zero by design when a check fails and reporting that is the job.
+And they never parse `.env` or print a value — configuration questions go through
+`pipeline config show --key` and `pipeline doctor --json`.
 
 ## Extending
 

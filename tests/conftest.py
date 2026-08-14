@@ -24,6 +24,9 @@ os.environ.update(
     MMC_MINUTES=str(_WORK / "minutes"),
     MMC_DB_DIR=str(_WORK / "db"),
     MMC_TIMEZONE="America/Toronto",
+    # Point .env loading at a file that does not exist. Otherwise the suite picks
+    # up the developer's real secrets and tests pass on this machine only.
+    MMC_ENV_FILE=str(_WORK / ".env"),
 )
 
 # httpx is only needed by the index module's HTTP calls, which these tests never

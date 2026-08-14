@@ -5,11 +5,12 @@
 #
 #   ./setup.sh
 #
-# Afterwards you still need to do two things by hand, because nobody can do them
-# for you:
-#   1. Put a HuggingFace token in .env
-#   2. Accept two model licences on huggingface.co
-# The script tells you exactly where at the end.
+# Two things need a browser and your accounts, so they cannot be automated:
+#   1. A HuggingFace read token, plus accepting two model licences
+#   2. Google Drive consent, if you want unattended capture
+# This prompts for the first (input hidden, never echoed) and points at the
+# second. The Windows equivalent is scripts\setup.ps1, which also installs the
+# prerequisites and registers the nightly Scheduled Task.
 
 set -euo pipefail
 
@@ -82,46 +83,59 @@ if [ "$MISSING" -eq 1 ]; then
     exit 1
 fi
 
-# ── 2. Secrets ────────────────────────────────────────────────────────
+# ── 2. Python dependencies ────────────────────────────────────────────
 
-step "Configuring .env"
-
-gen_secret() { python3 -c 'import secrets; print(secrets.token_urlsafe(32))'; }
-
-if [ -f .env ]; then
-    ok ".env already exists - leaving it alone"
-else
-    cp .env.example .env
-    # Fill in the two secrets that can be generated. HF_TOKEN cannot be.
-    python3 - <<'PY'
-import pathlib, secrets
-env = pathlib.Path(".env")
-text = env.read_text()
-for key in ("MMC_LIGHTRAG_API_KEY", "POSTGRES_PASSWORD"):
-    text = text.replace(f"{key}=\n", f"{key}={secrets.token_urlsafe(32)}\n", 1)
-env.write_text(text)
-PY
-    ok "created .env with generated secrets"
-fi
-
-# Owner name makes 1:1 speaker identification much better.
-if ! grep -q '^MMC_OWNER_NAME=' .env 2>/dev/null; then
-    printf '\n    Your name (used to tell who is who in 1:1 recordings): '
-    read -r OWNER || OWNER=""
-    if [ -n "$OWNER" ]; then
-        printf '\nMMC_OWNER_NAME=%s\n' "$OWNER" >> .env
-        ok "set MMC_OWNER_NAME=$OWNER"
-    else
-        warn "skipped - set MMC_OWNER_NAME in .env later"
-    fi
-fi
-
-# ── 3. Python dependencies ────────────────────────────────────────────
+# Before the .env step, which is driven by `pipeline config` so that one
+# implementation writes the file on every platform. A second one here would drift
+# from pipeline/env.py, and the drift would surface as setup insisting that a
+# configured value is missing.
 
 step "Installing Python dependencies"
 warn "the ASR extra pulls torch - this can take several minutes"
 uv sync --extra asr --extra dev
 ok "dependencies installed"
+
+# ── 3. Secrets ────────────────────────────────────────────────────────
+
+step "Configuring .env"
+
+# Creates .env from the example and generates MMC_LIGHTRAG_API_KEY and
+# POSTGRES_PASSWORD. Only fills blanks: re-running never rotates a password that
+# the running database still expects.
+uv run pipeline config init
+
+# Owner name makes 1:1 speaker identification much better.
+if ! uv run pipeline config show --key MMC_OWNER_NAME >/dev/null 2>&1; then
+    printf '\n    Your name (used to tell who is who in 1:1 recordings): '
+    read -r OWNER || OWNER=""
+    if [ -n "$OWNER" ]; then
+        printf '%s' "$OWNER" | uv run pipeline config set MMC_OWNER_NAME >/dev/null
+        ok "MMC_OWNER_NAME configured"
+    else
+        warn "skipped - set MMC_OWNER_NAME in .env later"
+    fi
+fi
+
+# The one secret nobody can generate for you. Read with echo off and piped
+# straight in: a token passed as an argument lands in shell history and in `ps`.
+if ! uv run pipeline config show --key HF_TOKEN >/dev/null 2>&1; then
+    printf '\n    A HuggingFace read token is needed for speaker diarization.\n'
+    printf '    Without it, action items come out with nobody assigned.\n\n'
+    printf '      1. Create a %sread%s token:  https://huggingface.co/settings/tokens\n' "$BOLD" "$RESET"
+    printf '      2. Accept BOTH licences (the token alone is not enough):\n'
+    printf '           https://hf.co/pyannote/speaker-diarization-3.1\n'
+    printf '           https://hf.co/pyannote/segmentation-3.0\n\n'
+    printf '    Paste the token (input hidden), or press Enter to skip: '
+    read -rs HF || HF=""
+    printf '\n'
+    if [ -n "$HF" ]; then
+        printf '%s' "$HF" | uv run pipeline config set HF_TOKEN >/dev/null
+        ok "HF_TOKEN configured"
+    else
+        warn "skipped - re-run ./setup.sh when you have one"
+    fi
+    unset HF
+fi
 
 # ── 4. Services ───────────────────────────────────────────────────────
 
@@ -169,14 +183,16 @@ if [ "$DOCTOR" -eq 0 ]; then
     printf '%sSetup complete.%s\n\n' "$GREEN$BOLD" "$RESET"
 else
     printf '%sSetup done, but preflight found problems.%s\n\n' "$YELLOW$BOLD" "$RESET"
-    printf 'Almost always this is the HuggingFace token. Two steps:\n\n'
-    printf '  1. Put a %sread%s token in .env as HF_TOKEN\n' "$BOLD" "$RESET"
-    printf '     %shttps://huggingface.co/settings/tokens%s\n\n' "$DIM" "$RESET"
-    printf '  2. Accept BOTH licences (the token alone is not enough):\n'
+    printf 'Each failure above prints its own fix. The two that need a browser:\n\n'
+    printf '  %sdiarization%s - a read token, AND both licences accepted:\n' "$BOLD" "$RESET"
+    printf '     %shttps://huggingface.co/settings/tokens%s\n' "$DIM" "$RESET"
     printf '     %shttps://hf.co/pyannote/speaker-diarization-3.1%s\n' "$DIM" "$RESET"
-    printf '     %shttps://hf.co/pyannote/segmentation-3.0%s\n\n' "$DIM" "$RESET"
-    printf 'Without it you get transcripts with no speaker names, which means\n'
-    printf 'action items with nobody assigned. Then re-run: %suv run pipeline doctor%s\n\n' "$BOLD" "$RESET"
+    printf '     %shttps://hf.co/pyannote/segmentation-3.0%s\n' "$DIM" "$RESET"
+    printf '     Without it, transcripts have no speaker names, which means action\n'
+    printf '     items with nobody assigned. Re-run this script to enter the token.\n\n'
+    printf '  %sdrive auth%s - one-time consent for unattended capture:\n' "$BOLD" "$RESET"
+    printf '     %suv run pipeline auth-drive%s\n\n' "$BOLD" "$RESET"
+    printf 'Then re-check with: %suv run pipeline doctor%s\n\n' "$BOLD" "$RESET"
 fi
 
 printf '%sYour first meeting:%s\n\n' "$BOLD" "$RESET"

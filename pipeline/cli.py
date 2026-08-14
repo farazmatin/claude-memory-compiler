@@ -17,6 +17,8 @@ minutes compilation loses minutes of work rather than hours.
     pipeline dashboard             browse and search the local meeting record
     pipeline query "question"      ask the knowledge base
     pipeline status                where everything is, plus stage timings
+    pipeline doctor                preflight the environment (--json to script it)
+    pipeline reindex               re-push minutes after the index is replaced
     pipeline retry                 requeue failed meetings
 
 Wire `pipeline run` to a nightly timer, not a filesystem watcher: the combined
@@ -553,17 +555,32 @@ def cmd_entities(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_doctor(_args: argparse.Namespace) -> int:
+def cmd_doctor(args: argparse.Namespace) -> int:
     """Preflight the environment.
 
     Verifies nothing is obviously broken. It cannot tell you the minutes are any
     good - only running a real meeting through and reading the result does that.
+
+    Reports configuration as `configured` or `missing` and where to fix it. No
+    check prints a secret, so the output is safe to paste into a bug report.
     """
+    import json
+
     from pipeline import doctor
 
     checks, ok = doctor.run()
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "ok": ok,
+            "failed": sum(1 for c in checks if c.status == doctor.FAIL),
+            "warnings": sum(1 for c in checks if c.status == doctor.WARN),
+            "checks": [c.as_dict() for c in checks],
+        }, indent=2))
+        return 0 if ok else 1
+
     for check in checks:
-        print(f"[{check.symbol}] {check.name:<22} {check.detail}")
+        print(f"[{check.symbol}] {check.name:<26} {check.detail}")
         if check.fix and check.status != doctor.OK:
             print(f"{'':<9} -> {check.fix}")
 
@@ -589,6 +606,87 @@ def cmd_backup(args: argparse.Namespace) -> int:
             print(f"  {error}")
         return 1
     return 0
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    """Create, inspect and edit `.env` without a secret ever being visible.
+
+    The setup scripts drive this rather than editing the file themselves. A value
+    arrives on stdin, not as an argument: arguments show up in shell history, in
+    `ps`, and in the transcript of anyone screen-sharing while they set the
+    machine up. Nothing here ever prints a value back.
+    """
+    from pipeline import env
+
+    if args.config_command == "init":
+        created = env.create_from_example(env.ENV_FILE)
+        generated = env.fill_generated_secrets(env.ENV_FILE)
+        print(f"{'created' if created else 'kept existing'} {env.ENV_FILE}")
+        if generated:
+            print(f"generated: {', '.join(generated)}")
+        else:
+            print("generated: none needed - existing secrets left untouched")
+        return 0
+
+    if args.config_command == "set":
+        value = sys.stdin.read().strip()
+        if not value:
+            print(f"No value on stdin; {args.key} not changed.", file=sys.stderr)
+            return 1
+        env.set_value(args.key, value, env.ENV_FILE)
+        print(f"{args.key}: {env.CONFIGURED}")
+        return 0
+
+    single = getattr(args, "key", None)
+    if single:
+        # One key, with the answer in the exit code. This is how the setup
+        # scripts ask "is this configured yet" without growing a second .env
+        # parser that drifts from this one.
+        state = env.status(single, env.ENV_FILE)
+        print(f"{single}: {state}")
+        return 0 if state == env.CONFIGURED else 1
+
+    keys = [*env.REQUIRED_SECRETS, *env.MANUAL_SECRETS]
+    print(f"{env.ENV_FILE}\n")
+    missing = 0
+    for key in keys:
+        state = env.status(key, env.ENV_FILE)
+        missing += state == env.MISSING
+        print(f"  {key:<24} {state}")
+    return 1 if missing else 0
+
+
+def cmd_reindex(args: argparse.Namespace) -> int:
+    """Push already-indexed meetings into the index again.
+
+    This exists for the day the index is replaced rather than updated - moving
+    LightRAG from its file-based defaults onto Postgres being the case that
+    matters. The manifest, transcripts and minutes are untouched by that move, so
+    nothing needs recompiling; the documents just have to be inserted into a store
+    that has never seen them.
+
+    Clearing `lightrag_doc_id` is the part that is easy to miss. The index stage
+    refuses to insert when a previously recorded document cannot be deleted first,
+    because that is how a recompile ends up with two contradictory copies of one
+    meeting in the graph. Against an empty Postgres store every one of those
+    deletes fails - the documents were never there - so every meeting would be
+    skipped for a reason that does not apply.
+    """
+    db.init_db()
+    with db.connect() as conn:
+        queue = db.pending(conn, db.INDEXED, args.limit)
+        if not queue:
+            print("No indexed meetings to requeue.")
+            return 0
+        for meeting in queue:
+            db.advance(conn, meeting.id, db.MINUTES_COMPILED, lightrag_doc_id=None)
+            print(f"  requeued {meeting.label}")
+
+    print(f"\nRequeued {len(queue)} meeting(s) for indexing.")
+    if args.queue_only:
+        print("Run `pipeline index` when the index is ready.")
+        return 0
+    return cmd_index(argparse.Namespace(limit=args.limit))
 
 
 def cmd_retry(args: argparse.Namespace) -> int:
@@ -737,9 +835,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_entities.add_argument("--limit", type=int, default=50)
     p_entities.set_defaults(func=cmd_entities)
 
-    subparsers.add_parser(
+    p_doctor = subparsers.add_parser(
         "doctor", help="preflight the environment before a real batch"
-    ).set_defaults(func=cmd_doctor)
+    )
+    p_doctor.add_argument(
+        "--json", action="store_true",
+        help="machine-readable results, for the setup scripts to branch on",
+    )
+    p_doctor.set_defaults(func=cmd_doctor)
 
     p_backup = subparsers.add_parser(
         "backup", help="back up transcripts, minutes, audio and the manifest"
@@ -751,6 +854,36 @@ def build_parser() -> argparse.ArgumentParser:
              "transcripts but never re-transcribe",
     )
     p_backup.set_defaults(func=cmd_backup)
+
+    p_config = subparsers.add_parser(
+        "config", help="create and inspect .env without printing secrets"
+    )
+    config_subparsers = p_config.add_subparsers(dest="config_command")
+    config_subparsers.add_parser(
+        "init", help="create .env from .env.example and generate the local secrets"
+    )
+    p_config_set = config_subparsers.add_parser(
+        "set", help="set one key, reading the value from stdin"
+    )
+    p_config_set.add_argument("key", help="e.g. HF_TOKEN")
+    p_config_show = config_subparsers.add_parser(
+        "show", help="which secrets are configured (default)"
+    )
+    p_config_show.add_argument(
+        "--key",
+        help="report one key and exit non-zero when it is missing, for scripting",
+    )
+    p_config.set_defaults(func=cmd_config)
+
+    p_reindex = subparsers.add_parser(
+        "reindex", help="re-push indexed meetings (after the index is replaced)"
+    )
+    p_reindex.add_argument("--limit", type=int, default=None)
+    p_reindex.add_argument(
+        "--queue-only", action="store_true",
+        help="requeue without indexing, for when the new store is not up yet",
+    )
+    p_reindex.set_defaults(func=cmd_reindex)
 
     p_retry = subparsers.add_parser("retry", help="requeue failed meetings")
     p_retry.add_argument(
