@@ -112,15 +112,68 @@ Everything runs from these. No terminal, no commands, no config files.
 | **Meetings & minutes** | exists | Gains a play button beside each speaker name. |
 | **Ask** | exists | Unchanged, but answers improve as names become correct. |
 
-## Prerequisites, in order
+## How it gets built
 
-1. **Dashboard login.** Phone access means recorded voice leaves the laptop, so
-   the authentication and Host-header work in
-   `2026-08-14-desktop-app-design.md` must land first. This is a hard blocker.
-2. **Better voice separation.** The diarization upgrade must happen *before*
-   anyone is labelled — it changes how voices are measured, and doing it after
-   would mean labelling everyone again.
-3. **Old recordings.** Already-processed meetings have no stored clips and their
-   audio was deleted after transcription. Making them labellable means
-   re-fetching from Drive once. Worth it for recurring people, not for one-off
-   calls.
+Six stages in dependency order. Each must be finished before the next is worth
+starting, and every stage after the first ends in something usable.
+
+### 00 — Groundwork (blocker)
+
+- **Dashboard login**, from `2026-08-14-desktop-app-design.md`. Phone access
+  means recorded voice leaves the laptop; that cannot happen on an
+  unauthenticated page.
+- **Diarization upgrade.** Must happen *before* anyone is labelled — it changes
+  how voices are measured, so doing it later means labelling everyone twice.
+
+Nothing visible changes for the owner.
+
+### 01 — Start keeping the voice clips (silent)
+
+Embeddings and snippets stored during every transcribe. New tables. No screens,
+no notifications.
+
+Deliberately first: when the labelling screen appears it opens with a real
+backlog from actual meetings rather than an empty page, and matching can be
+sanity-checked against real recordings before anything depends on it.
+
+### 02 — Labelling on the laptop (first usable version)
+
+Matching, cross-meeting clustering, and the *To label* and *People* screens in
+the desktop browser. The one-time enrollment sitting happens here.
+
+Laptop first, because it proves the matching is good before any effort goes into
+phone plumbing.
+
+### 03 — Move it to the phone
+
+PWA install, full-screen card with looping audio and thumb-reach buttons,
+Tailscale access toggle, ntfy notifications with quiet hours.
+
+### 04 — Ask the same day
+
+The daytime scheduled task: watch Drive through working hours, run diarization on
+arrival, separately from the night transcription.
+
+Last, because until the earlier stages exist there is nothing to notify about.
+Before this lands, labelling happens the next morning — workable, just less fresh.
+
+### 05 — Finish the edges
+
+Automatic calibration, *Status* screen, sensitivity slider, and the setup screen
+that re-fetches old audio from Drive so historic meetings become labellable.
+
+### Where this can go wrong
+
+**Stage 02 is the decision point.** If matching proves unreliable on real
+recordings — far-field audio, speakerphone, phone dial-in — then stages 03 and 04
+are polish on something that does not work, and the right move is to stop and fix
+matching first.
+
+Stage 02 therefore ends with a measurement, not a demo: how often the top guess
+is correct on the owner's own meetings.
+
+### Note on old recordings
+
+Already-processed meetings have no stored clips and their audio was deleted after
+transcription. Making them labellable means re-fetching from Drive once (stage
+05). Worth it for recurring people, not for one-off calls.
