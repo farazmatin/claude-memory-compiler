@@ -11,6 +11,10 @@ inbox/
 audio/
 transcripts/
 
+# Retained voice clips for speaker labelling. Small (~30 KB per speaker) but they
+# are recorded voice, and biometric material never belongs in version control.
+snippets/
+
 # Tier 2: compiled minutes.
 # The RAG corpus. Ignored by default because meeting content is sensitive;
 # remove this line if you want minutes version-controlled.

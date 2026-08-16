@@ -42,6 +42,9 @@ ALL_DIRS = [
     INBOX_DIR, DRIVE_HANDOFF_DIR, AUDIO_DIR, TRANSCRIPTS_DIR, MINUTES_DIR, DB_DIR, TEMPLATES_DIR,
 ]
 
+# Populated further down, once SNIPPETS_DIR is defined; kept out of the literal
+# above so the voice settings stay in one block.
+
 # Audio extensions we will pick up out of the inbox.
 AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".opus", ".mp4"}
 
@@ -71,6 +74,57 @@ TARGET_SAMPLE_RATE = 16_000
 INITIAL_PROMPT_TOKEN_BUDGET = 224
 
 ENABLE_DIARIZATION = os.environ.get("MMC_DIARIZATION", "1") not in ("0", "false", "False")
+
+# ── Voice enrollment ──────────────────────────────────────────────────
+# Diarization separates voices within one recording; these settings govern
+# recognising the same voice ACROSS recordings, so a person named once is
+# labelled automatically thereafter.
+#
+# Every threshold below is set for the deployment profile that actually exists:
+# one phone on a table, in person. That is far-field single-channel audio, the
+# hardest realistic case, and it puts same-speaker similarity well below the
+# figures published for close-mic enrollment. Treat these as starting points -
+# `calibrate` replaces them with values measured on real recordings.
+
+# Auto-apply at or above this cosine similarity.
+VOICE_AUTO = float(os.environ.get("MMC_VOICE_AUTO", "0.62"))
+# Queue a card for confirmation at or above this.
+VOICE_REVIEW = float(os.environ.get("MMC_VOICE_REVIEW", "0.38"))
+# Required gap between the best and second-best match. Absolute similarity alone
+# confuses two people at the same table on the same microphone; distance to the
+# runner-up is what catches it.
+VOICE_MARGIN = float(os.environ.get("MMC_VOICE_MARGIN", "0.12"))
+# Below this much speech, never auto-apply. A four-second embedding is noise, and
+# someone who says "yeah, agreed" once should not enroll anybody.
+VOICE_MIN_SPEECH_SEC = float(os.environ.get("MMC_VOICE_MIN_SPEECH_SEC", "30"))
+# Meetings a person must appear in before they are eligible for auto-matching.
+# The key far-field rule: enrolled from one meeting means enrolled from one seat,
+# and the same colleague across the table next week embeds differently enough to
+# be mistaken for someone else.
+VOICE_MIN_ENROLL_MEETINGS = int(os.environ.get("MMC_VOICE_MIN_ENROLL_MEETINGS", "2"))
+# Grouping pending labels into "one person" is deliberately tighter than the
+# auto-match threshold: a contaminated cluster enrolls a poisoned voiceprint from
+# a single confirmation, which is the most damaging wrong answer available.
+VOICE_CLUSTER_THRESHOLD = float(os.environ.get("MMC_VOICE_CLUSTER", "0.72"))
+# Embeddings from different models are not comparable. Matching filters on this,
+# and changing it means re-enrollment rather than nonsense similarities.
+VOICE_MODEL = os.environ.get("MMC_VOICE_MODEL", "pyannote/wespeaker-voxceleb-resnet34-LM")
+
+# Retained voice clips, so speakers stay labellable by ear after the source audio
+# is deleted. ~30 KB per speaker against 2-4 MB per audio-hour.
+SNIPPETS_DIR = Path(os.environ.get("MMC_SNIPPETS", ROOT_DIR / "snippets"))
+SNIPPET_COUNT = int(os.environ.get("MMC_SNIPPET_COUNT", "3"))
+SNIPPET_SEC = float(os.environ.get("MMC_SNIPPET_SEC", "6"))
+# The opening of a meeting is join noise and overlapping greetings. Clips taken
+# from it are the worst possible evidence to hand someone for a decision.
+SNIPPET_SKIP_OPENING_SEC = float(os.environ.get("MMC_SNIPPET_SKIP_OPENING", "90"))
+# Reject a candidate clip whose aligned words cover less than this of its span.
+SNIPPET_MIN_WORD_COVERAGE = 0.5
+# Minimum separation between chosen clips, so three clips are not three slices of
+# one sentence.
+SNIPPET_MIN_SEPARATION_SEC = 60.0
+
+ALL_DIRS.append(SNIPPETS_DIR)
 
 
 def _optional_int(name: str) -> int | None:
