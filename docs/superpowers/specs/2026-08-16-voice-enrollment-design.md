@@ -238,10 +238,17 @@ toward review over auto for the first weeks:
 
 These are starting points, not measurements — far-field meeting audio moves the
 same-speaker distribution down relative to the clean enrollment audio the
-published numbers assume. `pipeline voices calibrate` reports the same-person and
-different-person score distributions from your own confirmed data with the
-equal-error point and a suggested triple. It needs several people confirmed
-across several meetings before it can say anything, so it is a month-two tool.
+published numbers assume.
+
+Calibration is a **nightly job, not a command**. Once enough confirmed pairs
+exist it computes the same-person and different-person score distributions from
+the owner's own recordings, finds the equal-error point, and proposes a tuned
+triple. The owner sees "Matching has been tuned to your recordings — accept?",
+never a cosine value. It needs several people confirmed across several meetings
+before it can say anything, so it is a month-two event.
+
+The only threshold control the owner ever touches is one sensitivity slider,
+mapping to all four values at once.
 
 ## The unit of work is a voice, not a meeting
 
@@ -324,6 +331,96 @@ at identifying voices they know only slightly, and a UI that pressures a decisio
 manufactures confident wrong labels — the exact outcome `speakers.py:7` exists to
 prevent. Skipping returns the cluster to the queue, where it may resolve itself
 later once a neighbouring voice is named.
+
+## Phone-first, and no terminal
+
+Two hard constraints from the owner, and they reshape more than the CSS.
+
+**The phone is the primary review device.** Listening to six-second clips is a
+couch activity. A desktop-only queue would be reviewed rarely, which is the same
+as never.
+
+**There is no terminal in this workflow.** The dashboard exists precisely to
+retire the CLI. Any capability specified as a `pipeline voices ...` command is,
+for this owner, a capability that does not exist. Every one of them needs a
+screen — that is a requirement, not polish.
+
+### Reaching the dashboard from the phone
+
+`DASHBOARD_HOST` stays `127.0.0.1` as the default for anyone else. Phone access
+is opt-in and goes over **Tailscale**: a private WireGuard mesh where the laptop
+and the phone join one tailnet and the dashboard becomes reachable at a stable
+tailnet address. No port forwarding, no public DNS, nothing exposed to the
+internet, and the device list is the access list.
+
+Defence in depth, because this serves recorded voice:
+
+1. Tailscale — only enrolled devices can route to it at all.
+2. Session authentication from `2026-08-14-desktop-app-design.md`.
+3. Host-header validation from that same spec, which closes the DNS-rebinding
+   finding of the 2026-08-13 review.
+
+Bind address becomes a dashboard setting rather than an environment variable,
+with plain language — "Allow access from my phone (Tailscale only)" — and it
+stays off until deliberately switched on.
+
+### It has to work when the laptop is asleep
+
+The batch runs 01:00–07:00 while the machine is awake. Couch review happens in
+the evening, and if the laptop is shut the phone has nothing to talk to. A queue
+that only works when the owner remembers to leave a laptop open is a queue that
+gets abandoned.
+
+The dashboard therefore ships as an **installable PWA** that caches the pending
+queue and its snippets on the phone. The whole queue is a few megabytes — snippets
+are ~30 KB each — so a night's cards fit trivially. Decisions are recorded locally
+and **synced when the laptop is next reachable**, which in practice is the next
+morning's batch window.
+
+This makes laptop uptime irrelevant to the owner's experience, which is the point.
+It also means review works on a train with no signal.
+
+### The card, on a phone
+
+- **One card, full screen.** No list to scroll, no density.
+- **Audio starts on its own and loops.** The primary action is listening.
+- **Actions sit in the bottom third**, inside thumb reach — not the top bar.
+- **Accept is the biggest target**, since the pre-filled proposal is usually right.
+- **No swipe-to-decide.** A mis-swipe on a moving bus enrolls a wrong voiceprint;
+  destructive-by-accident is not acceptable when the cost is silent mislabelling.
+- **Progress is visible and finite** — "4 of 11" — because a bounded task gets
+  finished and an unbounded one gets abandoned.
+- Snippets encode as **Opus in Ogg**, natively supported by Chrome on Android.
+
+### Notifications
+
+Self-hosted **ntfy**, reachable over the tailnet, with the Android app subscribed
+to a topic. This slots into machinery that already exists: `config.py:130`
+documents `MMC_ALERT_COMMAND` with an ntfy example, so the pattern is already the
+project's own.
+
+Self-hosted rather than public `ntfy.sh` deliberately. The public server is a
+third party, and the Play-flavour app routes through Firebase; neither belongs
+between this archive and its owner. It runs as one more service block in the
+`docker-compose.yml` already hosting LightRAG and Postgres.
+
+**Payloads carry no content** — no names, no meeting titles, no transcript text.
+"3 voices to label" and a link. A notification is a lock-screen artifact and gets
+mirrored to watches and laptops; it is the wrong place for anything private, even
+with a private server.
+
+### Every command becomes a screen
+
+| Previously specified as CLI | Becomes |
+|---|---|
+| `pipeline voices bootstrap` | **Setup screen.** "Find voices in my past meetings", a progress bar, and a plain-language note when old audio must be re-fetched from Drive. |
+| `pipeline voices calibrate` | **Automatic.** Runs in the nightly window once enough confirmed pairs exist; surfaces as "Matching has been tuned to your recordings" with a one-tap accept. Never asks the owner to reason about cosine thresholds. |
+| `pipeline voices forget <person>` | **Delete on the person's page**, with an explicit confirmation naming what is destroyed, and the honest caveat that backups are not rewritten. |
+| Threshold environment variables | **A single sensitivity control** — "Ask me more often ⇄ Label automatically more often" — writing to the existing `pipeline_settings` table (`db.py:105`). Env vars remain as an advanced override, undocumented in the UI. |
+
+The people registry needs a screen regardless: list, rename, merge, play their
+enrolled samples. Merging two people is a normal correction, not an edge case,
+and it currently has no non-CLI expression at all.
 
 ## Routes
 
@@ -408,9 +505,11 @@ audio is gone.
    `web_view_link`, so historic audio can be re-downloaded, embedded, snipped,
    and dropped again.
 
-`pipeline voices bootstrap [--from-drive]` covers 2 and 3. Note that path 3 is
-the only way to make old meetings reviewable at all, since without snippets
-there is nothing to listen to.
+Paths 2 and 3 run from the **setup screen**, not a command: one button, a
+progress bar, and a clear statement that re-fetching old audio from Drive is what
+makes historic meetings reviewable at all — without snippets there is nothing to
+listen to. Re-fetch is bandwidth-heavy and interruptible, and it should be
+resumable rather than all-or-nothing.
 
 ## Model selection
 
@@ -453,11 +552,13 @@ Snippets raise it further: they are actual recorded voice, kept indefinitely.
 
 - Voiceprints and snippets never leave the machine. The LLM resolver keeps
   receiving text only.
-- `pipeline voices forget <person>` deletes every sample, match and snippet for
-  one person.
+- **Delete** on a person's page removes every sample, match and snippet for them,
+  behind a confirmation that names what is destroyed.
 - Snippets live under `SNIPPETS_DIR`, gitignored, covered by `backup.py`.
-- **`forget` is not retroactive to existing backups.** Anyone treating this as a
-  deletion guarantee needs to prune backups too.
+- **Deletion is not retroactive to existing backups.** The UI must say so at the
+  point of deletion rather than implying a guarantee it cannot make.
+- Phone review copies snippets onto the phone. That is a second device holding
+  recorded voice, and the cache should clear on sign-out.
 
 ## Testing
 
@@ -477,7 +578,18 @@ Snippets raise it further: they are actual recorded voice, kept indefinitely.
   route is rejected.
 - **propagation**: resolving a name rewrites the transcript, recompiles minutes
   and replaces the LightRAG document.
+- **clustering**: two meetings with the same voice yield one card; a split
+  returns the constituents; cluster ordering follows corpus speaking time.
+- **offline sync**: a decision queued on the phone applies on reconnect; a
+  decision against a cluster the server has since split is re-presented rather
+  than misapplied; the human answer beats a nightly re-match.
+- **access control**: no session → 401 on every voices route including snippet
+  audio; bad Host header → 421; snippet path traversal rejected.
 - The existing 57 tests must continue to pass.
+
+Manual verification on a real Android phone is a required step, not optional:
+autoplay behaviour, Opus playback, thumb reach, and the install-to-home-screen
+flow cannot be established from unit tests.
 
 ## Explicitly out of scope
 
@@ -518,11 +630,19 @@ job.
    confidently. Mitigated by clustering tighter than the match threshold and by
    the split action, but it is the most damaging wrong answer the UI can accept
    and deserves a conservative threshold.
-7. **Phone review is desirable and currently blocked.** Listening to six-second
-   clips is a couch task, not a desk task, and the natural device is a phone. The
-   dashboard binds to `127.0.0.1` by design, and the 2026-08-13 security review
-   found a DNS-rebinding exposure that the desktop spec closes with a Host check.
-   LAN exposure should not be added casually to a surface serving private meeting
-   audio; if phone review is wanted, it goes behind the authentication from
-   `2026-08-14-desktop-app-design.md`, as a deliberate decision rather than a
-   convenience default.
+7. **Phone access widens the attack surface on purpose.** Serving recorded voice
+   to a second device is a real change, mitigated by the Tailscale + session +
+   Host-header stack above rather than by LAN exposure. The authentication from
+   `2026-08-14-desktop-app-design.md` is a hard prerequisite, not a parallel
+   track: phone review must not ship before it.
+8. **Offline sync can conflict.** A decision made on the phone while the laptop
+   was asleep can collide with a nightly re-match that has since resolved the
+   same cluster. The human answer wins — it is evidence, not inference — but the
+   merge must be explicit rather than last-write-wins, and a cluster that was
+   split or merged server-side while the phone held a stale copy has to be
+   re-presented rather than silently applied to the wrong person.
+9. **PWA audio autoplay is restricted on mobile browsers.** Chrome on Android
+   blocks autoplay until the user has interacted with the page. In practice the
+   first card needs one tap and the rest follow, but the interaction spec must be
+   verified on a real device early — the whole review loop is built on audio
+   starting by itself.
