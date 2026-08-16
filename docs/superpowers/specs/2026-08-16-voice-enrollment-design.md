@@ -243,23 +243,111 @@ different-person score distributions from your own confirmed data with the
 equal-error point and a suggested triple. It needs several people confirmed
 across several meetings before it can say anything, so it is a month-two tool.
 
-## Confirmation queue — dashboard
+## The unit of work is a voice, not a meeting
 
-`dashboard.py` gains routes alongside those at `dashboard.py:157`:
+The scarce resource in this system is no longer CPU. It is the owner's
+attention, and it is scarce in a way CPU never was: a review chore that takes
+twenty minutes a day is abandoned inside a week, and an abandoned queue makes
+the whole feature worthless.
 
-- `GET  /api/voices/pending` — grouped by meeting: label, proposed name, score,
-  runner-up, what the LLM thought, speech duration, and **snippet URLs**.
+An earlier draft grouped the queue by meeting. That is the wrong unit and it
+does not survive contact with the arithmetic. If Ali appears in twelve meetings,
+meeting-grouping asks twelve times. The same voice, the same decision, twelve
+times — and the twelfth is no more informative than the first.
+
+**Pending labels are therefore clustered across the whole corpus before any
+human sees them.** Agglomerative clustering over the pending embeddings, at a
+threshold tighter than the match threshold, so a cluster is "almost certainly one
+person". One card per cluster. Answering it labels every appearance at once.
+
+This is the same move Google Photos makes: it shows a face group, never every
+photograph.
+
+Cards are ordered by **total speaking time across the corpus**, highest first, so
+the earliest decisions resolve the most history. In a personal archive the
+distribution is steep — a handful of recurring colleagues dominate — which is what
+makes the first sitting short and the payoff immediate.
+
+## Review workflow — where the human actually fits
+
+Three moments, deliberately separated. The machine never waits on the human, and
+the human never waits on the machine.
+
+**1. Overnight (01:00–07:00), machine only.** Transcribe, diarize, embed, snip,
+match, re-cluster. The queue is fully staged before the owner wakes. Nothing about
+review costs the owner time that a computer could have spent instead.
+
+**2. The enrollment sitting, once.** At cold start there are no voiceprints, so
+everything is "new" and a naive queue would demand hundreds of names. Instead the
+first run clusters the *entire backlog* and presents the top voices by speaking
+time. Roughly ten decisions covers most of the archive. This is framed in the UI
+as setup with a finish line — "10 voices cover 80% of your meetings" — not as an
+inbox. Setup that ends is tolerable; an inbox that never empties is not.
+
+Start with the owner's own voice: it appears in every recording, and labelling it
+once removes one of the two labels from every 1:1 in the corpus. `OWNER_NAME`
+already exists in config to seed the prompt.
+
+**3. Steady state, a trickle.** Once the recurring cast is enrolled, most labels
+auto-resolve. What surfaces is genuinely new people — a new customer, a new hire —
+which is a decision only a human can make and one worth being asked about. Expect
+one or two a week, not a daily chore.
+
+Review is **never blocking**. Minutes compile and publish with `SPEAKER_01`
+rather than waiting; a later confirmation rewrites and re-indexes them. Making
+the owner a synchronous dependency of the nightly batch would mean one busy week
+stalls the entire archive.
+
+Notification reuses the existing `MMC_ALERT_COMMAND` (`config.py:130`), already
+built for nightly failures: *"3 new voices to label"* with a link. Silence when
+there is nothing worth asking.
+
+## The listening interaction
+
+Optimising for the hundredth decision, not the first. Every extra click multiplies
+by the size of the backlog.
+
+- **Audio plays on card open**, automatically, and loops. No click-to-play.
+- **The proposal is pre-filled** — "Sounds like Ali · 0.78" — so the common case is
+  a single keystroke: `Enter` to accept.
+- **The runner-up is offered as a second button**, so an ambiguous pair becomes an
+  A/B comparison by ear rather than a recall task.
+- **Keyboard first**: `Enter` accept, `1`–`9` pick a known person, `N` new, `M`
+  merge, `S` skip, `Space` replay.
+- **Context is shown, and it does the heavy lifting**: meeting date, title hint,
+  who else is in the room. "Your Aug 10 call with Ali" narrows a voice far faster
+  than the audio alone.
+- **Multiple snippets per card**, so one bad clip does not force a guess.
+
+**"I'm not sure" is a first-class button, not a failure.** People are unreliable
+at identifying voices they know only slightly, and a UI that pressures a decision
+manufactures confident wrong labels — the exact outcome `speakers.py:7` exists to
+prevent. Skipping returns the cluster to the queue, where it may resolve itself
+later once a neighbouring voice is named.
+
+## Routes
+
+`dashboard.py` gains, alongside those at `dashboard.py:157`:
+
+- `GET  /api/voices/pending` — clusters, ordered by corpus speaking time: proposed
+  name, score, runner-up, what the LLM thought, appearance count, and **snippet
+  URLs** from across the cluster's meetings.
 - `GET  /api/voices/snippet/<meeting>/<label>/<n>` — serves the clip, path-checked
   against `SNIPPETS_DIR` the way `_remove_handoff_file` guards the handoff root.
-- `POST /api/voices/resolve` — `confirm` | `assign` (different existing person) |
-  `create` (new person) | `merge` (this person is that person) | `dismiss`.
+- `POST /api/voices/resolve` — `confirm` | `assign` | `create` | `merge` |
+  `dismiss` | `unsure`, applied to a whole cluster.
 
-The UI leads with a play button, not a transcript. Text is shown underneath as
-context, never as the basis for the decision.
+The UI leads with a play button. Text sits underneath as context, never as the
+basis for the decision.
 
-Each naming action writes a `voice_sample` and resolves the match. `merge`
-reassigns every sample from one canonical to the other, writes the alias through
-the existing `person_aliases` table, and recomputes.
+Each naming action writes a `voice_sample` per constituent label and resolves the
+matches. `merge` reassigns every sample from one canonical to the other, writes
+the alias through the existing `person_aliases` table, and recomputes.
+
+**Cluster splitting is required.** Clustering will occasionally group two people,
+and a confirmation would then enroll a poisoned voiceprint. The card shows its
+appearance count and offers "these aren't all the same person", which returns the
+constituents as individual cards.
 
 `dismiss` is **reversible and does not delete the embedding**. Over-segmentation
 means a "not a real speaker" fragment is sometimes a real person who barely
@@ -277,6 +365,34 @@ Naming a speaker weeks later must reach the documents, not just the database:
 Without step 3 the index keeps answering with `SPEAKER_01`, and the graph keeps
 the entities it extracted under the wrong owner. This is the step most likely to
 be skipped in implementation and the one that makes the feature real.
+
+## The nightly window (01:00–07:00)
+
+The machine is idle and awake for six hours. Every minute the owner would
+otherwise spend should be pushed into that window.
+
+| Job | Why it belongs overnight |
+|---|---|
+| Transcribe, diarize | Already there. |
+| Embed + snip | Marginal cost on top of diarization; must happen before `capture.py:491` deletes the audio. |
+| **Re-match pending voices** | Yesterday's unknown may resolve itself tonight against voiceprints improved today. Work that silently disappears before the owner sees it. |
+| **Re-cluster the queue** | Keeps one card per person as new appearances arrive, instead of the queue fragmenting. |
+| **Deferred recompile + reindex** | Meetings whose speakers were named during the day. Also resolves the SQLite contention in risk 5 — the dashboard enqueues, the batch performs. |
+
+Re-matching is the compounding one. Each label the owner supplies improves the
+voiceprints, which resolves adjacent unknowns without being asked, which shrinks
+tomorrow's queue. Human effort per meeting should fall over time, and if it does
+not, that is the signal the thresholds are wrong.
+
+The window also changes an old constraint. `config.py:55` chose
+`large-v3-turbo` because CPU time was binding. With six guaranteed hours the
+budget is roughly an hour of compute per meeting-hour for a five-meeting night,
+which does not stretch to `large-v3` once diarization is added, but does buy the
+**diarization** upgrade — and diarization, not ASR, is what governs how much
+labelling the owner has to do. Better clusters mean fewer, cleaner cards.
+
+Spending machine time to buy human time is the correct trade here, and it is
+newly affordable. Measure on real recordings before committing the batch to it.
 
 ## Bootstrapping
 
@@ -387,11 +503,26 @@ job.
    speaker count is implausible. Meetings carrying that warning must be excluded
    from auto-enrollment: one person split across four labels would enroll four
    bad voiceprints.
-4. **Review backlog is the real failure mode.** If pending items accumulate
-   faster than they are cleared, the system degrades to the status quo with extra
-   storage. The queue should be ordered by *value* — a voice appearing across many
-   meetings first, since one confirmation there resolves the most history.
-5. **Concurrent write during the nightly batch.** Resolving from the dashboard
-   triggers recompile and reindex, which can collide with a running batch on the
-   same SQLite file. Resolution should enqueue the recompile rather than perform
-   it inline.
+4. **Review abandonment is the real failure mode**, and it is a design risk
+   rather than a technical one. If the queue outgrows the owner's willingness,
+   the system degrades to the status quo plus storage. Cross-corpus clustering,
+   value ordering, a bounded enrollment sitting and nightly re-matching all exist
+   to attack this. The metric to watch is *decisions per meeting over time*: it
+   must fall. If it plateaus, thresholds are mis-set or diarization is
+   over-segmenting.
+5. **Concurrent write during the nightly batch.** Resolved by deferring
+   recompile and reindex into the nightly window rather than running them inline
+   from the dashboard.
+6. **Cluster contamination.** Grouping two similar voices into one card means a
+   single confirmation enrolls a poisoned voiceprint that then mislabels
+   confidently. Mitigated by clustering tighter than the match threshold and by
+   the split action, but it is the most damaging wrong answer the UI can accept
+   and deserves a conservative threshold.
+7. **Phone review is desirable and currently blocked.** Listening to six-second
+   clips is a couch task, not a desk task, and the natural device is a phone. The
+   dashboard binds to `127.0.0.1` by design, and the 2026-08-13 security review
+   found a DNS-rebinding exposure that the desktop spec closes with a Host check.
+   LAN exposure should not be added casually to a surface serving private meeting
+   audio; if phone review is wanted, it goes behind the authentication from
+   `2026-08-14-desktop-app-design.md`, as a deliberate decision rather than a
+   convenience default.
