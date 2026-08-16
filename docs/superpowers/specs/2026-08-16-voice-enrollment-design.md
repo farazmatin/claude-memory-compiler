@@ -42,6 +42,22 @@ permanently available, decouples review from the audio retention policy, and
 means a voice you name in 2027 can be confirmed against a 2026 meeting you never
 got round to reviewing.
 
+## Prior art: what Google Pixel Recorder gets right and wrong
+
+The owner's previous tool is the clearest available specification of the target.
+
+**Right: it asks immediately.** Record, save, label — while the conversation is
+still in mind. That timing is why labelling there is tolerable at all, and it is
+the behaviour this design copies.
+
+**Wrong: it has no memory.** Every recording starts from zero, so the same people
+are re-labelled forever. Effort scales linearly with meetings and never decays.
+Its transcription and speaker separation are also weak, which is what makes the
+labels unreliable even after the work of supplying them.
+
+This design is Pixel Recorder's timing plus persistent voiceprints: ask while
+fresh, but ask about each person **once**, then never again.
+
 ## The distinction this rests on
 
 **Diarization** separates voices *within one meeting*. It produces `SPEAKER_00`,
@@ -78,25 +94,32 @@ adding a second acoustic model.
 ## Architecture
 
 ```
-transcribe (pipeline/asr.py)
-  audio → ASR → align → diarize
-                          ├─ NEW: per-label embedding + speech duration
-                          └─ NEW: per-label voice snippets → snippets/<meeting>/<label>-N.opus
-                                   ↓  ← capture.py:491 deletes source audio AFTER this
-identify (pipeline/voices.py)                                              NEW
-  embedding × enrolled voiceprints → cosine → band
-      auto   ≥ auto and margin ok and LLM agrees → applied, confidence=inferred
-      review ≥ review, or margin thin, or LLM disagrees → queued
-      new    below review                        → queued as unknown voice
-                          ↓
-speakers (pipeline/speakers.py)
-  precedence: overrides > voice match > LLM pass
-                          ↓
-dashboard (pipeline/dashboard.py)
-  /api/voices/pending  → play snippet, then confirm | assign | create | merge | dismiss
-                          ↓
-  writes voice_sample → centroid recomputed → re-resolve → recompile → reindex
+DAY  ── meeting ends → Drive upload → handoff poll (~15 min, 08:00-22:00)
+     listen pass (below-normal priority, NO ASR)
+       normalize → diarize → embed → snip → match
+                     │          │       └─ snippets/<meeting>/<label>-N.opus
+                     │          └─ per-label embedding + speech duration
+                     └─ diarization persisted for the night pass
+                                   ↓
+     identify (pipeline/voices.py)                                     NEW
+       embedding × enrolled voiceprints → cosine → band
+           auto   ≥ auto and margin ok      → applied silently
+           review ≥ review, or thin margin  → card
+           new    below review              → card, unknown voice
+                                   ↓
+     ntfy → phone (quiet hours enforced) → PWA card → label while fresh
+                                   ↓
+NIGHT ── 01:00-07:00, machine only
+     compile pass
+       ASR → align → merge stored diarization → resolve names → minutes → index
+       re-match pending · re-cluster · recompile day's corrections · calibrate
+                                   ↓
+                   capture.py:491 deletes source audio
+                   (snippets and embeddings already retained)
 ```
+
+Names are usually known before the compile pass runs, so minutes are written
+correct the first time rather than repaired afterwards.
 
 ## Schema
 
@@ -277,37 +300,62 @@ makes the first sitting short and the payoff immediate.
 
 ## Review workflow — where the human actually fits
 
-Three moments, deliberately separated. The machine never waits on the human, and
-the human never waits on the machine.
+**Labelling happens during the working day, minutes after the meeting — never at
+night.** The owner is asleep from 01:00 to 07:00, and a system that asks then
+gets no answer.
 
-**1. Overnight (01:00–07:00), machine only.** Transcribe, diarize, embed, snip,
-match, re-cluster. The queue is fully staged before the owner wakes. Nothing about
-review costs the owner time that a computer could have spent instead.
+This is the single most important scheduling fact in the design, and it points
+the same way as good practice anyway: a voice is easiest to identify while the
+conversation is still fresh. The owner just spoke to these people.
+
+**Ask on arrival, not on completion.** A recording uploads to Drive as soon as
+the meeting ends. That upload — not the nightly batch — is the trigger. Within
+minutes the card is on the phone, while the meeting is still in mind.
+
+**1. On arrival, during the day.** The listen pass runs, the card appears, the
+owner labels it between meetings. Fresh memory does the work that acoustic
+similarity would otherwise have to do alone.
 
 **2. The enrollment sitting, once.** At cold start there are no voiceprints, so
-everything is "new" and a naive queue would demand hundreds of names. Instead the
-first run clusters the *entire backlog* and presents the top voices by speaking
-time. Roughly ten decisions covers most of the archive. This is framed in the UI
-as setup with a finish line — "10 voices cover 80% of your meetings" — not as an
-inbox. Setup that ends is tolerable; an inbox that never empties is not.
+everything is "new" and a naive queue would demand hundreds of names. The first
+run clusters the *entire backlog* and presents the top voices by speaking time.
+Roughly ten decisions covers most of the archive. Framed in the UI as setup with
+a finish line — "10 voices cover 80% of your meetings" — not as an inbox. Setup
+that ends is tolerable; an inbox that never empties is not.
 
-Start with the owner's own voice: it appears in every recording, and labelling it
-once removes one of the two labels from every 1:1 in the corpus. `OWNER_NAME`
-already exists in config to seed the prompt.
+Start with the owner's own voice: it is in every recording, and labelling it once
+removes one of the two labels from every 1:1 in the corpus. `OWNER_NAME` already
+exists in config to seed the prompt.
 
 **3. Steady state, a trickle.** Once the recurring cast is enrolled, most labels
 auto-resolve. What surfaces is genuinely new people — a new customer, a new hire —
-which is a decision only a human can make and one worth being asked about. Expect
-one or two a week, not a daily chore.
+a decision only a human can make and one worth being asked about. One or two a
+week, not a daily chore.
 
-Review is **never blocking**. Minutes compile and publish with `SPEAKER_01`
-rather than waiting; a later confirmation rewrites and re-indexes them. Making
-the owner a synchronous dependency of the nightly batch would mean one busy week
-stalls the entire archive.
+### Labelling can never block the batch
 
-Notification reuses the existing `MMC_ALERT_COMMAND` (`config.py:130`), already
-built for nightly failures: *"3 new voices to label"* with a link. Silence when
-there is nothing worth asking.
+Stated as a guarantee, because the consequence of getting it wrong is no minutes
+the next morning:
+
+- The nightly compile runs on whatever is known at 01:00. Unlabelled speakers
+  compile as `SPEAKER_01`. The batch never waits, never pauses, never asks.
+- An unanswered card is a normal state, not an error, and never an alert.
+- A label supplied later rewrites the transcript, recompiles the minutes and
+  replaces the indexed document.
+
+The daytime loop exists so that in the common case labels are already in hand by
+01:00 and the minutes are **born correct** — but nothing depends on it.
+
+### Notifications respect sleep
+
+Notification reuses the `MMC_ALERT_COMMAND` pattern (`config.py:130`), delivered
+via self-hosted ntfy: *"3 new voices to label"* with a link.
+
+**Quiet hours are enforced in code, not left to phone settings.** Nothing is sent
+between 22:00 and 08:00 by default; anything the night batch generates is held
+and delivered with the morning's first notification. A batch failure alert is the
+one exception, and it is still held rather than waking the owner — a failed batch
+at 03:00 cannot be fixed at 03:00.
 
 ## The listening interaction
 
@@ -364,21 +412,22 @@ Bind address becomes a dashboard setting rather than an environment variable,
 with plain language — "Allow access from my phone (Tailscale only)" — and it
 stays off until deliberately switched on.
 
-### It has to work when the laptop is asleep
+### The server is always up
 
-The batch runs 01:00–07:00 while the machine is awake. Couch review happens in
-the evening, and if the laptop is shut the phone has nothing to talk to. A queue
-that only works when the owner remembers to leave a laptop open is a queue that
-gets abandoned.
+The laptop runs 24 hours a day, lid closed included. An earlier draft treated
+laptop sleep as a design problem and justified an offline-sync architecture around
+it; that justification does not hold, and the complexity it bought should not be
+built.
 
-The dashboard therefore ships as an **installable PWA** that caches the pending
-queue and its snippets on the phone. The whole queue is a few megabytes — snippets
-are ~30 KB each — so a night's cards fit trivially. Decisions are recorded locally
-and **synced when the laptop is next reachable**, which in practice is the next
-morning's batch window.
+The dashboard still ships as an **installable PWA**, for one reason that survives:
+a home-screen icon rather than a URL to remember and a browser tab to find. For a
+review loop meant to take seconds, the cost of *getting to it* dominates.
 
-This makes laptop uptime irrelevant to the owner's experience, which is the point.
-It also means review works on a train with no signal.
+**Offline caching and decision sync are explicitly deferred.** They solve
+signal-loss on a train, not laptop uptime, and they carry a genuine correctness
+risk — a decision queued against a cluster the server has since re-clustered. Not
+worth it for a phone sitting on the same tailnet as an always-on server. Revisit
+only if real usage shows review being blocked by connectivity.
 
 ### The card, on a phone
 
@@ -463,33 +512,80 @@ Without step 3 the index keeps answering with `SPEAKER_01`, and the graph keeps
 the entities it extracted under the wrong owner. This is the step most likely to
 be skipped in implementation and the one that makes the feature real.
 
-## The nightly window (01:00–07:00)
+## Two passes: listen by day, compile by night
 
-The machine is idle and awake for six hours. Every minute the owner would
-otherwise spend should be pushed into that window.
+The machine is on 24 hours a day, lid closed included. The scheduling constraint
+is not the hardware, it is the owner's sleep — so the work splits by *who it needs*
+rather than by what is convenient.
 
-| Job | Why it belongs overnight |
+`install-nightly-task.ps1:17` currently registers a single daily trigger at
+01:00. This adds a second, daytime task.
+
+### Pass 1 — the listen pass, on arrival (working hours)
+
+Triggered by a new file appearing in the Drive handoff folder, polled every ~15
+minutes between 08:00 and 22:00.
+
+```
+normalize → diarize → embed → snip → match → notify if uncertain
+```
+
+**No ASR.** This is the key economy: pyannote needs only audio, so speaker turns,
+embeddings and snippets are all obtainable without transcribing a word.
+Identifying a voice by ear does not require the transcript — the owner is
+listening, not reading. Skipping ASR and alignment removes the most expensive
+part of the pipeline from the owner's working hours.
+
+The diarization output is persisted and reused by pass 2, so nothing is computed
+twice.
+
+Runs at **below-normal process priority**. The laptop is the owner's working
+machine and a background job must never make it feel slow; finishing within the
+hour is entirely adequate, since the card only has to arrive while the meeting is
+still fresh.
+
+Card context comes from `title_hint` — "your 10:00 with Ali" — which needs no
+transcript. The LLM cross-check is unavailable until pass 2; voice is the primary
+signal and any disagreement surfaces the following morning.
+
+### Pass 2 — the compile pass (01:00–07:00)
+
+```
+ASR → align → merge with stored diarization → resolve names → minutes → index
+```
+
+Plus the jobs that only make sense in bulk:
+
+| Job | Why it belongs at night |
 |---|---|
-| Transcribe, diarize | Already there. |
-| Embed + snip | Marginal cost on top of diarization; must happen before `capture.py:491` deletes the audio. |
-| **Re-match pending voices** | Yesterday's unknown may resolve itself tonight against voiceprints improved today. Work that silently disappears before the owner sees it. |
-| **Re-cluster the queue** | Keeps one card per person as new appearances arrive, instead of the queue fragmenting. |
-| **Deferred recompile + reindex** | Meetings whose speakers were named during the day. Also resolves the SQLite contention in risk 5 — the dashboard enqueues, the batch performs. |
+| **Re-match pending voices** | Yesterday's unknowns may resolve against voiceprints improved today — work that disappears before the owner ever sees it. |
+| **Re-cluster the queue** | Keeps one card per person as new appearances arrive, instead of fragmenting. |
+| **Recompile + reindex** | Meetings labelled during the day. Deferring here also removes the SQLite contention in risk 5: the dashboard enqueues, the batch performs. |
+| **Calibration** | Once enough confirmed pairs exist. |
 
-Re-matching is the compounding one. Each label the owner supplies improves the
-voiceprints, which resolves adjacent unknowns without being asked, which shrinks
-tomorrow's queue. Human effort per meeting should fall over time, and if it does
-not, that is the signal the thresholds are wrong.
+Because pass 1 already asked, most meetings reach 01:00 with their speakers
+known, and the minutes are **born with correct names** rather than being written
+wrong and repaired later. The repair path still exists; it just stops being the
+normal case.
 
-The window also changes an old constraint. `config.py:55` chose
-`large-v3-turbo` because CPU time was binding. With six guaranteed hours the
-budget is roughly an hour of compute per meeting-hour for a five-meeting night,
-which does not stretch to `large-v3` once diarization is added, but does buy the
-**diarization** upgrade — and diarization, not ASR, is what governs how much
-labelling the owner has to do. Better clusters mean fewer, cleaner cards.
+Re-matching is the compounding job. Each label the owner supplies improves the
+voiceprints, resolving adjacent unknowns unasked, shrinking tomorrow's queue.
+Effort per meeting should fall over time — and if it plateaus, that is the signal
+the thresholds are wrong.
 
-Spending machine time to buy human time is the correct trade here, and it is
-newly affordable. Measure on real recordings before committing the batch to it.
+### What the freed budget buys
+
+`config.py:55` chose `large-v3-turbo` because CPU time was binding. With ASR now
+alone in a six-hour window, the budget is roughly an hour of compute per
+meeting-hour on a five-meeting night. That still does not stretch to `large-v3`,
+but it comfortably buys the **diarization** upgrade — and diarization, not ASR,
+governs how much labelling the owner does. Better clusters mean fewer, cleaner
+cards.
+
+Note the ordering consequence: diarization now runs in the *daytime* pass, so a
+heavier model spends its cost during working hours. That argues for the CPU-viable
+`pyannote 4.0 community-1` over the WavLM-large DiariZen variants until there is a
+GPU, regardless of benchmark scores. Measure on real recordings before committing.
 
 ## Bootstrapping
 
@@ -635,14 +731,16 @@ job.
    Host-header stack above rather than by LAN exposure. The authentication from
    `2026-08-14-desktop-app-design.md` is a hard prerequisite, not a parallel
    track: phone review must not ship before it.
-8. **Offline sync can conflict.** A decision made on the phone while the laptop
-   was asleep can collide with a nightly re-match that has since resolved the
-   same cluster. The human answer wins — it is evidence, not inference — but the
-   merge must be explicit rather than last-write-wins, and a cluster that was
-   split or merged server-side while the phone held a stale copy has to be
-   re-presented rather than silently applied to the wrong person.
-9. **PWA audio autoplay is restricted on mobile browsers.** Chrome on Android
-   blocks autoplay until the user has interacted with the page. In practice the
-   first card needs one tap and the rest follow, but the interaction spec must be
-   verified on a real device early — the whole review loop is built on audio
-   starting by itself.
+8. **Daytime CPU contention.** The listen pass runs on the owner's working
+   machine during working hours. Below-normal priority is the mitigation, but a
+   weak laptop plus a heavier diarization model could still be felt. If it is,
+   the fix is a lighter diarization model or a delay to the end of the working
+   day — never moving the ask into the night, which defeats the purpose.
+9. **A meeting recorded late in the evening misses its own freshness window.**
+   The last poll is 22:00 and notifications are suppressed until 08:00, so a
+   21:50 meeting is labelled the next morning rather than minutes later. Correct
+   behaviour, but it means the freshness benefit is not universal.
+10. **PWA audio autoplay is restricted on mobile browsers.** Chrome on Android
+    blocks autoplay until the user has interacted with the page. In practice the
+    first card needs one tap and the rest follow, but this must be verified on a
+    real device early — the whole review loop assumes audio starts by itself.
