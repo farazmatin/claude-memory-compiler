@@ -90,6 +90,8 @@ adding a second acoustic model.
 | Thresholds | Provisional defaults, calibrated once data exists | Calibration needs confirmed cross-meeting pairs, which do not exist on day one. Honest sequencing, not a constant pretending to be measured. |
 | LLM resolver | Kept, as an independent second signal | Voice says who it sounds like; transcript says who got named. Agreement is stronger than either; disagreement forces review. |
 | Voiceprint scope | Local only, never sent to a provider | Biometric data. Same rule as the audio. |
+| Who gets enrolled | **Everyone who appears**, including external people | Owner's explicit decision, made with the alternative on the table. Deletion is the remedy, so it has to actually work. |
+| Recording profile | One phone on the table, in person | Far-field single channel. Drives every threshold and makes the diarization upgrade mandatory rather than optional. |
 
 ## Architecture
 
@@ -252,12 +254,22 @@ would throw it away.
 Cosine over L2-normalised embeddings. Provisional defaults, deliberately biased
 toward review over auto for the first weeks:
 
+Set for the confirmed deployment profile: **one phone on the table, in person**.
+That is far-field single-channel audio, the hardest realistic case, and it pushes
+every value below its textbook figure.
+
 | Setting | Provisional | Meaning |
 |---|---|---|
-| `MMC_VOICE_AUTO` | 0.70 | auto-apply above this |
-| `MMC_VOICE_REVIEW` | 0.45 | queue for confirmation above this |
-| `MMC_VOICE_MARGIN` | 0.10 | required gap to the runner-up |
-| `MMC_VOICE_MIN_SPEECH_SEC` | 20 | below this, never auto-apply |
+| `voice.auto` | 0.62 | auto-apply above this |
+| `voice.review` | 0.38 | queue for confirmation above this |
+| `voice.margin` | 0.12 | required gap to the runner-up |
+| `voice.min_speech_sec` | 30 | below this, never auto-apply |
+| `voice.min_enroll_meetings` | 2 | meetings needed before a person auto-matches |
+
+`min_enroll_meetings` is the far-field rule that matters most. A person enrolled
+from one meeting is enrolled from **one seat**; the same colleague across the
+table next week produces a measurably different embedding. Requiring two
+meetings before auto-matching is what stops distance being mistaken for identity.
 
 These are starting points, not measurements — far-field meeting audio moves the
 same-speaker distribution down relative to the clean enrollment audio the
