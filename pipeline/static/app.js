@@ -480,9 +480,12 @@ function renderMeetingDetail(m) {
     ${driveLink}
 
     <div class="speaker-section">
-      <p class="eyebrow">ATTENDEES &amp; SPEAKERS (CLICK TO NAME)</p>
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+        <p class="eyebrow" style="margin:0;">ATTENDEES &amp; SPEAKERS (CLICK TO NAME)</p>
+        <button type="button" class="btn-outline" style="font-size:0.75rem; padding:4px 10px; border-radius:4px;" onclick="openSpeakerModal('${escapeHtml(m.id)}', '', '')">+ Add Attendee / Speaker</button>
+      </div>
       <div class="speaker-list">
-        ${speakersHtml || '<span class="chip">No speaker diarization</span>'}
+        ${speakersHtml || '<span class="chip" style="opacity:0.75;">No speakers diarized yet — click \"+ Add Attendee\" to add</span>'}
       </div>
     </div>
 
@@ -645,10 +648,18 @@ async function submitMergePerson() {
 // ── Speaker Modal Dialog ─────────────────────────────────────────────
 function openSpeakerModal(meetingId, label, currentName) {
   $("modal-meeting-id").value = meetingId;
+  
+  if (!label) {
+    // Generate next available label
+    const activeDetail = state.meetings.find(m => m.id === meetingId);
+    label = "SPEAKER_00";
+  }
+
   $("modal-speaker-label").value = label;
   $("modal-speaker-name").value = currentName || "";
-  $("speaker-modal-sub").textContent = `Assign real contact name to voice tag: ${label}`;
+  $("speaker-modal-sub").textContent = `Assign contact name to speaker tag: ${label}`;
   $("speaker-modal").showModal();
+  setTimeout(() => $("modal-speaker-name").focus(), 50);
 }
 
 function closeSpeakerModal() {
