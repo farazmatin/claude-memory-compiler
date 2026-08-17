@@ -164,6 +164,84 @@ CREATE TABLE IF NOT EXISTS seen_files (
     meeting_id  TEXT,               -- NULL when the file was a duplicate
     seen_at     TEXT NOT NULL
 );
+
+-- ── Voice enrollment ────────────────────────────────────────────────
+--
+-- Diarization only separates voices WITHIN one recording; SPEAKER_00 means
+-- nothing in the next file. These tables give the pipeline a memory of what
+-- people sound like, so a voice named once is recognised forever after.
+
+-- One row per enrolled utterance. A person's voiceprint is the duration-weighted
+-- mean of their samples, computed on read rather than stored: a confirmation the
+-- owner later regrets is one DELETE, and the voiceprint corrects itself.
+--
+-- meeting_id is ON DELETE SET NULL, deliberately NOT CASCADE. Cascading would
+-- mean deleting one old meeting silently degrades the voiceprint of everyone who
+-- spoke in it, and enrollment evidence disappearing unnoticed is exactly the
+-- failure nobody catches until names start going wrong. The embedding is the
+-- asset; its provenance is merely nice to have.
+CREATE TABLE IF NOT EXISTS voice_samples (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical   TEXT NOT NULL,
+    meeting_id  TEXT,
+    label       TEXT,
+    embedding   BLOB NOT NULL,      -- float32 little-endian, np.ndarray.tobytes()
+    dim         INTEGER NOT NULL,
+    model       TEXT NOT NULL,      -- embeddings from different models never mix
+    speech_sec  REAL NOT NULL,
+    source      TEXT NOT NULL,      -- confirmed | merged | bootstrap
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (canonical)  REFERENCES people(canonical) ON DELETE CASCADE,
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id)      ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_voice_samples_canonical ON voice_samples(canonical);
+CREATE INDEX IF NOT EXISTS idx_voice_samples_model ON voice_samples(model);
+
+-- Every diarized label with its embedding and clips, named or not. Retaining
+-- unnamed rows is what lets a voice named today be matched against last spring's
+-- meetings, long after the source audio was deleted.
+CREATE TABLE IF NOT EXISTS speaker_matches (
+    meeting_id      TEXT NOT NULL,
+    label           TEXT NOT NULL,
+    embedding       BLOB,
+    dim             INTEGER,
+    model           TEXT,
+    speech_sec      REAL,
+    snippet_paths   TEXT,               -- JSON array, relative to SNIPPETS_DIR
+    snippet_quality TEXT,               -- ok | low
+    best_canonical  TEXT,
+    best_score      REAL,
+    next_canonical  TEXT,               -- runner-up, for the margin test
+    next_score      REAL,
+    llm_name        TEXT,               -- what the transcript pass concluded
+    band            TEXT,               -- auto | review | new
+    state           TEXT NOT NULL,      -- pending | resolved | dismissed
+    cluster_id      TEXT,
+    resolved_as     TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (meeting_id, label),
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_speaker_matches_state ON speaker_matches(state);
+CREATE INDEX IF NOT EXISTS idx_speaker_matches_cluster ON speaker_matches(cluster_id);
+
+-- Rebuilt nightly. One row per group of pending labels believed to be the same
+-- person, and the unit the owner is actually asked about: a voice appearing in
+-- twelve meetings is one question, not twelve.
+CREATE TABLE IF NOT EXISTS voice_clusters (
+    id              TEXT PRIMARY KEY,
+    size            INTEGER NOT NULL,
+    total_speech    REAL NOT NULL,      -- drives queue order: most history first
+    best_canonical  TEXT,
+    best_score      REAL,
+    next_canonical  TEXT,
+    next_score      REAL,
+    band            TEXT NOT NULL,      -- review | new
+    created_at      TEXT NOT NULL
+);
 """
 
 
@@ -840,3 +918,202 @@ def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
         """,
         (key, value, now_iso()),
     )
+
+
+# ── Voice enrollment ──────────────────────────────────────────────────
+
+def upsert_speaker_match(conn: sqlite3.Connection, meeting_id: str, label: str, **fields) -> None:
+    """Insert or update one diarized label's match row.
+
+    Only the supplied fields are written, so the daytime pass can record the
+    embedding and snippets before any matching has happened, and the matcher can
+    fill in scores later without clobbering them.
+    """
+    allowed = {
+        "embedding", "dim", "model", "speech_sec", "snippet_paths", "snippet_quality",
+        "best_canonical", "best_score", "next_canonical", "next_score", "llm_name",
+        "band", "state", "cluster_id", "resolved_as",
+    }
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(f"unknown speaker_matches fields: {sorted(unknown)}")
+
+    ts = now_iso()
+    conn.execute(
+        """
+        INSERT INTO speaker_matches (meeting_id, label, state, created_at, updated_at)
+        VALUES (?, ?, 'pending', ?, ?)
+        ON CONFLICT(meeting_id, label) DO NOTHING
+        """,
+        (meeting_id, label, ts, ts),
+    )
+    if not fields:
+        return
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    conn.execute(
+        f"UPDATE speaker_matches SET {assignments}, updated_at = ? "
+        "WHERE meeting_id = ? AND label = ?",
+        (*fields.values(), ts, meeting_id, label),
+    )
+
+
+def get_speaker_match(conn: sqlite3.Connection, meeting_id: str, label: str):
+    return conn.execute(
+        "SELECT * FROM speaker_matches WHERE meeting_id = ? AND label = ?",
+        (meeting_id, label),
+    ).fetchone()
+
+
+def pending_matches(conn: sqlite3.Connection, model: str | None = None) -> list[sqlite3.Row]:
+    """Every unresolved label that carries an embedding.
+
+    Dismissed rows are excluded but not deleted: over-segmentation means a
+    "not a real speaker" fragment is sometimes a real person who barely spoke,
+    and destroying that evidence would be unrecoverable.
+    """
+    sql = "SELECT * FROM speaker_matches WHERE state = 'pending' AND embedding IS NOT NULL"
+    params: list[object] = []
+    if model:
+        sql += " AND model = ?"
+        params.append(model)
+    return list(conn.execute(sql + " ORDER BY speech_sec DESC", params))
+
+
+def cluster_labels(conn: sqlite3.Connection, cluster_id: str) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            "SELECT * FROM speaker_matches WHERE cluster_id = ? AND state = 'pending' "
+            "ORDER BY speech_sec DESC",
+            (cluster_id,),
+        )
+    )
+
+
+def replace_clusters(conn: sqlite3.Connection, clusters: list[dict[str, object]]) -> None:
+    """Rebuild voice_clusters wholesale. Idempotent, so it is safe nightly."""
+    ts = now_iso()
+    conn.execute("DELETE FROM voice_clusters")
+    conn.execute("UPDATE speaker_matches SET cluster_id = NULL WHERE state = 'pending'")
+    for cluster in clusters:
+        conn.execute(
+            """
+            INSERT INTO voice_clusters
+                (id, size, total_speech, best_canonical, best_score,
+                 next_canonical, next_score, band, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cluster["id"], cluster["size"], cluster["total_speech"],
+                cluster.get("best_canonical"), cluster.get("best_score"),
+                cluster.get("next_canonical"), cluster.get("next_score"),
+                cluster["band"], ts,
+            ),
+        )
+        for meeting_id, label in cluster["members"]:  # type: ignore[union-attr]
+            conn.execute(
+                "UPDATE speaker_matches SET cluster_id = ?, updated_at = ? "
+                "WHERE meeting_id = ? AND label = ?",
+                (cluster["id"], ts, meeting_id, label),
+            )
+
+
+def pending_clusters(conn: sqlite3.Connection, limit: int = 50) -> list[sqlite3.Row]:
+    """The review queue, most valuable first.
+
+    Ordered by total speaking time so the earliest answers resolve the most
+    history: in a personal archive a handful of recurring people dominate.
+    """
+    return list(
+        conn.execute(
+            "SELECT * FROM voice_clusters ORDER BY total_speech DESC LIMIT ?", (limit,)
+        )
+    )
+
+
+def add_voice_sample(
+    conn: sqlite3.Connection,
+    *,
+    canonical: str,
+    meeting_id: str | None,
+    label: str | None,
+    embedding: bytes,
+    dim: int,
+    model: str,
+    speech_sec: float,
+    source: str = "confirmed",
+) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO voice_samples
+            (canonical, meeting_id, label, embedding, dim, model, speech_sec, source, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (canonical, meeting_id, label, embedding, dim, model, speech_sec, source, now_iso()),
+    )
+    return int(cursor.lastrowid or 0)
+
+
+def person_samples(
+    conn: sqlite3.Connection, canonical: str, model: str | None = None
+) -> list[sqlite3.Row]:
+    sql = "SELECT * FROM voice_samples WHERE canonical = ?"
+    params: list[object] = [canonical]
+    if model:
+        sql += " AND model = ?"
+        params.append(model)
+    return list(conn.execute(sql + " ORDER BY created_at", params))
+
+
+def enrolled_names(conn: sqlite3.Connection, model: str) -> list[str]:
+    return [
+        r["canonical"]
+        for r in conn.execute(
+            "SELECT DISTINCT canonical FROM voice_samples WHERE model = ? ORDER BY canonical",
+            (model,),
+        )
+    ]
+
+
+def sample_meeting_count(conn: sqlite3.Connection, canonical: str, model: str) -> int:
+    """Distinct meetings backing a person's voiceprint.
+
+    Gates auto-matching. With one phone on a table, a person enrolled from a
+    single meeting is enrolled from a single seat, and the same colleague across
+    the table next week embeds differently enough to be mistaken for someone else.
+    """
+    row = conn.execute(
+        "SELECT COUNT(DISTINCT COALESCE(meeting_id, CAST(id AS TEXT))) AS n "
+        "FROM voice_samples WHERE canonical = ? AND model = ?",
+        (canonical, model),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def delete_voice_sample(conn: sqlite3.Connection, sample_id: int) -> None:
+    conn.execute("DELETE FROM voice_samples WHERE id = ?", (sample_id,))
+
+
+def reassign_voice_samples(conn: sqlite3.Connection, source: str, target: str) -> int:
+    cursor = conn.execute(
+        "UPDATE voice_samples SET canonical = ? WHERE canonical = ?", (target, source)
+    )
+    return int(cursor.rowcount or 0)
+
+
+def delete_person_voice_data(conn: sqlite3.Connection, canonical: str) -> int:
+    """Remove every sample for one person. Returns the count deleted.
+
+    Snippet files on disk are the caller's responsibility - see voices.forget().
+    """
+    cursor = conn.execute("DELETE FROM voice_samples WHERE canonical = ?", (canonical,))
+    return int(cursor.rowcount or 0)
+
+
+def get_setting_float(conn: sqlite3.Connection, key: str, default: float) -> float:
+    raw = get_setting(conn, key)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default

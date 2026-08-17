@@ -33,6 +33,7 @@ from pipeline.config import (
     DB_PATH,
     GLOSSARY_FILE,
     MINUTES_DIR,
+    SNIPPETS_DIR,
     SPEAKER_OVERRIDES_FILE,
     TEMPLATES_DIR,
     TRANSCRIPTS_DIR,
@@ -139,6 +140,10 @@ def run(destination: Path, include_audio: bool = True) -> BackupReport:
     # protect. If the run dies partway, this is what you most want to have copied.
     _sync_tree(TRANSCRIPTS_DIR, destination / "transcripts", report, "transcripts")
     _sync_tree(MINUTES_DIR, destination / "minutes", report, "minutes")
+    # Voice clips are tiny but irreplaceable: the source audio is deleted after
+    # transcription, so losing these means a speaker can never be labelled by ear
+    # again without re-fetching the original from Drive.
+    _sync_tree(SNIPPETS_DIR, destination / "snippets", report, "snippets")
 
     if include_audio:
         _sync_tree(AUDIO_DIR, destination / "audio", report, "audio")
