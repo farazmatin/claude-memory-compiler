@@ -1,5 +1,5 @@
 /**
- * Meeting Memory — Interactive Control Room & Archive
+ * Meeting Memory — Executive Archive & Interactive Assistant
  */
 
 let state = {
@@ -56,7 +56,7 @@ function setupEventListeners() {
     loadMeetings();
     loadPeople();
     checkPipelineStatus();
-    showToast("Refreshed dashboard data");
+    showToast("Refreshed archive data", "success");
   });
 
   // Query / RAG Form
@@ -91,14 +91,16 @@ async function loadOverview() {
     const data = await res.json();
     renderOverview(data);
   } catch (err) {
-    $("rag-health").textContent = "Index unavailable";
+    $("rag-health").textContent = "AI Search: Offline";
     console.error("Failed to load overview:", err);
   }
 }
 
 function renderOverview(data) {
   // Masthead & Signal Strip
-  $("rag-health").textContent = `Index: ${data.lightrag || "healthy"}`;
+  const isHealthy = data.lightrag === "ok" || data.lightrag === "healthy";
+  $("rag-health").textContent = isHealthy ? "AI Search: Ready" : "AI Search: Offline (Docker)";
+  
   $("metric-meetings").textContent = data.meetings ?? "0";
   $("metric-indexed").textContent = data.indexed ?? "0";
 
@@ -108,9 +110,9 @@ function renderOverview(data) {
   const today = data.activity?.today || {};
   $("metric-today").textContent = `${today.count || 0} (${today.duration_min || 0}m)`;
 
-  $("metric-hours").textContent = `${data.durations?.total_hours || 0}h`;
+  $("metric-hours").textContent = `${data.durations?.total_hours || 0} hrs`;
   const attentionCount = (data.failed || 0) + (data.speaker_review || 0);
-  $("metric-attention").textContent = attentionCount;
+  $("metric-attention").textContent = attentionCount > 0 ? `${attentionCount} items` : "0";
 
   // Queue Funnel
   const queue = data.queue || {};
@@ -141,10 +143,10 @@ function renderOverview(data) {
   $("vel-total-min").textContent = `${dur.total_min || 0} min`;
   $("vel-total-hrs").textContent = `${dur.total_hours || 0} hrs`;
 
-  // Stage Timings Table
+  // Stage Timings Table (Diagnostics)
   renderTimingsTable(data.timings || []);
 
-  // Top Graph Entities Table
+  // Top Discussion Topics
   renderEntitiesTable(data.knowledge?.top_entities || []);
 
   // Drive Stats
@@ -157,6 +159,7 @@ function renderOverview(data) {
 
 function renderTimingsTable(timings) {
   const tbody = $("timings-tbody");
+  if (!tbody) return;
   if (!timings.length) {
     tbody.innerHTML = `<tr><td colspan="5" class="empty-cell">No stage runs recorded yet.</td></tr>`;
     return;
@@ -178,8 +181,9 @@ function renderTimingsTable(timings) {
 
 function renderEntitiesTable(entities) {
   const tbody = $("entities-tbody");
+  if (!tbody) return;
   if (!entities.length) {
-    tbody.innerHTML = `<tr><td colspan="3" class="empty-cell">No knowledge graph entities found.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="3" class="empty-cell">No discussion topics recorded yet.</td></tr>`;
     return;
   }
   tbody.innerHTML = entities
@@ -187,15 +191,15 @@ function renderEntitiesTable(entities) {
       (e) => `
     <tr>
       <td><strong>${escapeHtml(e.name)}</strong></td>
-      <td><span class="chip">${escapeHtml(e.kind || "entity")}</span></td>
-      <td>${e.mention_count || 1}</td>
+      <td><span class="chip">${escapeHtml(e.kind || "topic")}</span></td>
+      <td>${e.meetings || e.mention_count || 1} meetings</td>
     </tr>
   `
     )
     .join("");
 }
 
-// ── Pipeline Orchestrator & Live Logs ────────────────────────────────
+// ── Pipeline Orchestrator & Live Status ──────────────────────────────
 async function checkPipelineStatus() {
   try {
     const res = await fetch("/api/pipeline/status");
@@ -214,20 +218,32 @@ function handlePipelineStatus(status) {
 
   state.pipelineRunning = status.running;
 
+  const stageFriendly = {
+    all: "Processing All Stages",
+    capture: "Checking Google Drive",
+    ingest: "Discovering Audio",
+    transcribe: "Transcribing Speech",
+    speakers: "Matching Speakers",
+    minutes: "Synthesizing Minutes",
+    index: "Updating AI Search Index",
+    recompile: "Refreshing Formats",
+  };
+
   if (status.running) {
+    const friendlyName = stageFriendly[status.stage] || status.stage;
     indicator.classList.add("running");
-    statusText.textContent = `Pipeline: Running [${status.stage}]`;
+    statusText.textContent = `● ${friendlyName}...`;
     $("btn-quick-run").disabled = true;
-    $("btn-quick-run").textContent = `⏳ Running [${status.stage}]...`;
+    $("btn-quick-run").textContent = `⏳ ${friendlyName}...`;
   } else {
     indicator.classList.remove("running");
-    statusText.textContent = "Pipeline Idle";
+    statusText.textContent = "All Caught Up";
     $("btn-quick-run").disabled = false;
-    $("btn-quick-run").textContent = "▶ Run Pipeline";
+    $("btn-quick-run").textContent = "▶ Sync & Process Recordings";
   }
 
-  // Update logs
-  if (status.logs && status.logs.length) {
+  // Update logs in diagnostics drawer
+  if (terminalBody && status.logs && status.logs.length) {
     terminalBody.textContent = status.logs.join("\n");
     terminalBody.scrollTop = terminalBody.scrollHeight;
   }
@@ -239,6 +255,7 @@ function handlePipelineStatus(status) {
         state.pollTimer = null;
         await checkPipelineStatus();
         loadOverview();
+        loadMeetings();
       }, 1500);
     }
   } else if (state.pollTimer) {
@@ -249,7 +266,7 @@ function handlePipelineStatus(status) {
 
 async function runStage(stage) {
   if (state.pipelineRunning) {
-    showToast("A pipeline stage is already running.", "error");
+    showToast("Processing is already in progress.", "info");
     return;
   }
   try {
@@ -259,8 +276,8 @@ async function runStage(stage) {
       body: JSON.stringify({ stage }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Failed to start stage");
-    showToast(`Started pipeline stage '${stage}'`, "success");
+    if (!res.ok) throw new Error(data.error || "Failed to start operation");
+    showToast(`Started audio processing (${stage})`, "success");
     checkPipelineStatus();
   } catch (err) {
     showToast(err.message, "error");
@@ -276,7 +293,7 @@ async function retryAllFailed() {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Retry failed");
-    showToast(`Requeued ${data.requeued} failed meetings`, "success");
+    showToast(`Requeued ${data.requeued} recordings for processing`, "success");
     loadOverview();
     loadMeetings();
   } catch (err) {
@@ -291,8 +308,8 @@ async function recompileStale() {
       headers: { "Content-Type": "application/json" },
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Recompile failed");
-    showToast("Recompilation stage initiated", "success");
+    if (!res.ok) throw new Error(data.error || "Format refresh failed");
+    showToast("Refreshing minutes layout", "success");
     checkPipelineStatus();
   } catch (err) {
     showToast(err.message, "error");
@@ -308,7 +325,7 @@ async function retrySingleMeeting(meetingId) {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Retry failed");
-    showToast("Meeting requeued for ASR transcription", "success");
+    showToast("Meeting requeued for transcription", "success");
     loadMeetings();
     selectMeeting(meetingId);
   } catch (err) {
@@ -317,19 +334,20 @@ async function retrySingleMeeting(meetingId) {
 }
 
 function clearTerminalLogs() {
-  $("terminal-body").textContent = "Terminal log display cleared.";
+  const terminalBody = $("terminal-body");
+  if (terminalBody) terminalBody.textContent = "Log view cleared.";
 }
 
-// ── Meetings Archive & Reader ────────────────────────────────────────
+// ── Meetings Archive & Executive Reader ──────────────────────────────
 async function loadMeetings() {
   try {
     const res = await fetch("/api/meetings");
-    if (!res.ok) throw new Error("Meetings library unavailable");
+    if (!res.ok) throw new Error("Meetings unavailable");
     const data = await res.json();
     state.meetings = data.meetings || [];
     filterAndRenderMeetings();
   } catch (err) {
-    $("meeting-list").innerHTML = `<div class="empty-list">Failed to load meetings.</div>`;
+    $("meeting-list").innerHTML = `<div class="empty-list">Could not load meetings.</div>`;
   }
 }
 
@@ -357,7 +375,7 @@ function filterAndRenderMeetings() {
 function renderMeetingList(meetings) {
   const container = $("meeting-list");
   if (!meetings.length) {
-    container.innerHTML = `<div class="empty-list">No meetings match your filter.</div>`;
+    container.innerHTML = `<div class="empty-list">No meetings match your search.</div>`;
     return;
   }
 
@@ -366,14 +384,19 @@ function renderMeetingList(meetings) {
       const activeClass = m.id === state.activeMeetingId ? "active" : "";
       const isFailed = m.status === "failed";
       const badgeClass = isFailed ? "badge warn" : "badge";
-      const badgeText = isFailed ? "Failed" : m.review_state || m.status;
+      
+      let badgeText = "Ready";
+      if (isFailed) badgeText = "Needs Attention";
+      else if (m.unresolved_count > 0) badgeText = `${m.unresolved_count} Unnamed Speaker${m.unresolved_count > 1 ? "s" : ""}`;
+      else if (m.status === "indexed") badgeText = "Search Ready";
+      else badgeText = m.review_state || m.status;
 
       return `
       <button type="button" class="meeting-card ${activeClass}" onclick="selectMeeting('${m.id}')">
         <div class="meeting-date">${formatShortDate(m.date)}</div>
         <div>
           <h3>${escapeHtml(m.title)}</h3>
-          <p>${escapeHtml(m.excerpt || "No minutes preview available.")}</p>
+          <p>${escapeHtml(m.excerpt || "No summary available.")}</p>
           <span class="${badgeClass}">${escapeHtml(badgeText)}</span>
           <span class="badge" style="background:var(--paper);border:1px solid var(--rule);">${formatDuration(m.duration_sec)}</span>
         </div>
@@ -389,7 +412,6 @@ function renderMeetingList(meetings) {
 
 async function selectMeeting(id) {
   state.activeMeetingId = id;
-  // Update active state in list
   $$(".meeting-card").forEach((card) => card.classList.remove("active"));
   const foundCard = Array.from($$(".meeting-card")).find((c) =>
     c.getAttribute("onclick")?.includes(id)
@@ -397,7 +419,7 @@ async function selectMeeting(id) {
   if (foundCard) foundCard.classList.add("active");
 
   const reader = $("meeting-reader");
-  reader.innerHTML = `<p class="reader-kicker">LOADING RECORD...</p>`;
+  reader.innerHTML = `<p class="reader-kicker">LOADING EXECUTIVE BRIEF...</p>`;
 
   try {
     const res = await fetch(`/api/meetings/${id}`);
@@ -405,7 +427,7 @@ async function selectMeeting(id) {
     const m = await res.json();
     renderMeetingDetail(m);
   } catch (err) {
-    reader.innerHTML = `<div class="empty-list">Failed to load meeting minutes.</div>`;
+    reader.innerHTML = `<div class="empty-list">Failed to load meeting brief.</div>`;
   }
 }
 
@@ -418,8 +440,8 @@ function renderMeetingDetail(m) {
     failedBanner = `
       <div class="failed-banner">
         <div>
-          <strong>Stage Error:</strong>
-          <p>${escapeHtml(m.error || "Unknown pipeline execution error.")}</p>
+          <strong>Processing Interrupted:</strong>
+          <p>${escapeHtml(m.error || "An issue occurred during transcription.")}</p>
         </div>
         <button type="button" class="btn-action btn-warn" onclick="retrySingleMeeting('${m.id}')">↻ Retry Meeting</button>
       </div>
@@ -427,19 +449,15 @@ function renderMeetingDetail(m) {
   }
 
   const driveLink = m.drive_url
-    ? `<div class="reader-actions"><a href="${escapeHtml(m.drive_url)}" target="_blank" rel="noopener">Open original audio in Google Drive ↗</a></div>`
+    ? `<div class="reader-actions"><a href="${escapeHtml(m.drive_url)}" target="_blank" rel="noopener">🎧 Listen to Original Audio in Google Drive ↗</a></div>`
     : "";
 
   const speakersHtml = (m.speakers || [])
     .map((s) => {
       const isUnresolved = !s.name;
       const chipClass = isUnresolved ? "chip chip-speaker unresolved" : "chip chip-speaker";
-      const displayName = s.name ? `${s.label} · ${s.name}` : `${s.label} · (Unassigned ✎)`;
-      // Values go in data-* attributes, never into an inline handler. The
-      // browser HTML-decodes an attribute before parsing it as JS, so an
-      // escaped quote turns back into a real one and escapes the string.
-      // Speaker names are user- and LLM-supplied, so that is reachable.
-      return `<button type="button" class="${chipClass}" title="Click to resolve speaker identity" data-speaker-chip data-meeting-id="${escapeHtml(m.id)}" data-label="${escapeHtml(s.label)}" data-name="${escapeHtml(s.name || "")}">${escapeHtml(displayName)}</button>`;
+      const displayName = s.name ? `👤 ${s.name} (${s.label})` : `🎙️ ${s.label} · (Click to Name ✎)`;
+      return `<button type="button" class="${chipClass}" title="Click to name this person" data-speaker-chip data-meeting-id="${escapeHtml(m.id)}" data-label="${escapeHtml(s.label)}" data-name="${escapeHtml(s.name || "")}">${escapeHtml(displayName)}</button>`;
     })
     .join("");
 
@@ -447,20 +465,22 @@ function renderMeetingDetail(m) {
     .map((e) => `<span class="chip" title="${escapeHtml(e.description || "")}">${escapeHtml(e.name)}</span>`)
     .join("");
 
+  const formattedMinutes = renderMarkdown(m.minutes || "No executive brief recorded for this meeting yet.");
+
   reader.innerHTML = `
     <p class="reader-kicker">${escapeHtml(m.date || "UNDATED")} · ${escapeHtml(m.time || "")} · ${formatDuration(m.duration_sec)}</p>
     <h2>${escapeHtml(m.title)}</h2>
     <div class="reader-meta">
-      <span>ID: <code>${m.short_id}</code></span>
-      <span>Source: ${escapeHtml(m.source_name || "direct")}</span>
-      <span>Status: <strong>${escapeHtml(m.status)}</strong></span>
+      <span>Meeting ID: <code>${m.short_id}</code></span>
+      <span>Source: ${escapeHtml(m.source_name || "direct recording")}</span>
+      <span>Status: <strong>${escapeHtml(m.status === "indexed" ? "Search Ready" : m.status)}</strong></span>
     </div>
 
     ${failedBanner}
     ${driveLink}
 
     <div class="speaker-section">
-      <p class="eyebrow">ATTRIBUTED SPEAKERS</p>
+      <p class="eyebrow">ATTENDEES &amp; SPEAKERS (CLICK TO NAME)</p>
       <div class="speaker-list">
         ${speakersHtml || '<span class="chip">No speaker diarization</span>'}
       </div>
@@ -470,17 +490,17 @@ function renderMeetingDetail(m) {
       entitiesHtml
         ? `
       <div class="entity-section" style="margin-top:14px;">
-        <p class="eyebrow">GRAPH ENTITIES</p>
+        <p class="eyebrow">KEY TOPICS &amp; PROJECTS</p>
         <div class="entity-list">${entitiesHtml}</div>
       </div>
     `
         : ""
     }
 
-    <div class="minutes">${escapeHtml(m.minutes || "No compiled minutes recorded for this meeting yet.")}</div>
+    <div class="minutes">${formattedMinutes}</div>
   `;
 
-  // Bind after innerHTML: dataset values are plain strings, never parsed as JS.
+  // Bind click handlers to speaker chips
   reader.querySelectorAll("[data-speaker-chip]").forEach((btn) => {
     btn.addEventListener("click", () => {
       openSpeakerModal(btn.dataset.meetingId, btn.dataset.label, btn.dataset.name);
@@ -488,7 +508,49 @@ function renderMeetingDetail(m) {
   });
 }
 
-// ── People & Aliases Management ──────────────────────────────────────
+// ── Markdown Parser for Executive Briefs ──────────────────────────────
+function renderMarkdown(md) {
+  if (!md) return "";
+  
+  // Strip YAML frontmatter if present
+  let text = md;
+  if (text.startsWith("---")) {
+    const parts = text.split("---", 3);
+    if (parts.length >= 3) {
+      text = parts.slice(2).join("---").trim();
+    }
+  }
+
+  // Escape HTML characters
+  let html = escapeHtml(text);
+
+  // Headers (h3, h4)
+  html = html.replace(/^### (.*$)/gim, '<h4>$1</h4>');
+  html = html.replace(/^## (.*$)/gim, '<h3>$1</h3>');
+  html = html.replace(/^# (.*$)/gim, '<h2>$1</h2>');
+
+  // Bold & Italic
+  html = html.replace(/\*\*(.*?)\*\*/gim, '<strong>$1</strong>');
+  html = html.replace(/\*(.*?)\*/gim, '<em>$1</em>');
+
+  // Checkboxes / Action Items
+  html = html.replace(/^- \[ \] (.*$)/gim, '<div class="action-item unchecked"><span class="check-box">☐</span> $1</div>');
+  html = html.replace(/^- \[x\] (.*$)/gim, '<div class="action-item checked"><span class="check-box">☑</span> <s>$1</s></div>');
+
+  // Bullet items
+  html = html.replace(/^\- (.*$)/gim, '<li>$1</li>');
+  html = html.replace(/^\* (.*$)/gim, '<li>$1</li>');
+
+  // Wrap consecutive list items in <ul>
+  html = html.replace(/(<li>.*<\/li>\s*)+/gim, '<ul>$&</ul>');
+
+  // Paragraph line breaks
+  html = html.replace(/\n\n/g, '<br/><br/>');
+
+  return html;
+}
+
+// ── People & Contact Management ──────────────────────────────────────
 async function loadPeople() {
   try {
     const res = await fetch("/api/people");
@@ -504,8 +566,9 @@ async function loadPeople() {
 
 function renderPeopleTable(people) {
   const tbody = $("people-tbody");
+  if (!tbody) return;
   if (!people.length) {
-    tbody.innerHTML = `<tr><td colspan="4" class="empty-cell">No registered people yet.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="4" class="empty-cell">No contacts added yet.</td></tr>`;
     return;
   }
   tbody.innerHTML = people
@@ -514,7 +577,7 @@ function renderPeopleTable(people) {
     <tr>
       <td><strong>${escapeHtml(p.canonical)}</strong></td>
       <td>${escapeHtml(p.role || "—")}</td>
-      <td>${p.meeting_count || 0}</td>
+      <td>${p.meetings || p.meeting_count || 0} meetings</td>
       <td>${(p.aliases || []).map((a) => `<span class="chip">${escapeHtml(a)}</span>`).join(" ") || "—"}</td>
     </tr>
   `
@@ -524,6 +587,7 @@ function renderPeopleTable(people) {
 
 function updateDatalistSuggestions(people) {
   const datalist = $("canonical-suggestions");
+  if (!datalist) return;
   datalist.innerHTML = people
     .map((p) => `<option value="${escapeHtml(p.canonical)}">${escapeHtml(p.role ? `${p.canonical} (${p.role})` : p.canonical)}</option>`)
     .join("");
@@ -543,7 +607,7 @@ async function submitAddPerson() {
       body: JSON.stringify({ canonical, role, aliases }),
     });
     if (!res.ok) throw new Error("Failed to save person");
-    showToast(`Saved person: ${canonical}`, "success");
+    showToast(`Saved contact: ${canonical}`, "success");
     $("person-canonical").value = "";
     $("person-role").value = "";
     $("person-aliases").value = "";
@@ -566,8 +630,8 @@ async function submitMergePerson() {
       body: JSON.stringify({ from_name: fromName, into }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Failed to merge people");
-    showToast(`Merged '${fromName}' into '${into}' (${data.rewritten} records rewritten)`, "success");
+    if (!res.ok) throw new Error(data.error || "Failed to combine names");
+    showToast(`Combined '${fromName}' into '${into}' (${data.rewritten} records updated)`, "success");
     $("merge-from").value = "";
     $("merge-into").value = "";
     loadPeople();
@@ -583,7 +647,7 @@ function openSpeakerModal(meetingId, label, currentName) {
   $("modal-meeting-id").value = meetingId;
   $("modal-speaker-label").value = label;
   $("modal-speaker-name").value = currentName || "";
-  $("speaker-modal-sub").textContent = `Assign canonical person for speaker tag: ${label}`;
+  $("speaker-modal-sub").textContent = `Assign real contact name to voice tag: ${label}`;
   $("speaker-modal").showModal();
 }
 
@@ -603,7 +667,7 @@ async function submitSpeakerModal() {
       body: JSON.stringify({ label, name, confidence: "confirmed" }),
     });
     if (!res.ok) throw new Error("Failed to update speaker");
-    showToast(`Assigned ${label} → ${name}`, "success");
+    showToast(`Saved speaker: ${label} → ${name}`, "success");
     closeSpeakerModal();
     selectMeeting(meetingId);
     loadPeople();
@@ -613,19 +677,19 @@ async function submitSpeakerModal() {
   }
 }
 
-// ── Ask Archive (RAG Search) ─────────────────────────────────────────
+// ── Ask AI Assistant ─────────────────────────────────────────────────
 async function askArchive() {
   const question = $("question").value.trim();
   const mode = $("query-mode").value;
   const answerEl = $("answer");
 
   if (!question) {
-    showToast("Please enter a question.", "error");
+    showToast("Please enter a question.", "info");
     return;
   }
 
   answerEl.className = "answer";
-  answerEl.innerHTML = `<p>Consulting local hybrid LightRAG graph and synthesising record...</p>`;
+  answerEl.innerHTML = `<p>Consulting your meeting archive and preparing answer...</p>`;
 
   try {
     const res = await fetch("/api/query", {
@@ -634,23 +698,24 @@ async function askArchive() {
       body: JSON.stringify({ question, mode }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Query failed");
+    if (!res.ok) throw new Error(data.error || "Query could not be completed");
 
     answerEl.innerHTML = `
-      <div>${escapeHtml(data.answer)}</div>
+      <div>${renderMarkdown(data.answer)}</div>
       <span class="answer-meta">
-        Latency: ${data.retrieval_sec}s retrieval + ${data.synthesis_sec}s synthesis · Provider: ${escapeHtml(data.provider || "ollama")} · Mode: ${escapeHtml(mode)}
+        Retrieved in ${data.retrieval_sec}s · Mode: ${escapeHtml(mode)}
       </span>
     `;
   } catch (err) {
     answerEl.className = "answer empty";
-    answerEl.innerHTML = `<p style="color:var(--clay)">Error querying archive: ${escapeHtml(err.message)}</p>`;
+    answerEl.innerHTML = `<p style="color:var(--clay)">Search service note: ${escapeHtml(err.message)}</p>`;
   }
 }
 
 // ── Utilities & Formatting ───────────────────────────────────────────
 function showToast(message, type = "info") {
   const container = $("toast-container");
+  if (!container) return;
   const toast = document.createElement("div");
   toast.className = `toast ${type}`;
   toast.textContent = message;
@@ -695,30 +760,4 @@ function formatShortDate(dateStr) {
     return `${months[m] || parts[1]} ${parts[2]}`;
   }
   return dateStr;
-}
-
-// ── Quick Jump (API Explorer) ────────────────────────────────────────
-function jumpToTab(tabId) {
-  // Activate the target tab
-  $$(".tab-btn").forEach((b) => {
-    b.classList.remove("active");
-    b.setAttribute("aria-selected", "false");
-  });
-  $$(".tab-pane").forEach((p) => p.classList.remove("active"));
-
-  const targetTab = $(tabId);
-  if (targetTab) {
-    targetTab.classList.add("active");
-  }
-
-  // Find and activate the matching tab button
-  $$(".tab-btn").forEach((btn) => {
-    if (btn.dataset.tab === tabId) {
-      btn.classList.add("active");
-      btn.setAttribute("aria-selected", "true");
-    }
-  });
-
-  // Scroll to top of the page
-  window.scrollTo({ top: 0, behavior: "smooth" });
 }
