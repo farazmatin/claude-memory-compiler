@@ -63,24 +63,33 @@ cross-meeting identity.
 
 Diarization requires all of the following:
 
-- `HF_TOKEN` set on the Windows user account;
-- acceptance of the terms for `pyannote/speaker-diarization-3.1` and
-  `pyannote/segmentation-3.0` on Hugging Face;
+- `HF_TOKEN` set in `.env` (loaded by `pipeline/config.py` via `load_dotenv`);
+- acceptance of the terms for **`pyannote/speaker-diarization-community-1`** on
+  Hugging Face, using the same account that owns the token;
 - the ASR extra installed (`uv sync --extra asr`).
 
-If the token or model access is missing, the pipeline keeps the transcript but
-prints `diarization skipped: no HF_TOKEN`. There will be no speaker labels to
-resolve, so the minutes will show unresolved ownership. This is the current
-state of the initial test recordings.
+**Which model is gated depends on the installed pyannote version.** whisperx
+resolves `model_name or "pyannote/speaker-diarization-community-1"`, so
+pyannote 4.x needs `speaker-diarization-community-1`. Accepting the older
+`speaker-diarization-3.1` and `segmentation-3.0` alone is **not** sufficient
+and produces no speaker labels. Accepting all three is harmless and covers a
+future downgrade.
 
-On Windows, configure the token once (keep it private and never commit it):
+To confirm access before trusting a nightly run:
 
 ```powershell
-[Environment]::SetEnvironmentVariable("HF_TOKEN", "hf_your_read_token", "User")
+uv run python -c "from pipeline.config import HF_TOKEN; from whisperx.diarize import DiarizationPipeline; DiarizationPipeline(token=HF_TOKEN, device='cpu'); print('diarization OK')"
 ```
 
-Open a new PowerShell window after setting it. The nightly scheduled task will
-inherit the user-level setting.
+A `GatedRepoError: 403` here means the terms were never accepted on that
+account. Note that `HfApi().model_info()` succeeds even when the gate is
+closed — metadata is public, file downloads are not — so metadata access is
+not evidence that diarization will work.
+
+If the token or model access is missing, the pipeline keeps the transcript and
+prints a diagnostic, but the stage is still recorded as `ok`. Under the nightly
+scheduled task that message goes to a discarded stdout, so the only visible
+symptom is `0 speakers` in `pipeline status`.
 
 ### 4. Identity resolution
 
@@ -117,8 +126,11 @@ The minutes—not the raw transcript—are sent to LightRAG for search.
 
 Do this once before expecting speaker attribution:
 
-1. Create a Hugging Face read token and accept both gated pyannote model terms.
-2. Set `HF_TOKEN` at the Windows user level and open a new PowerShell window.
+1. Create a Hugging Face read token, then — signed in as that same account —
+   accept the terms at
+   <https://hf.co/pyannote/speaker-diarization-community-1>. Also accept
+   `speaker-diarization-3.1` and `segmentation-3.0` to cover older pyannote.
+2. Put `HF_TOKEN=hf_...` in `.env`, then run the access check above.
 3. Confirm the ASR dependencies are installed:
 
    ```powershell
@@ -222,8 +234,12 @@ avoids silently matching the wrong person.
 
 ## Troubleshooting
 
-**There are no `SPEAKER_00` labels.** Diarization did not run. Check `HF_TOKEN`,
-the pyannote model terms, and the ASR extra, then transcribe again.
+**There are no `SPEAKER_00` labels.** Diarization did not run, and the stage
+still reported `ok`. Run the access check in the Diarization section — a
+`GatedRepoError: 403` naming `speaker-diarization-community-1` means the terms
+were never accepted on the token's account. This is the most common cause and
+it fails silently under the nightly task. Then check the ASR extra and
+transcribe again.
 
 **The model named the wrong person.** Add a meeting-specific override. Manual
 overrides beat filename hints and model inference.

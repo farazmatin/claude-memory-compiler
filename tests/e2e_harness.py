@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -245,12 +246,18 @@ def install_fake_llm(tmp_path: Path, minutes: str = MINUTES_DOC) -> dict[str, st
     script.write_text(FAKE_LLM, encoding="utf-8")
     script.chmod(0o755)
 
+    bin_path = script
+    if os.name == "nt":
+        cmd_script = tmp_path / "fake_llm.cmd"
+        cmd_script.write_text(f'@echo off\n"{sys.executable}" "{script}" %*\n', encoding="utf-8")
+        bin_path = cmd_script
+
     minutes_file = tmp_path / "minutes_response.md"
     minutes_file.write_text(minutes, encoding="utf-8")
 
     return {
         "MMC_LLM_PROVIDERS": "gemini",
-        "MMC_GEMINI_BIN": str(script),
+        "MMC_GEMINI_BIN": str(bin_path),
         "MMC_GEMINI_ARGS": " ",  # no args; prompt arrives on stdin
         "FAKE_LLM_MINUTES": str(minutes_file),
         "FAKE_LLM_SPEAKERS": SPEAKER_JSON,

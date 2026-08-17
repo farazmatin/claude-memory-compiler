@@ -145,8 +145,22 @@ services:
       # ── Concurrency ──────────────────────────────────────────────────
       # Keep low. This shares a CPU with ASR, and the nightly batch would
       # otherwise have transcription and indexing fighting for cores.
-      - MAX_ASYNC=2
+      #
+      # MAX_ASYNC MUST NOT exceed OLLAMA_NUM_PARALLEL (1, set on the ollama
+      # service). With 2, LightRAG issues a second extraction call that Ollama
+      # queues rather than serves; the caller's read timeout runs down while it
+      # waits, so it fails having never been processed. That is not a slow
+      # machine, it is a guaranteed timeout - it failed all 4 documents on
+      # 2026-08-14 before this was corrected.
+      - MAX_ASYNC=1
       - MAX_PARALLEL_INSERT=1
+
+      # Entity extraction on a CPU-bound reasoning model is slow: qwen3:4b emits
+      # long thinking traces before the structured answer, and a 1200-token chunk
+      # can take many minutes. LightRAG's default timeout assumes a hosted API and
+      # is far too short for this. Generous on purpose - a slow index is
+      # recoverable, a failed one needs the whole document reprocessed.
+      - TIMEOUT=1800
 
       # Minutes are 600-1200 words, so a chunk this size usually keeps a whole
       # meeting's decisions in one chunk with its rationale intact.

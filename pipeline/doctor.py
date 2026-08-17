@@ -82,6 +82,7 @@ def check_ffmpeg() -> list[Check]:
 def check_asr() -> list[Check]:
     """whisperx and the model choice."""
     checks = []
+
     try:
         import whisperx  # noqa: F401
 

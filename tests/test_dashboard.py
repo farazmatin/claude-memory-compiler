@@ -1,4 +1,4 @@
-"""Coverage for the read-only local Meeting Memory dashboard."""
+"""Coverage for the local Meeting Memory dashboard, metrics, and operations."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ def test_library_and_detail_read_minutes_inside_archive(manifest, tmp_path, monk
         meeting_id,
         "2026-08-12",
         title_hint="Roadmap decision",
+        duration_sec=1800.0,
         status=db.INDEXED,
         minutes_path=str(minutes_path),
     )
@@ -29,7 +30,7 @@ def test_library_and_detail_read_minutes_inside_archive(manifest, tmp_path, monk
         folder_kind="future",
         source_name="roadmap.m4a",
         mime_type="audio/mp4",
-        byte_size=100,
+        byte_size=1000,
         md5_checksum="checksum",
         created_time="2026-08-12T09:00:00Z",
         modified_time="2026-08-12T09:00:00Z",
@@ -43,7 +44,7 @@ def test_library_and_detail_read_minutes_inside_archive(manifest, tmp_path, monk
     )
     manifest.execute(
         "INSERT INTO speakers (meeting_id, label, name, confidence) VALUES (?, ?, ?, ?)",
-        (meeting_id, "SPEAKER_00", "Faraz", 0.98),
+        (meeting_id, "SPEAKER_00", "Faraz", "confirmed"),
     )
     manifest.execute(
         "INSERT INTO entities (meeting_id, name, kind, description) VALUES (?, ?, ?, ?)",
@@ -59,10 +60,106 @@ def test_library_and_detail_read_minutes_inside_archive(manifest, tmp_path, monk
     assert detail is not None
     assert detail["drive_url"].startswith("https://drive.google.com/")
     assert detail["speakers"] == [
-        {"label": "SPEAKER_00", "name": "Faraz", "confidence": "0.98"}
+        {"label": "SPEAKER_00", "name": "Faraz", "confidence": "confirmed"}
     ]
     assert detail["entities"][0]["name"] == "September"
     assert "ship in September" in detail["minutes"]
+
+
+def test_overview_computes_extended_metrics(manifest):
+    meeting_id = "m" * 64
+    make_meeting(
+        manifest,
+        meeting_id,
+        "2026-08-14",
+        title_hint="Sprint Planning",
+        duration_sec=3600.0,
+        status=db.INDEXED,
+    )
+    manifest.execute(
+        "INSERT INTO stage_runs (meeting_id, stage, started_at, finished_at, ok, detail) "
+        "VALUES (?, ?, '2026-08-14T10:00:00Z', '2026-08-14T10:10:00Z', 1, 'ok')",
+        (meeting_id, "transcribe"),
+    )
+    manifest.execute(
+        "INSERT INTO people (canonical, role, created_at) VALUES ('Faraz', 'PM', '2026-08-14T10:00:00Z')"
+    )
+    manifest.commit()
+
+    data = dashboard.overview()
+    assert data["meetings"] >= 1
+    assert data["durations"]["total_hours"] >= 1.0
+    assert "activity" in data
+    assert "today" in data["activity"]
+    assert "yesterday" in data["activity"]
+    assert "queue" in data
+    assert data["queue"][db.INDEXED] >= 1
+    assert "timings" in data
+    assert "knowledge" in data
+    assert data["knowledge"]["people_count"] >= 1
+
+
+def test_retry_failed_and_retry_meeting(manifest):
+    meeting_id = "f" * 64
+    make_meeting(
+        manifest,
+        meeting_id,
+        "2026-08-14",
+        status=db.FAILED,
+    )
+    manifest.commit()
+
+    # Retry single meeting
+    ok = dashboard.retry_meeting(meeting_id, db.DISCOVERED)
+    assert ok is True
+    with db.connect() as conn:
+        m = db.get_meeting(conn, meeting_id)
+        assert m.status == db.DISCOVERED
+
+    # Reset back to failed and test batch retry
+    with db.connect() as conn:
+        db.mark_failed(conn, meeting_id, "some error")
+    count = dashboard.retry_failed(db.DISCOVERED)
+    assert count == 1
+    with db.connect() as conn:
+        m = db.get_meeting(conn, meeting_id)
+        assert m.status == db.DISCOVERED
+
+
+def test_people_management_and_speaker_override(manifest):
+    meeting_id = "s" * 64
+    make_meeting(
+        manifest,
+        meeting_id,
+        "2026-08-14",
+        status=db.TRANSCRIBED,
+    )
+    manifest.commit()
+
+    # Add person
+    dashboard.add_person("Alice", role="Engineering", aliases=["alice_dev"])
+    plist = dashboard.people()
+    assert any(p["canonical"] == "Alice" for p in plist)
+
+    # Set speaker in meeting
+    dashboard.set_meeting_speaker(meeting_id, "SPEAKER_00", "Alice")
+    with db.connect() as conn:
+        speakers = db.get_speakers(conn, meeting_id)
+        assert speakers.get("SPEAKER_00") == "Alice"
+
+    # Merge person
+    dashboard.add_person("Bob", role="Design")
+    rewritten = dashboard.merge_people("Alice", "Bob")
+    assert rewritten >= 1
+    with db.connect() as conn:
+        speakers = db.get_speakers(conn, meeting_id)
+        assert speakers.get("SPEAKER_00") == "Bob"
+
+
+def test_pipeline_status_and_trigger():
+    status = dashboard.get_pipeline_status()
+    assert "running" in status
+    assert "logs" in status
 
 
 def test_minutes_outside_archive_are_not_exposed(manifest, tmp_path, monkeypatch):

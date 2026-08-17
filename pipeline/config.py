@@ -98,6 +98,7 @@ IMPLAUSIBLE_SPEAKER_COUNT = int(os.environ.get("MMC_IMPLAUSIBLE_SPEAKERS", "8"))
 # This fails at runtime, not at install time.
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
 
+
 # ── LLM providers ─────────────────────────────────────────────────────
 # Priority order, highest first. Tried in sequence, falling through on failure,
 # so a quota limit on the preferred provider does not stall a nightly batch that
