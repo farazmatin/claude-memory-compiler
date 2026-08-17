@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from pipeline import db, index
+from pipeline import db, index, voices
 from pipeline.config import (
     DASHBOARD_HOST,
     DASHBOARD_PORT,
@@ -188,6 +188,141 @@ def set_meeting_speaker(
         db.set_speaker(conn, meeting_id=meeting_id, label=label, name=cleaned or None, confidence=confidence)
         if cleaned:
             db.add_person(conn, canonical=cleaned)
+
+
+def get_voice_clusters() -> list[dict[str, Any]]:
+    """Return pending voice review clusters with member meeting details."""
+    db.init_db()
+    with db.connect() as conn:
+        clusters = db.pending_clusters(conn)
+        if not clusters:
+            try:
+                voices.cluster_pending(conn)
+                clusters = db.pending_clusters(conn)
+            except Exception:
+                pass
+
+        result = []
+        for c in clusters:
+            labels = db.cluster_labels(conn, c["id"])
+            members = []
+            for row in labels:
+                m = db.get_meeting(conn, row["meeting_id"])
+                members.append({
+                    "meeting_id": row["meeting_id"],
+                    "label": row["label"],
+                    "meeting_title": (m.title_hint if m else None) or (m.source_name if m else "Meeting"),
+                    "meeting_date": m.meeting_date if m else None,
+                    "speech_sec": float(row["speech_sec"] or 0),
+                })
+            result.append({
+                "id": c["id"],
+                "size": c["size"],
+                "total_speech": c["total_speech"],
+                "best_canonical": c["best_canonical"],
+                "best_score": round(float(c["best_score"] or 0), 2) if c["best_score"] is not None else None,
+                "next_canonical": c["next_canonical"],
+                "band": c["band"],
+                "members": members,
+            })
+        return result
+
+
+def confirm_voice_cluster(cluster_id: str, canonical: str) -> int:
+    """Confirm all appearances in a voice cluster as a canonical person name."""
+    db.init_db()
+    with db.connect() as conn:
+        return voices.confirm(conn, cluster_id=cluster_id, canonical=canonical.strip())
+
+
+def dismiss_voice_cluster(cluster_id: str) -> int:
+    """Dismiss a cluster as non-speaker noise or crosstalk."""
+    db.init_db()
+    with db.connect() as conn:
+        return voices.dismiss(conn, cluster_id=cluster_id)
+
+
+def split_voice_cluster(cluster_id: str) -> list[str]:
+    """Split a cluster back into individual pending speaker matches."""
+    db.init_db()
+    with db.connect() as conn:
+        return voices.split_cluster(conn, cluster_id=cluster_id)
+
+
+def decision_timeline(topic: str | None = None) -> dict[str, Any]:
+    """Extract chronological milestones and decisions for a topic or across the corpus."""
+    db.init_db()
+    with db.connect() as conn:
+        query = """
+            SELECT id, source_name, title_hint, meeting_date, meeting_time, duration_sec, status, minutes_path
+            FROM meetings
+            WHERE status = ?
+            ORDER BY meeting_date ASC, meeting_time ASC
+        """
+        rows = conn.execute(query, (db.INDEXED,)).fetchall()
+
+        events = []
+        filter_term = (topic or "").strip().lower()
+        if filter_term in {"all", "everything", ""}:
+            filter_term = ""
+
+        for row in rows:
+            minutes = _read_minutes(row["minutes_path"])
+            speakers = [
+                s["name"]
+                for s in conn.execute(
+                    "SELECT name FROM speakers WHERE meeting_id = ? AND name IS NOT NULL",
+                    (row["id"],),
+                ).fetchall()
+            ]
+            entities = [e["name"] for e in db.get_entities(conn, row["id"])]
+
+            title = row["title_hint"] or row["source_name"] or "Meeting"
+            full_text = f"{title} {minutes} {' '.join(entities)} {' '.join(speakers)}"
+            if filter_term and filter_term not in full_text.lower():
+                continue
+
+            # Extract key decisions and action items from minutes markdown
+            lines = minutes.splitlines()
+            decisions: list[str] = []
+            capture = False
+            for line in lines:
+                l_lower = line.lower().strip()
+                if any(k in l_lower for k in ("decision", "outcome", "agreed", "key takeaway", "action item", "next step")):
+                    capture = True
+                    continue
+                if capture:
+                    if line.startswith("#"):
+                        capture = False
+                    elif line.strip().startswith(("-", "*", "•", "1.", "2.", "3.", "4.", "5.")):
+                        cleaned_line = line.strip().lstrip("-*• 0123456789.[]xX").strip()
+                        if cleaned_line and len(cleaned_line) > 10:
+                            decisions.append(cleaned_line)
+                            if len(decisions) >= 3:
+                                break
+
+            if not decisions:
+                excerpt_text = _excerpt(minutes, limit=180)
+                decisions = [excerpt_text] if excerpt_text else ["Meeting indexed and archived in memory."]
+
+            events.append({
+                "meeting_id": row["id"],
+                "short_id": row["id"][:8],
+                "date": row["meeting_date"] or "Undated",
+                "time": row["meeting_time"] or "",
+                "title": title,
+                "headline": decisions[0] if decisions else "Alignment & Discussion",
+                "decisions": decisions,
+                "speakers": speakers,
+                "entities": entities[:6],
+                "duration_sec": row["duration_sec"],
+            })
+
+        return {
+            "topic": topic or "All Historical Meetings",
+            "total_milestones": len(events),
+            "events": events,
+        }
 
 
 def overview() -> dict[str, Any]:
@@ -454,6 +589,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             search = parse_qs(parsed.query).get("search", [""])[0]
             self._json(HTTPStatus.OK, {"meetings": meetings(search)})
             return
+        if path == "/api/voices/clusters":
+            self._json(HTTPStatus.OK, {"clusters": get_voice_clusters()})
+            return
+        if path == "/api/timeline":
+            topic = parse_qs(parsed.query).get("topic", [""])[0]
+            self._json(HTTPStatus.OK, decision_timeline(topic))
+            return
         if path.startswith("/api/meetings/"):
             detail = meeting_detail(path.rsplit("/", 1)[-1])
             if detail:
@@ -466,6 +608,51 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
+        if path == "/api/timeline":
+            try:
+                payload = self._payload()
+                topic = payload.get("topic", "")
+                self._json(HTTPStatus.OK, decision_timeline(topic))
+            except Exception as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+
+        if path == "/api/voices/confirm":
+            try:
+                payload = self._payload()
+                cluster_id = payload.get("cluster_id")
+                canonical = payload.get("canonical", "").strip()
+                if not cluster_id or not canonical:
+                    raise ValueError("Both 'cluster_id' and 'canonical' name are required.")
+                count = confirm_voice_cluster(cluster_id, canonical)
+                self._json(HTTPStatus.OK, {"confirmed": count, "cluster_id": cluster_id, "canonical": canonical})
+            except Exception as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+
+        if path == "/api/voices/dismiss":
+            try:
+                payload = self._payload()
+                cluster_id = payload.get("cluster_id")
+                if not cluster_id:
+                    raise ValueError("'cluster_id' is required.")
+                count = dismiss_voice_cluster(cluster_id)
+                self._json(HTTPStatus.OK, {"dismissed": count, "cluster_id": cluster_id})
+            except Exception as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+
+        if path == "/api/voices/split":
+            try:
+                payload = self._payload()
+                cluster_id = payload.get("cluster_id")
+                if not cluster_id:
+                    raise ValueError("'cluster_id' is required.")
+                res = split_voice_cluster(cluster_id)
+                self._json(HTTPStatus.OK, {"split": res, "cluster_id": cluster_id})
+            except Exception as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
         if path == "/api/query":
             try:
                 payload = self._payload()

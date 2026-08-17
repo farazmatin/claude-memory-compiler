@@ -762,6 +762,248 @@ function formatSeconds(sec) {
   return `${m}m ${s}s`;
 }
 
+// ── Zero-Touch Voice Identification Cards (PR #4) ────────────────────
+async function loadVoiceClusters() {
+  try {
+    const res = await fetch("/api/voices/clusters");
+    if (!res.ok) return;
+    const data = await res.json();
+    state.voiceClusters = data.clusters || [];
+    renderVoiceCards(state.voiceClusters);
+  } catch (err) {
+    console.error("Failed to load voice clusters:", err);
+  }
+}
+
+function renderVoiceCards(clusters) {
+  const banner = $("voice-review-banner");
+  const peopleSection = $("voice-review-people-section");
+  const peopleList = $("voice-review-people-list");
+
+  if (!clusters || !clusters.length) {
+    if (banner) banner.style.display = "none";
+    if (peopleSection) peopleSection.style.display = "none";
+    return;
+  }
+
+  const cardsHtml = clusters
+    .map((c) => {
+      const bestMatchName = c.best_canonical;
+      const matchConfidence = c.best_score ? Math.round(c.best_score * 100) : null;
+      const matchText = bestMatchName
+        ? `Best Match: <strong>${escapeHtml(bestMatchName)}</strong> <span class="similarity-pill">${matchConfidence}% confidence</span>`
+        : `Unrecognized recurring speaker`;
+
+      const confirmBtn = bestMatchName
+        ? `<button type="button" class="btn-action btn-sm" onclick="confirmVoiceCluster('${c.id}', '${escapeHtml(bestMatchName)}')">✓ Confirm as ${escapeHtml(bestMatchName)}</button>`
+        : "";
+
+      return `
+        <div class="voice-card">
+          <div class="voice-card-header">
+            <div class="voice-card-title">
+              <span class="voice-icon">🎙️</span>
+              <div>
+                <strong>Recurring Voice Detected</strong>
+                <p class="voice-meta">Heard across ${c.size} meeting${c.size > 1 ? "s" : ""} · ${formatDuration(c.total_speech)} total speech</p>
+              </div>
+            </div>
+          </div>
+          <div class="voice-card-body">
+            <p class="voice-match-text">${matchText}</p>
+            <div class="voice-members">
+              ${(c.members || []).slice(0, 3).map((m) => `<span class="voice-member-chip">📅 ${escapeHtml(m.meeting_date || "Past Meeting")}: ${escapeHtml(m.meeting_title || "Recording")} (${m.label})</span>`).join("")}
+            </div>
+          </div>
+          <div class="voice-card-actions">
+            ${confirmBtn}
+            <button type="button" class="btn-outline btn-sm" onclick="promptCustomVoiceName('${c.id}')">✎ Name Someone Else</button>
+            <button type="button" class="btn-text btn-sm" onclick="dismissVoiceCluster('${c.id}')">✗ Dismiss Noise</button>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+
+  if (banner) {
+    banner.innerHTML = `
+      <div class="voice-banner-inner">
+        <div class="voice-banner-header">
+          <h3>🎙️ Speaker Identity Review (${clusters.length} pending)</h3>
+          <p>We detected recurring voices across your meetings. Confirming them enrolls their voiceprint and updates all past meetings automatically.</p>
+        </div>
+        <div class="voice-cards-scroll">${cardsHtml}</div>
+      </div>
+    `;
+    banner.style.display = "block";
+  }
+
+  if (peopleSection && peopleList) {
+    peopleList.innerHTML = cardsHtml;
+    peopleSection.style.display = "block";
+  }
+}
+
+async function confirmVoiceCluster(clusterId, canonical) {
+  try {
+    const res = await fetch("/api/voices/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cluster_id: clusterId, canonical }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Failed to confirm voice");
+    showToast(`Enrolled voiceprint for '${canonical}' across ${data.confirmed || "all"} meetings!`, "success");
+    loadVoiceClusters();
+    loadMeetings();
+    loadPeople();
+    loadOverview();
+    if (state.activeMeetingId) selectMeeting(state.activeMeetingId);
+  } catch (err) {
+    showToast(err.message, "error");
+  }
+}
+
+async function dismissVoiceCluster(clusterId) {
+  try {
+    const res = await fetch("/api/voices/dismiss", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cluster_id: clusterId }),
+    });
+    if (!res.ok) throw new Error("Failed to dismiss cluster");
+    showToast("Dismissed speaker fragment as noise.", "info");
+    loadVoiceClusters();
+  } catch (err) {
+    showToast(err.message, "error");
+  }
+}
+
+function promptCustomVoiceName(clusterId) {
+  const name = prompt("Enter the real contact name for this voice:");
+  if (name && name.trim()) {
+    confirmVoiceCluster(clusterId, name.trim());
+  }
+}
+
+// ── Decision Timeline Evolution ──────────────────────────────────────
+function switchAskMode(mode) {
+  const qaBtn = $("mode-btn-qa");
+  const tlBtn = $("mode-btn-timeline");
+  const qaPanel = $("ask-qa-panel");
+  const tlPanel = $("ask-timeline-panel");
+
+  if (mode === "timeline") {
+    if (qaBtn) qaBtn.classList.remove("active");
+    if (tlBtn) tlBtn.classList.add("active");
+    if (qaPanel) qaPanel.style.display = "none";
+    if (tlPanel) tlPanel.style.display = "block";
+    loadTimelineForTopic("all");
+  } else {
+    if (tlBtn) tlBtn.classList.remove("active");
+    if (qaBtn) qaBtn.classList.add("active");
+    if (tlPanel) tlPanel.style.display = "none";
+    if (qaPanel) qaPanel.style.display = "block";
+  }
+}
+
+async function loadTimelineForTopic(topic) {
+  const input = $("timeline-topic-input");
+  if (input && topic !== "all") input.value = topic;
+  const container = $("timeline-results");
+  if (!container) return;
+
+  container.innerHTML = `<div class="empty-timeline"><p>Compiling chronological decision evolution for <strong>${escapeHtml(topic === "all" ? "All Projects" : topic)}</strong>...</p></div>`;
+
+  try {
+    const res = await fetch(`/api/timeline?topic=${encodeURIComponent(topic)}`);
+    if (!res.ok) throw new Error("Failed to load timeline");
+    const data = await res.json();
+    renderTimeline(data);
+  } catch (err) {
+    container.innerHTML = `<div class="empty-timeline"><p style="color:var(--clay)">Failed to load timeline: ${escapeHtml(err.message)}</p></div>`;
+  }
+}
+
+function renderTimeline(data) {
+  const container = $("timeline-results");
+  if (!container) return;
+
+  if (!data.events || !data.events.length) {
+    container.innerHTML = `
+      <div class="empty-timeline">
+        <p>No historical decisions found matching "<strong>${escapeHtml(data.topic)}</strong>".</p>
+        <button type="button" class="btn-outline btn-sm" onclick="loadTimelineForTopic('all')">View All Historical Milestones</button>
+      </div>
+    `;
+    return;
+  }
+
+  const eventsHtml = data.events
+    .map((evt, idx) => {
+      const attendeesHtml = (evt.speakers || []).length
+        ? `<div class="timeline-attendees">👥 ${evt.speakers.map((s) => `<span class="chip">${escapeHtml(s)}</span>`).join(" ")}</div>`
+        : "";
+
+      const decisionsList = (evt.decisions || [])
+        .map((d) => `<li>${escapeHtml(d)}</li>`)
+        .join("");
+
+      return `
+        <div class="timeline-node">
+          <div class="timeline-marker">
+            <span class="timeline-dot"></span>
+            <span class="timeline-num">#${idx + 1}</span>
+          </div>
+          <div class="timeline-card">
+            <div class="timeline-card-header">
+              <span class="timeline-date">📅 ${escapeHtml(evt.date)} · ${escapeHtml(evt.time || "")}</span>
+              <button type="button" class="btn-link" onclick="jumpToMeeting('${evt.meeting_id}')">↗ View Full Brief</button>
+            </div>
+            <h4 class="timeline-title">${escapeHtml(evt.title)}</h4>
+            <div class="timeline-headline">📌 <strong>${escapeHtml(evt.headline)}</strong></div>
+            ${decisionsList ? `<ul class="timeline-decisions">${decisionsList}</ul>` : ""}
+            ${attendeesHtml}
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+
+  container.innerHTML = `
+    <div class="timeline-summary-bar">
+      <span>Showing <strong>${data.total_milestones}</strong> chronological milestone${data.total_milestones > 1 ? "s" : ""} for "<strong>${escapeHtml(data.topic)}</strong>"</span>
+    </div>
+    <div class="timeline-track">${eventsHtml}</div>
+  `;
+}
+
+function jumpToMeeting(meetingId) {
+  // Switch to library tab
+  const libBtn = document.querySelector('[data-tab="tab-ledger"]');
+  if (libBtn) libBtn.click();
+  selectMeeting(meetingId);
+}
+
+// ── Application Initialization ───────────────────────────────────────
+function init() {
+  setupTabs();
+  setupEventListeners();
+  loadOverview();
+  loadMeetings();
+  loadPeople();
+  loadVoiceClusters();
+
+  // Poll status periodically
+  setInterval(() => {
+    loadPipelineStatus();
+    loadOverview();
+  }, 10000);
+}
+
+document.addEventListener("DOMContentLoaded", init);
+
+
 function formatShortDate(dateStr) {
   if (!dateStr) return "—";
   const parts = dateStr.split("-");

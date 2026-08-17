@@ -1199,3 +1199,350 @@ footer {
   background: var(--panel);
 }
 
+/* ── Zero-Touch Voice Identification Cards (PR #4) ──────────────────── */
+.voice-review-banner {
+  margin-bottom: 24px;
+  background: linear-gradient(135deg, rgba(48, 76, 59, 0.08), rgba(191, 87, 61, 0.08));
+  border: 1px solid var(--moss);
+  border-radius: 8px;
+  padding: 18px 20px;
+}
+
+.voice-banner-header h3 {
+  margin: 0 0 4px;
+  font-size: 1.15rem;
+  color: var(--moss-dark);
+}
+
+.voice-banner-header p {
+  margin: 0 0 16px;
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+
+.voice-cards-scroll,
+.voice-cards-deck {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 16px;
+}
+
+.voice-card {
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.03);
+}
+
+.voice-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 12px;
+}
+
+.voice-card-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.voice-icon {
+  font-size: 1.5rem;
+  padding: 6px;
+  background: var(--moss-soft);
+  border-radius: 6px;
+}
+
+.voice-meta {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin: 2px 0 0;
+}
+
+.voice-match-text {
+  font-size: 0.95rem;
+  margin: 0 0 10px;
+  color: var(--ink);
+}
+
+.similarity-pill {
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 700;
+  padding: 2px 6px;
+  background: var(--moss-soft);
+  color: var(--moss-dark);
+  border-radius: 4px;
+  margin-left: 4px;
+}
+
+.voice-members {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 14px;
+}
+
+.voice-member-chip {
+  font-size: 0.78rem;
+  color: var(--muted);
+  background: var(--panel);
+  padding: 3px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--rule);
+}
+
+.voice-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--rule);
+}
+
+/* ── Ask Mode Switcher ──────────────────────────────────────────────── */
+.ask-mode-switcher {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 24px;
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 12px;
+}
+
+.mode-btn {
+  padding: 8px 18px;
+  font-size: 0.92rem;
+  font-weight: 600;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.mode-btn:hover {
+  background: var(--paper);
+  color: var(--ink);
+}
+
+.mode-btn.active {
+  background: var(--moss);
+  color: #fff;
+  border-color: var(--moss);
+}
+
+/* ── Decision Evolution Timeline ────────────────────────────────────── */
+.timeline-room {
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 28px;
+}
+
+.timeline-header h2 {
+  font-size: 1.55rem;
+  margin: 4px 0 8px;
+  color: var(--ink);
+}
+
+.timeline-quick-pills {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 16px 0 20px;
+}
+
+.quick-pill-label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--muted);
+  margin-right: 4px;
+}
+
+.quick-pill {
+  padding: 5px 12px;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 14px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--ink);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.quick-pill:hover {
+  background: var(--moss-soft);
+  border-color: var(--moss);
+  color: var(--moss-dark);
+}
+
+.timeline-search-form {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 28px;
+}
+
+.timeline-search-form input {
+  flex: 1;
+  padding: 10px 14px;
+  font-size: 0.95rem;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--panel);
+}
+
+.timeline-summary-bar {
+  padding: 10px 14px;
+  background: var(--panel);
+  border-radius: 6px;
+  font-size: 0.88rem;
+  color: var(--muted);
+  margin-bottom: 24px;
+  border-left: 3px solid var(--moss);
+}
+
+.timeline-track {
+  position: relative;
+  padding-left: 32px;
+}
+
+.timeline-track::before {
+  content: "";
+  position: absolute;
+  left: 11px;
+  top: 10px;
+  bottom: 10px;
+  width: 2px;
+  background: var(--rule);
+}
+
+.timeline-node {
+  position: relative;
+  margin-bottom: 28px;
+}
+
+.timeline-node:last-child {
+  margin-bottom: 0;
+}
+
+.timeline-marker {
+  position: absolute;
+  left: -32px;
+  top: 14px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.timeline-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--moss);
+  border: 3px solid var(--paper);
+  box-shadow: 0 0 0 2px var(--moss);
+}
+
+.timeline-num {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.timeline-card {
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 18px 20px;
+  transition: transform 0.15s, border-color 0.15s;
+}
+
+.timeline-card:hover {
+  border-color: var(--moss);
+  transform: translateX(2px);
+}
+
+.timeline-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.timeline-date {
+  font-size: 0.84rem;
+  font-weight: 700;
+  color: var(--moss-dark);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.btn-link {
+  background: none;
+  border: none;
+  color: var(--clay);
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0;
+}
+
+.btn-link:hover {
+  text-decoration: underline;
+}
+
+.timeline-title {
+  font-size: 1.15rem;
+  margin: 0 0 8px;
+  color: var(--ink);
+}
+
+.timeline-headline {
+  font-size: 0.98rem;
+  color: var(--ink);
+  margin-bottom: 10px;
+  padding-left: 10px;
+  border-left: 2px solid var(--clay);
+}
+
+.timeline-decisions {
+  margin: 8px 0 12px 18px;
+  padding: 0;
+  font-size: 0.9rem;
+  color: var(--ink);
+  line-height: 1.55;
+}
+
+.timeline-decisions li {
+  margin-bottom: 4px;
+}
+
+.timeline-attendees {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--rule);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.empty-timeline {
+  text-align: center;
+  padding: 40px 20px;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+

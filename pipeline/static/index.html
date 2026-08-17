@@ -78,6 +78,9 @@
 
       <!-- TAB 1: MEETING LIBRARY (Reader & Archive) -->
       <section id="tab-ledger" class="tab-pane active" role="tabpanel">
+        <!-- Zero-Touch Voice Identification Review Banner -->
+        <div id="voice-review-banner" class="voice-review-banner" style="display: none;"></div>
+
         <div class="archive-heading">
           <div>
             <p class="eyebrow">THE ARCHIVE</p>
@@ -115,6 +118,13 @@
             <h2>People You Meet With</h2>
           </div>
           <p class="pane-subtitle">Manage recognized contacts and nicknames so the AI accurately attributes commitments to real people.</p>
+        </div>
+
+        <!-- Voice Enrollment Review Queue in People Tab -->
+        <div id="voice-review-people-section" class="section-card" style="margin-bottom: 24px; display: none;">
+          <h3>🎙️ Unrecognized Voices to Review</h3>
+          <p class="card-desc">Recurring voices detected across meetings that need your confirmation.</p>
+          <div id="voice-review-people-list" class="voice-cards-deck"></div>
         </div>
 
         <div class="grid-2col">
@@ -205,9 +215,15 @@
         </div>
       </section>
 
-      <!-- TAB 3: ASK AI ASSISTANT -->
+      <!-- TAB 3: ASK AI ASSISTANT & DECISION TIMELINES -->
       <section id="tab-ask" class="tab-pane" role="tabpanel">
-        <section class="question-room" aria-labelledby="ask-title">
+        <div class="ask-mode-switcher">
+          <button type="button" class="mode-btn active" id="mode-btn-qa" onclick="switchAskMode('qa')">💬 Ask a Question</button>
+          <button type="button" class="mode-btn" id="mode-btn-timeline" onclick="switchAskMode('timeline')">📈 Decision Timeline</button>
+        </div>
+
+        <!-- Mode A: Q&A -->
+        <section id="ask-qa-panel" class="question-room" aria-labelledby="ask-title">
           <div>
             <p class="eyebrow">CONVERSATIONAL MEETING RECALL</p>
             <h2 id="ask-title">What did we decide?</h2>
@@ -228,6 +244,35 @@
           <article id="answer" class="answer empty" aria-live="polite">
             <p>Type a question above to get an instant answer with citations from your recorded meetings.</p>
           </article>
+        </section>
+
+        <!-- Mode B: Decision Timeline -->
+        <section id="ask-timeline-panel" class="timeline-room" style="display: none;">
+          <div class="timeline-header">
+            <div>
+              <p class="eyebrow">KNOWLEDGE GRAPH CHRONOLOGY</p>
+              <h2>Decision Evolution Timeline</h2>
+              <p class="rag-desc">Track how budgets, property plans, agreements, and contracts evolved over time across all your recordings.</p>
+            </div>
+            <div class="timeline-quick-pills">
+              <span class="quick-pill-label">Suggested topics:</span>
+              <button type="button" class="quick-pill" onclick="loadTimelineForTopic('157 Blacklock')">🏢 157 Blacklock</button>
+              <button type="button" class="quick-pill" onclick="loadTimelineForTopic('Budget')">💰 Budget &amp; Estimates</button>
+              <button type="button" class="quick-pill" onclick="loadTimelineForTopic('Contractor')">🔨 Contractor &amp; Repairs</button>
+              <button type="button" class="quick-pill" onclick="loadTimelineForTopic('all')">📜 All Milestones</button>
+            </div>
+          </div>
+
+          <form id="timeline-form" class="timeline-search-form" onsubmit="event.preventDefault(); loadTimelineForTopic($('timeline-topic-input').value);">
+            <input type="text" id="timeline-topic-input" placeholder="Enter any project, property, or topic (e.g. Cambridge lease, Roof estimate)..." />
+            <button type="submit" class="btn-action">Generate Timeline</button>
+          </form>
+
+          <div id="timeline-results" class="timeline-results-container" aria-live="polite">
+            <div class="empty-timeline">
+              <p>Click a suggested topic above or type a search to see chronological decision progression.</p>
+            </div>
+          </div>
         </section>
       </section>
 
