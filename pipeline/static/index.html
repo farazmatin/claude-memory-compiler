@@ -4,60 +4,91 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light" />
-    <title>Meeting Memory</title>
+    <title>Meeting Memory — Control Room & Archive</title>
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
     <main class="shell">
+      <!-- Masthead -->
       <header class="masthead">
         <div>
-          <p class="eyebrow">PRIVATE MEETING ARCHIVE</p>
+          <p class="eyebrow">PRIVATE ARCHIVE &amp; KNOWLEDGE SYSTEM</p>
           <h1>Meeting<br /><em>Memory</em></h1>
         </div>
-        <div class="masthead-note">
-          <span class="live-dot" aria-hidden="true"></span>
-          <span id="rag-health">Checking local index…</span>
-          <p>Minutes are the record.<br />Audio stays in Drive.</p>
+        <div class="masthead-controls">
+          <div class="pipeline-badge" id="pipeline-indicator">
+            <span class="badge-dot" id="badge-dot"></span>
+            <span id="pipeline-status-text">Pipeline Idle</span>
+          </div>
+          <div class="masthead-actions">
+            <button type="button" id="btn-quick-run" class="btn-action">▶ Run Pipeline</button>
+            <button type="button" id="btn-refresh" class="btn-outline" title="Refresh data">↻</button>
+          </div>
+          <div class="masthead-note">
+            <span class="live-dot" aria-hidden="true"></span>
+            <span id="rag-health">Checking local index…</span>
+            <p>Local loopback · Encrypted &amp; private</p>
+          </div>
         </div>
       </header>
 
-      <section class="signal-strip" aria-label="Archive status">
-        <article><strong id="meeting-count">—</strong><span>meetings held</span></article>
-        <article><strong id="indexed-count">—</strong><span>ready to search</span></article>
-        <article><strong id="review-count">—</strong><span>speaker checks</span></article>
-        <article><strong id="failed-count">—</strong><span>needs attention</span></article>
-      </section>
-
-      <section class="question-room" aria-labelledby="ask-title">
-        <div>
-          <p class="eyebrow">ASK THE RECORD</p>
-          <h2 id="ask-title">What did we decide?</h2>
-        </div>
-        <form id="query-form">
-          <label class="sr-only" for="question">Question about the meeting archive</label>
-          <textarea id="question" rows="2" placeholder="e.g. Why did we choose the Drive capture approach?"></textarea>
-          <div class="query-actions">
-            <select id="query-mode" aria-label="Search depth">
-              <option value="hybrid">Focused answer</option>
-              <option value="global">Across all meetings</option>
-              <option value="local">One topic or person</option>
-            </select>
-            <button type="submit">Ask archive <span aria-hidden="true">↗</span></button>
-          </div>
-        </form>
-        <article id="answer" class="answer empty" aria-live="polite">
-          <p>Ask a question to retrieve the relevant meeting record, then have the answer written from that evidence.</p>
+      <!-- Global Signal Strip -->
+      <section class="signal-strip" aria-label="Archive telemetry">
+        <article>
+          <strong id="metric-meetings">—</strong>
+          <span>Total Meetings</span>
+        </article>
+        <article>
+          <strong id="metric-indexed">—</strong>
+          <span>Ready in Graph</span>
+        </article>
+        <article>
+          <strong id="metric-yesterday">—</strong>
+          <span>Processed Yesterday</span>
+        </article>
+        <article>
+          <strong id="metric-today">—</strong>
+          <span>Processed Today</span>
+        </article>
+        <article>
+          <strong id="metric-hours">—</strong>
+          <span>Audio Recorded</span>
+        </article>
+        <article>
+          <strong id="metric-attention">—</strong>
+          <span>Needs Attention</span>
         </article>
       </section>
 
-      <section class="archive" aria-labelledby="archive-title">
+      <!-- Main Navigation Tabs -->
+      <nav class="nav-tabs" role="tablist">
+        <button type="button" class="tab-btn active" data-tab="tab-ledger" role="tab" aria-selected="true">The Ledger</button>
+        <button type="button" class="tab-btn" data-tab="tab-control" role="tab" aria-selected="false">Control Room &amp; Operations</button>
+        <button type="button" class="tab-btn" data-tab="tab-knowledge" role="tab" aria-selected="false">Knowledge &amp; People</button>
+        <button type="button" class="tab-btn" data-tab="tab-ask" role="tab" aria-selected="false">Ask the Record</button>
+      </nav>
+
+      <!-- TAB 1: THE LEDGER (Archive & Reader) -->
+      <section id="tab-ledger" class="tab-pane active" role="tabpanel">
         <div class="archive-heading">
           <div>
-            <p class="eyebrow">THE LEDGER</p>
-            <h2 id="archive-title">Meetings, not fragments.</h2>
+            <p class="eyebrow">THE ARCHIVE</p>
+            <h2>Meetings, not fragments.</h2>
           </div>
-          <label class="search"><span aria-hidden="true">⌕</span><input id="meeting-search" type="search" placeholder="Filter by title or date" /></label>
+          <div class="archive-filters">
+            <label class="search">
+              <span aria-hidden="true">⌕</span>
+              <input id="meeting-search" type="search" placeholder="Search title, date, or source..." />
+            </label>
+            <select id="meeting-filter-status" aria-label="Filter status">
+              <option value="all">All statuses</option>
+              <option value="ready">Ready (Indexed)</option>
+              <option value="review">Needs speaker check</option>
+              <option value="failed">Failed / Attention</option>
+            </select>
+          </div>
         </div>
+
         <div class="archive-layout">
           <div id="meeting-list" class="meeting-list" aria-live="polite"></div>
           <article id="meeting-reader" class="meeting-reader">
@@ -68,7 +99,441 @@
         </div>
       </section>
 
-      <footer>Local-only dashboard · Read-only view of your private archive</footer>
+      <!-- TAB 2: CONTROL ROOM & OPERATIONS -->
+      <section id="tab-control" class="tab-pane" role="tabpanel">
+        <div class="pane-header">
+          <div>
+            <p class="eyebrow">OPERATIONS &amp; COMPUTATION</p>
+            <h2>Pipeline Control Room</h2>
+          </div>
+          <p class="pane-subtitle">Trigger stages, monitor execution times, and inspect batch runs.</p>
+        </div>
+
+        <!-- Stage Trigger Action Bar -->
+        <div class="control-panel">
+          <div class="control-panel-header">
+            <h3>Stage Orchestrator</h3>
+            <span class="control-note">Runs asynchronously in background thread</span>
+          </div>
+          <div class="action-grid">
+            <button type="button" class="btn-stage btn-stage-primary" onclick="runStage('all')">
+              <strong>▶ Run All Stages</strong>
+              <span>Capture → Ingest → Transcribe → Speakers → Minutes → Index</span>
+            </button>
+            <button type="button" class="btn-stage" onclick="runStage('capture')">
+              <strong>Drive Capture</strong>
+              <span>Download approved audio</span>
+            </button>
+            <button type="button" class="btn-stage" onclick="runStage('ingest')">
+              <strong>Ingest Inbox</strong>
+              <span>Hash dedup &amp; discovery</span>
+            </button>
+            <button type="button" class="btn-stage" onclick="runStage('transcribe')">
+              <strong>Transcribe (ASR)</strong>
+              <span>WhisperX + Diarization</span>
+            </button>
+            <button type="button" class="btn-stage" onclick="runStage('speakers')">
+              <strong>Resolve Speakers</strong>
+              <span>LLM speaker attribution</span>
+            </button>
+            <button type="button" class="btn-stage" onclick="runStage('minutes')">
+              <strong>Compile Minutes</strong>
+              <span>LLM minutes synthesis</span>
+            </button>
+            <button type="button" class="btn-stage" onclick="runStage('index')">
+              <strong>Index Graph</strong>
+              <span>LightRAG Knowledge Graph</span>
+            </button>
+            <button type="button" class="btn-stage btn-stage-warn" onclick="retryAllFailed()">
+              <strong>Retry Failed</strong>
+              <span>Requeue failed meetings</span>
+            </button>
+            <button type="button" class="btn-stage btn-stage-secondary" onclick="recompileStale()">
+              <strong>Recompile Stale</strong>
+              <span>Rebuild on current template</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Live Streaming Terminal Console -->
+        <div class="terminal-card">
+          <div class="terminal-header">
+            <span class="terminal-title">TERMINAL LOGS</span>
+            <div class="terminal-actions">
+              <span id="terminal-pulse" class="terminal-dot"></span>
+              <button type="button" class="btn-terminal-clear" onclick="clearTerminalLogs()">Clear Logs</button>
+            </div>
+          </div>
+          <pre id="terminal-body" class="terminal-body">Waiting for pipeline operations...</pre>
+        </div>
+
+        <!-- Queue Funnel Ladder -->
+        <div class="section-card">
+          <h3>Processing Funnel &amp; Queue</h3>
+          <div class="funnel-grid" id="funnel-container">
+            <div class="funnel-step">
+              <span class="funnel-label">Drive Sync</span>
+              <strong id="funnel-drive" class="funnel-val">—</strong>
+              <span class="funnel-sub">captured audio</span>
+            </div>
+            <div class="funnel-arrow">→</div>
+            <div class="funnel-step">
+              <span class="funnel-label">Discovered</span>
+              <strong id="funnel-discovered" class="funnel-val">—</strong>
+              <span class="funnel-sub">waiting ASR</span>
+            </div>
+            <div class="funnel-arrow">→</div>
+            <div class="funnel-step">
+              <span class="funnel-label">Transcribed</span>
+              <strong id="funnel-transcribed" class="funnel-val">—</strong>
+              <span class="funnel-sub">waiting speakers</span>
+            </div>
+            <div class="funnel-arrow">→</div>
+            <div class="funnel-step">
+              <span class="funnel-label">Resolved</span>
+              <strong id="funnel-resolved" class="funnel-val">—</strong>
+              <span class="funnel-sub">waiting minutes</span>
+            </div>
+            <div class="funnel-arrow">→</div>
+            <div class="funnel-step">
+              <span class="funnel-label">Compiled</span>
+              <strong id="funnel-compiled" class="funnel-val">—</strong>
+              <span class="funnel-sub">waiting index</span>
+            </div>
+            <div class="funnel-arrow">→</div>
+            <div class="funnel-step highlight">
+              <span class="funnel-label">Indexed</span>
+              <strong id="funnel-indexed" class="funnel-val">—</strong>
+              <span class="funnel-sub">searchable in graph</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Throughput Velocity & Stage Timings -->
+        <div class="grid-2col">
+          <div class="section-card">
+            <h3>Throughput Velocity</h3>
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Period</th>
+                  <th>Meetings</th>
+                  <th>Audio Minutes</th>
+                  <th>Audio Hours</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>Today</strong></td>
+                  <td id="vel-today-count">—</td>
+                  <td id="vel-today-min">—</td>
+                  <td id="vel-today-hrs">—</td>
+                </tr>
+                <tr>
+                  <td><strong>Yesterday</strong></td>
+                  <td id="vel-yesterday-count">—</td>
+                  <td id="vel-yesterday-min">—</td>
+                  <td id="vel-yesterday-hrs">—</td>
+                </tr>
+                <tr>
+                  <td><strong>Last 7 Days</strong></td>
+                  <td id="vel-week-count">—</td>
+                  <td id="vel-week-min">—</td>
+                  <td id="vel-week-hrs">—</td>
+                </tr>
+                <tr>
+                  <td><strong>Corpus Total</strong></td>
+                  <td id="vel-total-count">—</td>
+                  <td id="vel-total-min">—</td>
+                  <td id="vel-total-hrs">—</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="section-card">
+            <h3>Stage Wall-Clock Benchmarks</h3>
+            <table class="data-table" id="timings-table">
+              <thead>
+                <tr>
+                  <th>Stage</th>
+                  <th>Runs</th>
+                  <th>Success</th>
+                  <th>Avg Time</th>
+                  <th>Max Time</th>
+                </tr>
+              </thead>
+              <tbody id="timings-tbody">
+                <tr><td colspan="5" class="empty-cell">Loading timing telemetry...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 3: KNOWLEDGE & PEOPLE REGISTRY -->
+      <section id="tab-knowledge" class="tab-pane" role="tabpanel">
+        <div class="pane-header">
+          <div>
+            <p class="eyebrow">GRAPH ENTITIES &amp; STAKEHOLDERS</p>
+            <h2>People &amp; Knowledge Graph</h2>
+          </div>
+          <p class="pane-subtitle">Manage canonical people aliases, resolve speaker identities, and inspect top graph entities.</p>
+        </div>
+
+        <div class="grid-2col">
+          <!-- People Manager -->
+          <div class="section-card">
+            <h3>Canonical People Registry</h3>
+            <p class="card-desc">Normalizes speaker identities to eliminate disconnected graph nodes.</p>
+
+            <form id="form-add-person" class="inline-form">
+              <input type="text" id="person-canonical" placeholder="Canonical Name (e.g. Christine)" required />
+              <input type="text" id="person-role" placeholder="Role (e.g. Stakeholder / PM)" />
+              <input type="text" id="person-aliases" placeholder="Aliases (comma-separated)" />
+              <button type="submit" class="btn-action">Add / Update Person</button>
+            </form>
+
+            <div class="table-scroll">
+              <table class="data-table" id="people-table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Role</th>
+                    <th>Meetings</th>
+                    <th>Aliases</th>
+                  </tr>
+                </thead>
+                <tbody id="people-tbody">
+                  <tr><td colspan="4" class="empty-cell">Loading people registry...</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="merge-box">
+              <h4>Merge People &amp; Aliases</h4>
+              <p class="card-desc">Folds one name into another and rewrites historical speakers, entities, and relations.</p>
+              <form id="form-merge-person" class="merge-form">
+                <input type="text" id="merge-from" placeholder="From Name (e.g. Mike)" required />
+                <span>→</span>
+                <input type="text" id="merge-into" placeholder="Into Canonical (e.g. Michael)" required />
+                <button type="submit" class="btn-outline">Merge &amp; Rewrite</button>
+              </form>
+            </div>
+          </div>
+
+          <!-- Knowledge Graph & Drive Stats -->
+          <div class="knowledge-column">
+            <div class="section-card">
+              <h3>Top Knowledge Graph Entities</h3>
+              <p class="card-desc">Most frequent systems, features, customers, and people across compiled minutes.</p>
+              <div class="table-scroll">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Entity</th>
+                      <th>Kind</th>
+                      <th>Meetings</th>
+                    </tr>
+                  </thead>
+                  <tbody id="entities-tbody">
+                    <tr><td colspan="3" class="empty-cell">Loading entities...</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="section-card">
+              <h3>Google Drive Cloud Archive</h3>
+              <p class="card-desc">Remote audio sources tracked and downloaded into the pipeline.</p>
+              <div class="drive-stats-grid">
+                <div class="stat-pill">
+                  <span>Total Files</span>
+                  <strong id="drive-stat-files">—</strong>
+                </div>
+                <div class="stat-pill">
+                  <span>Total Storage</span>
+                  <strong id="drive-stat-bytes">—</strong>
+                </div>
+                <div class="stat-pill">
+                  <span>Ingested</span>
+                  <strong id="drive-stat-ingested">—</strong>
+                </div>
+                <div class="stat-pill">
+                  <span>Staged / Excluded</span>
+                  <strong id="drive-stat-other">—</strong>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 4: ASK THE RECORD (RAG Room) -->
+      <section id="tab-ask" class="tab-pane" role="tabpanel">
+        <section class="question-room" aria-labelledby="ask-title">
+          <div>
+            <p class="eyebrow">HYBRID GRAPH + VECTOR RAG</p>
+            <h2 id="ask-title">What did we decide?</h2>
+            <p class="rag-desc">Ask questions across your entire multi-year archive with full decision citations and rationale.</p>
+          </div>
+          <form id="query-form">
+            <label class="sr-only" for="question">Question about the meeting archive</label>
+            <textarea id="question" rows="3" placeholder="e.g. Why did we choose the Drive capture approach over direct API integration?"></textarea>
+            <div class="query-actions">
+              <select id="query-mode" aria-label="Search depth">
+                <option value="hybrid">Focused answer (hybrid graph + vector)</option>
+                <option value="global">Across all meetings (global synthesis)</option>
+                <option value="local">One topic or person (local neighborhood)</option>
+              </select>
+              <button type="submit">Ask archive <span aria-hidden="true">↗</span></button>
+            </div>
+          </form>
+          <article id="answer" class="answer empty" aria-live="polite">
+            <p>Ask a question to retrieve the relevant meeting record, then have the answer written from that evidence.</p>
+          </article>
+        </section>
+      </section>
+
+      <!-- Speaker Edit Modal -->
+      <dialog id="speaker-modal" class="custom-modal">
+        <form method="dialog" id="speaker-form" class="modal-card">
+          <h3>Resolve Speaker Identity</h3>
+          <p id="speaker-modal-sub" class="card-desc">Assign a canonical name to this speaker label.</p>
+          <input type="hidden" id="modal-meeting-id" />
+          <input type="hidden" id="modal-speaker-label" />
+          
+          <label for="modal-speaker-name">Real Person Name</label>
+          <input type="text" id="modal-speaker-name" list="canonical-suggestions" placeholder="e.g. Paul" required />
+          <datalist id="canonical-suggestions"></datalist>
+
+          <div class="modal-actions">
+            <button type="button" class="btn-outline" onclick="closeSpeakerModal()">Cancel</button>
+            <button type="submit" class="btn-action">Save Speaker</button>
+          </div>
+        </form>
+      </dialog>
+
+      <!-- API Explorer & Quick Links -->
+      <section class="api-explorer" id="api-explorer">
+        <div class="pane-header">
+          <div>
+            <p class="eyebrow">DEVELOPER &amp; DIAGNOSTICS</p>
+            <h2>API Explorer &amp; Quick Links</h2>
+          </div>
+          <p class="pane-subtitle">All endpoints are navigable. Click any link to inspect the raw JSON response.</p>
+        </div>
+
+        <div class="grid-2col">
+          <div class="section-card">
+            <h3>GET Endpoints (Read)</h3>
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Endpoint</th>
+                  <th>Description</th>
+                  <th>Link</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>/api/overview</code></td>
+                  <td>Full dashboard metrics, queue, timings, graph stats, drive telemetry</td>
+                  <td><a href="/api/overview" target="_blank" rel="noopener" class="api-link">Open ↗</a></td>
+                </tr>
+                <tr>
+                  <td><code>/api/meetings</code></td>
+                  <td>Meeting library with search (<code>?search=term</code>)</td>
+                  <td><a href="/api/meetings" target="_blank" rel="noopener" class="api-link">Open ↗</a></td>
+                </tr>
+                <tr>
+                  <td><code>/api/people</code></td>
+                  <td>Canonical people registry with aliases and meeting counts</td>
+                  <td><a href="/api/people" target="_blank" rel="noopener" class="api-link">Open ↗</a></td>
+                </tr>
+                <tr>
+                  <td><code>/api/pipeline/status</code></td>
+                  <td>Background pipeline execution state and streaming logs</td>
+                  <td><a href="/api/pipeline/status" target="_blank" rel="noopener" class="api-link">Open ↗</a></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="section-card">
+            <h3>POST Endpoints (Write/Action)</h3>
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Endpoint</th>
+                  <th>Description</th>
+                  <th>Access</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>/api/query</code></td>
+                  <td>RAG search — <code>{"question": "...", "mode": "hybrid"}</code></td>
+                  <td><span class="chip">Ask the Record tab</span></td>
+                </tr>
+                <tr>
+                  <td><code>/api/pipeline/run</code></td>
+                  <td>Trigger stage — <code>{"stage": "all"}</code></td>
+                  <td><span class="chip">Control Room tab</span></td>
+                </tr>
+                <tr>
+                  <td><code>/api/pipeline/retry</code></td>
+                  <td>Requeue failed meetings</td>
+                  <td><span class="chip">Control Room tab</span></td>
+                </tr>
+                <tr>
+                  <td><code>/api/pipeline/recompile</code></td>
+                  <td>Rebuild minutes on current template</td>
+                  <td><span class="chip">Control Room tab</span></td>
+                </tr>
+                <tr>
+                  <td><code>/api/people</code></td>
+                  <td>Add person — <code>{"canonical": "...", "aliases": [...]}</code></td>
+                  <td><span class="chip">Knowledge tab</span></td>
+                </tr>
+                <tr>
+                  <td><code>/api/people/merge</code></td>
+                  <td>Merge names — <code>{"from_name": "...", "into": "..."}</code></td>
+                  <td><span class="chip">Knowledge tab</span></td>
+                </tr>
+                <tr>
+                  <td><code>/api/meetings/{id}/speakers</code></td>
+                  <td>Set speaker — <code>{"label": "...", "name": "..."}</code></td>
+                  <td><span class="chip">Ledger tab</span></td>
+                </tr>
+                <tr>
+                  <td><code>/api/meetings/{id}/retry</code></td>
+                  <td>Retry a specific failed meeting</td>
+                  <td><span class="chip">Ledger tab</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Quick Jump Navigator -->
+        <div class="quick-jump">
+          <span class="quick-jump-label">Quick Jump:</span>
+          <button type="button" class="quick-jump-btn" onclick="jumpToTab('tab-ledger')">The Ledger</button>
+          <button type="button" class="quick-jump-btn" onclick="jumpToTab('tab-control')">Control Room</button>
+          <button type="button" class="quick-jump-btn" onclick="jumpToTab('tab-knowledge')">Knowledge &amp; People</button>
+          <button type="button" class="quick-jump-btn" onclick="jumpToTab('tab-ask')">Ask the Record</button>
+          <a href="/api/overview" target="_blank" rel="noopener" class="quick-jump-btn api-jump">API: Overview</a>
+          <a href="/api/meetings" target="_blank" rel="noopener" class="quick-jump-btn api-jump">API: Meetings</a>
+          <a href="/api/people" target="_blank" rel="noopener" class="quick-jump-btn api-jump">API: People</a>
+          <a href="/api/pipeline/status" target="_blank" rel="noopener" class="quick-jump-btn api-jump">API: Pipeline</a>
+        </div>
+      </section>
+
+      <!-- Toast Notifications Container -->
+      <div id="toast-container" class="toast-container"></div>
+
+      <footer>Local-only dashboard · All endpoints navigable from this page · Encrypted &amp; private</footer>
     </main>
     <script src="app.js"></script>
   </body>
