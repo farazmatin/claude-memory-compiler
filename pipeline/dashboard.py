@@ -9,7 +9,7 @@ import mimetypes
 import threading
 import webbrowser
 from collections import deque
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
