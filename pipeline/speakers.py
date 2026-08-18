@@ -90,44 +90,38 @@ def speaking_time(transcript: Transcript) -> dict[str, float]:
 def candidates_from_filename(
     transcript: Transcript, title_hint: str | None, owner_name: str | None
 ) -> list[str]:
-    """Likely attendee names for a two-speaker meeting, WITHOUT assigning labels.
-
-    "Ali Aug 10 at 11-12 a.m." in a two-speaker recording tells us the attendees
-    are probably {owner, Ali}. It does NOT tell us which diarization label is which.
-
-    An earlier version assumed the dominant speaker was the recorder. That is wrong
-    for a large share of a PM's calendar - in a stakeholder interview, a user
-    research session, or a demo, the other person talks more - and it produced
-    confidently reversed names, silently assigning action items to the wrong
-    person. It also contradicted this module's own rule against guessing.
-
-    The mapping decision therefore goes to the LLM, which can read who introduces
-    themselves and who is addressed by name. This only supplies candidates.
-    """
-    labels = transcript.speaker_labels
-    if len(labels) != 2:
-        return []
-
+    """Likely attendee names from the filename, title hint, or owner."""
     names: list[str] = []
     if owner_name and owner_name.strip():
         names.append(owner_name.strip())
 
+    import re
     hint = (title_hint or "").strip()
-    # Multi-word hints are usually subjects ("roadmap review"), not people.
-    if hint and len(hint.split()) <= 2:
-        names.append(hint)
+    # Extract common first names or capitalized tokens from title hint
+    for word in re.findall(r"\b[A-Z][a-z]+\b", hint):
+        if word.lower() not in {
+            "aug", "standup", "recording", "meeting", "sync", "call", "review", "planning",
+            "top", "pillar", "rehearsal", "architecture", "delivery", "roadmap", "decision", "team"
+        }:
+            if word not in names:
+                names.append(word)
 
     return names
 
 
 # ── LLM resolution ────────────────────────────────────────────────────
 
-def opening_excerpt(transcript: Transcript, window_sec: float = INTRO_WINDOW_SEC) -> str:
-    """Labeled dialogue from the start of the meeting."""
+def dialogue_excerpt(transcript: Transcript, max_lines: int = 100) -> str:
+    """Representative labeled dialogue across the meeting."""
+    segs = transcript.segments
+    if len(segs) <= max_lines:
+        chosen = segs
+    else:
+        # Sample opening, middle, and closing turns
+        mid = len(segs) // 2
+        chosen = segs[:50] + segs[max(0, mid - 15) : min(len(segs), mid + 15)] + segs[-20:]
     lines: list[str] = []
-    for seg in transcript.segments:
-        if seg.start > window_sec:
-            break
+    for seg in chosen:
         who = seg.speaker or "UNKNOWN"
         lines.append(f"[{format_timestamp(seg.start)}] {who}: {seg.text}")
     return "\n".join(lines)
@@ -145,8 +139,8 @@ def build_resolution_prompt(
     likely = ", ".join(candidates) if candidates else "(none)"
     return f"""You are identifying speakers in a meeting transcript.
 
-The diarization system assigned anonymous labels. Your job is to map each label
-to a real person's name, using ONLY evidence in the transcript.
+The diarization system assigned anonymous labels ({", ".join(labels)}).
+Your job is to map each label to a real person's name, using evidence in the transcript.
 
 ## Labels to resolve
 {", ".join(labels)}
@@ -154,33 +148,24 @@ to a real person's name, using ONLY evidence in the transcript.
 ## Filename hint
 {hint}
 
-## Likely attendees
-Derived from the filename and configuration. These are probably the two people
-in the room, but which label is which is NOT known - decide that from the
-transcript, or return null.
+## Likely attendees / candidates
 {likely}
 
 ## Names seen in previous meetings
-Prefer these exact spellings when a speaker is one of these people. Inconsistent
-spellings fragment the knowledge graph, so "Mike" and "Michael" must not both
-appear for the same person.
 {known}
 
-## Opening of the transcript
-{opening_excerpt(transcript)}
+## Representative Dialogue
+{dialogue_excerpt(transcript)}
 
 ## Rules
-- Use a name only when the transcript supports it: someone introduces
-  themselves, is addressed by name, or is clearly referred to.
-- If you cannot determine a label's name, output `null` for it. An honest null is
-  far better than a guess - a wrong name silently misassigns action items.
-- Do not invent names. Do not infer a name from the filename hint alone unless
-  the transcript corroborates it.
+- Use a name only when the transcript supports it: someone introduces themselves, is addressed by name ("Hi Paul", "Christine, what do you think?"), or is clearly identifiable from context.
+- If you cannot determine a label's name with confidence, output `null` for it. An honest null is far better than a guess.
+- Do not invent names.
 
 ## Output
-Return ONLY a JSON object mapping every label to a name or null. No prose.
-
-{{"SPEAKER_00": "Faraz", "SPEAKER_01": null}}"""
+Return ONLY a valid JSON object mapping every label to a name string or null. No other text.
+Example:
+{{"SPEAKER_00": "Faraz", "SPEAKER_01": "Paul", "SPEAKER_02": null}}"""
 
 
 def resolve_with_llm(
@@ -203,7 +188,12 @@ def resolve_with_llm(
         return {}
 
     try:
-        parsed = json.loads(extract_fenced_block(raw, "json"))
+        block = extract_fenced_block(raw, "json") or extract_fenced_block(raw) or raw.strip()
+        s = block.find("{")
+        e = block.rfind("}")
+        if s != -1 and e != -1 and e > s:
+            block = block[s : e + 1]
+        parsed = json.loads(block)
     except (json.JSONDecodeError, ValueError):
         print("    speaker LLM returned unparseable output; leaving labels unresolved")
         return {}
@@ -215,7 +205,7 @@ def resolve_with_llm(
     return {
         str(label): str(name).strip()
         for label, name in parsed.items()
-        if label in valid and isinstance(name, str) and name.strip()
+        if label in valid and isinstance(name, str) and name.strip() and name.lower() not in {"null", "unknown", "none"}
     }
 
 

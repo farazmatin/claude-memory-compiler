@@ -27,7 +27,7 @@
           <div class="masthead-note">
             <span class="live-dot" aria-hidden="true"></span>
             <span id="rag-health">Checking AI Search status…</span>
-            <p>100% Private · Stored securely on this computer</p>
+            <p>⚡ <strong>ASR Engine:</strong> Replicate Serverless GPU (~1–2m/meeting) · WhisperX large-v3</p>
           </div>
         </div>
       </header>
@@ -468,6 +468,16 @@
           <input type="hidden" id="modal-meeting-id" />
           <input type="hidden" id="modal-speaker-label" />
           
+          <!-- 10-Second Snippet Player -->
+          <div class="snippet-player-box" style="margin: 14px 0; padding: 12px; background: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+              <span style="font-size:12px; font-weight:600; color:#334155;">🎧 10-Second Voice Clip:</span>
+              <span id="modal-snippet-status" style="font-size:11px; color:#64748b;">Loading audio...</span>
+            </div>
+            <audio id="modal-snippet-audio" controls style="width: 100%; height: 36px; border-radius: 4px; outline: none;"></audio>
+            <p id="modal-snippet-transcript" style="font-size: 12px; color: #64748b; margin-top: 6px; font-style: italic; line-height: 1.4;"></p>
+          </div>
+
           <label for="modal-speaker-name">Contact / Person Name</label>
           <input type="text" id="modal-speaker-name" list="canonical-suggestions" placeholder="e.g. Paul or Sarah" required />
           <datalist id="canonical-suggestions"></datalist>

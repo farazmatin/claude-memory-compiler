@@ -65,6 +65,18 @@ ASR_COMPUTE_TYPE = os.environ.get("MMC_ASR_COMPUTE_TYPE", "int8")
 ASR_BATCH_SIZE = int(os.environ.get("MMC_ASR_BATCH_SIZE", "8"))
 ASR_LANGUAGE = os.environ.get("MMC_ASR_LANGUAGE", "en")
 
+# ASR backend selection: "auto" (uses Replicate if token is present, else local CPU),
+# "replicate" (force Replicate GPU), or "whisperx" (force local CPU WhisperX).
+ASR_BACKEND = os.environ.get("MMC_ASR_BACKEND", "auto").lower().strip()
+
+# Replicate serverless GPU configuration
+REPLICATE_API_TOKEN = (
+    os.environ.get("REPLICATE_API_TOKEN", "") or os.environ.get("REPLICATE_API_KEY", "")
+).strip()
+REPLICATE_MODEL = os.environ.get("MMC_REPLICATE_MODEL", "victor-upmeet/whisperx").strip()
+REPLICATE_TIMEOUT_SEC = float(os.environ.get("MMC_REPLICATE_TIMEOUT", "600"))
+REPLICATE_POLL_INTERVAL_SEC = float(os.environ.get("MMC_REPLICATE_POLL_INTERVAL", "2.0"))
+
 # Every ASR model resamples to 16 kHz mono internally, so normalizing to it up
 # front costs no accuracy and shrinks ~18 MB/hr of m4a to ~2-4 MB/hr.
 TARGET_SAMPLE_RATE = 16_000
@@ -166,9 +178,8 @@ LLM_PROVIDER_ORDER = [
     if name.strip()
 ]
 
-# Left unset, the Gemini CLI picks its own default model. Pin it here to hold a
-# specific Flash version.
-GEMINI_MODEL = os.environ.get("MMC_GEMINI_MODEL", "")
+# Pin the minutes model to gemini-3.7-flash.
+GEMINI_MODEL = os.environ.get("MMC_GEMINI_MODEL", "gemini-3.7-flash")
 
 # Per-call ceiling. Generous: a full transcript is a large prompt, and a CLI that
 # wants a TTY would otherwise hang the batch indefinitely.

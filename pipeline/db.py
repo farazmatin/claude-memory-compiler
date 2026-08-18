@@ -319,12 +319,10 @@ def connect(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
     """Open the manifest, creating it if needed."""
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=60.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    # The nightly batch is a single writer, but ASR holds the process for tens of
-    # minutes; WAL keeps a concurrent `pipeline status` from blocking.
-    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 60000")
     try:
         yield conn
         conn.commit()
@@ -341,6 +339,7 @@ MIGRATIONS: dict[str, str] = {
 def init_db(db_path: Path | None = None) -> None:
     """Create tables and apply pending migrations. Idempotent."""
     with connect(db_path) as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
         # CREATE TABLE IF NOT EXISTS silently skips an existing table, so new
         # columns must be added explicitly or an upgraded install keeps running

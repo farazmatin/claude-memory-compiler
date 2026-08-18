@@ -32,6 +32,8 @@ def test_a_broken_check_is_reported_not_fatal(monkeypatch):
 def test_missing_hf_token_fails_loudly(monkeypatch):
     """The most common silent degradation: no diarization means no action item
     owners, and the only signal is a printed warning mid-batch."""
+    monkeypatch.setattr(doctor, "REPLICATE_API_TOKEN", "")
+    monkeypatch.setattr(doctor, "ASR_BACKEND", "whisperx")
     monkeypatch.setattr(doctor, "HF_TOKEN", None)
     monkeypatch.setattr(doctor, "ENABLE_DIARIZATION", True)
 
@@ -42,6 +44,8 @@ def test_missing_hf_token_fails_loudly(monkeypatch):
 
 
 def test_disabled_diarization_warns_about_owners(monkeypatch):
+    monkeypatch.setattr(doctor, "REPLICATE_API_TOKEN", "")
+    monkeypatch.setattr(doctor, "ASR_BACKEND", "whisperx")
     monkeypatch.setattr(doctor, "ENABLE_DIARIZATION", False)
     checks = doctor.check_diarization()
     assert checks[0].status == doctor.WARN
@@ -50,6 +54,8 @@ def test_disabled_diarization_warns_about_owners(monkeypatch):
 
 def test_large_v3_on_cpu_is_flagged(monkeypatch):
     """Choosing large-v3 on CPU quietly makes the nightly batch impossible."""
+    monkeypatch.setattr(doctor, "REPLICATE_API_TOKEN", "")
+    monkeypatch.setattr(doctor, "ASR_BACKEND", "whisperx")
     monkeypatch.setattr(doctor, "ASR_DEVICE", "cpu")
     monkeypatch.setattr(doctor, "ASR_MODEL", "large-v3")
 
@@ -61,6 +67,14 @@ def test_large_v3_on_cpu_is_flagged(monkeypatch):
     except ImportError:
         return
     assert warnings and "will not fit a night" in warnings[0].detail
+
+
+def test_replicate_diarization_check(monkeypatch):
+    monkeypatch.setattr(doctor, "REPLICATE_API_TOKEN", "r8_fake")
+    monkeypatch.setattr(doctor, "ASR_BACKEND", "replicate")
+    checks = doctor.check_diarization()
+    assert checks[0].status == doctor.OK
+    assert "Replicate GPU" in checks[0].detail
 
 
 def test_no_providers_is_a_failure(monkeypatch):

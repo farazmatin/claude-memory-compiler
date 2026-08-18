@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Protocol
 
 from pipeline.config import (
+    ASR_BACKEND,
     ASR_BATCH_SIZE,
     ASR_COMPUTE_TYPE,
     ASR_DEVICE,
@@ -38,6 +39,7 @@ from pipeline.config import (
     INITIAL_PROMPT_TOKEN_BUDGET,
     MAX_SPEAKERS,
     MIN_SPEAKERS,
+    REPLICATE_API_TOKEN,
     TARGET_SAMPLE_RATE,
     TRANSCRIPTS_DIR,
 )
@@ -460,4 +462,17 @@ def save_transcript(transcript: Transcript, speaker_names: dict[str, str] | None
 
 
 def default_backend() -> Backend:
+    """Select the active ASR backend.
+
+    If MMC_ASR_BACKEND="replicate" or (MMC_ASR_BACKEND="auto" and REPLICATE_API_TOKEN is set),
+    uses serverless Replicate GPU for ~1-2 min turnaround.
+    Otherwise falls back to local CPU WhisperXBackend.
+    """
+    use_replicate = ASR_BACKEND == "replicate" or (
+        ASR_BACKEND == "auto" and bool(REPLICATE_API_TOKEN)
+    )
+    if use_replicate:
+        from pipeline.replicate_asr import ReplicateBackend
+
+        return ReplicateBackend()
     return WhisperXBackend()

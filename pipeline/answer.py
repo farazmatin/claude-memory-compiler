@@ -75,6 +75,38 @@ of what happened.
 {question}"""
 
 
+def fallback_local_context(question: str, top_n: int = 5) -> str:
+    """Retrieve relevant minutes files directly from disk when LightRAG is busy or slow."""
+    import re
+    from pipeline.config import MINUTES_DIR
+    keywords = [
+        w.lower()
+        for w in re.findall(r"\b[a-zA-Z0-9_-]{3,}\b", question)
+        if w.lower() not in {
+            "what", "when", "where", "which", "about", "did", "were", "the", "and", "for", "with",
+            "recent", "meetings", "meeting", "discuss", "discussed", "tell", "show", "summary"
+        }
+    ]
+    
+    scored_files: list[tuple[int, str, str]] = []
+    for md_file in MINUTES_DIR.glob("*.md"):
+        try:
+            content = md_file.read_text(encoding="utf-8")
+            lower_content = content.lower()
+            score = sum(lower_content.count(k) for k in keywords) if keywords else 1
+            if score > 0:
+                scored_files.append((score, md_file.name, content))
+        except OSError:
+            continue
+            
+    scored_files.sort(key=lambda x: x[0], reverse=True)
+    if not scored_files:
+        newest = sorted(MINUTES_DIR.glob("*.md"), reverse=True)[:3]
+        return "\n\n---\n\n".join(f"## {p.name}\n{p.read_text(encoding='utf-8')[:3000]}" for p in newest)
+        
+    return "\n\n---\n\n".join(f"## {name}\n{text[:3500]}" for _, name, text in scored_files[:top_n])
+
+
 def ask(
     question: str,
     mode: str | None = None,
@@ -102,9 +134,17 @@ def ask(
     context = index.query_context(question, mode=mode, top_k=top_k)
     retrieval_sec = time.monotonic() - started
 
+    is_empty_or_negative = (
+        not context.strip()
+        or "no relevant context" in context.lower()
+        or "no relevant records" in context.lower()
+    )
+    if is_empty_or_negative:
+        # Fallback to smart local full-text search across compiled minutes
+        context = fallback_local_context(question)
+        retrieval_sec = time.monotonic() - started
+
     if not context.strip():
-        # No context could mean an empty corpus or an unreachable server. Either
-        # way, asking a model to answer from nothing invites invention.
         return Answer(
             text=(
                 "No relevant records were retrieved. The corpus may be empty, or "
@@ -130,7 +170,6 @@ def ask(
             synthesized=True,
         )
     except LLMError as exc:
-        # An answer from the small local model beats no answer.
         print(f"    synthesis unavailable ({exc}); falling back to LightRAG generation")
         started = time.monotonic()
         text = index.query(question, mode=mode, top_k=top_k)

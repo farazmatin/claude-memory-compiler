@@ -190,7 +190,7 @@ def query_context(question: str, mode: str | None = None, top_k: int | None = No
         payload["top_k"] = top_k
 
     try:
-        with _client() as client:
+        with httpx.Client(base_url=LIGHTRAG_URL, timeout=10.0, headers=_headers()) as client:
             response = client.post("/query", json=payload)
             response.raise_for_status()
             data = response.json()

@@ -386,6 +386,14 @@ def apply_env(monkeypatch, env: dict[str, str], modules: list | None = None) -> 
             if hasattr(module, "DB_PATH"):
                 monkeypatch.setattr(module, "DB_PATH", db_path)
 
+    if "MMC_LLM_PROVIDERS" in env:
+        providers = [p.strip() for p in env["MMC_LLM_PROVIDERS"].split(",") if p.strip()]
+        for module in targets:
+            if hasattr(module, "LLM_PROVIDER_ORDER"):
+                monkeypatch.setattr(module, "LLM_PROVIDER_ORDER", providers)
+            if hasattr(module, "LLM_PROVIDERS"):
+                monkeypatch.setattr(module, "LLM_PROVIDERS", providers)
+
     # Keep the pipeline away from the repo's own glossary and overrides.
     root = Path(env["MMC_INBOX"]).parent
     for attr, filename in (

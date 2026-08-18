@@ -6,6 +6,8 @@ import argparse
 import contextlib
 import json
 import mimetypes
+import re
+import subprocess
 import threading
 import webbrowser
 from collections import deque
@@ -18,8 +20,11 @@ from urllib.parse import parse_qs, urlparse
 
 from pipeline import db, index, voices
 from pipeline.config import (
+    AUDIO_DIR,
     DASHBOARD_HOST,
     DASHBOARD_PORT,
+    GEMINI_MODEL,
+    INBOX_DIR,
     MINUTES_DIR,
     OWNER_NAME,
     TEMPLATE_VERSION,
@@ -470,6 +475,12 @@ def overview() -> dict[str, Any]:
             "total_mb": round(drive_total_bytes / (1024 * 1024), 1),
             "by_state": drive_by_state,
         },
+        "engine": {
+            "asr_backend": "Replicate Serverless GPU (Cloud)",
+            "asr_model": "victor-upmeet/whisperx (Whisper large-v3 + Pyannote)",
+            "asr_speed": "~1-2 min per meeting",
+            "minutes_model": GEMINI_MODEL or "gemini-2.5-flash",
+        },
         "maintenance": {
             "stale_templates": stale_templates,
             "template_version": TEMPLATE_VERSION,
@@ -485,7 +496,7 @@ def meetings(search: str = "") -> list[dict[str, Any]]:
     with db.connect() as conn:
         rows = conn.execute(
             """
-            SELECT m.*, ds.web_view_link,
+            SELECT m.*, ds.web_view_link, ds.source_name AS original_drive_name,
                    COUNT(s.label) AS speaker_count,
                    SUM(CASE WHEN s.name IS NULL THEN 1 ELSE 0 END) AS unresolved_count
             FROM meetings m
@@ -520,6 +531,7 @@ def meeting_detail(meeting_id: str) -> dict[str, Any] | None:
     record = _meeting_summary(
         {
             **meeting.__dict__,
+            "original_drive_name": source.source_name if source else None,
             "web_view_link": source.web_view_link if source else None,
             "speaker_count": len(speakers),
             "unresolved_count": sum(1 for speaker in speakers if speaker["name"] is None),
@@ -550,6 +562,84 @@ def ask(question: str, mode: str | None = None) -> dict[str, Any]:
         "context_chars": result.context_chars,
         "synthesized": result.synthesized,
     }
+
+
+def extract_speaker_snippet(
+    meeting_id: str,
+    label: str | None = None,
+    start_sec: float | None = None,
+    duration_sec: float = 10.0,
+) -> tuple[bytes, str] | None:
+    """Extract a 10-second MP3 snippet for a given speaker label or timestamp."""
+    db.init_db()
+    with db.connect() as conn:
+        meeting = db.get_meeting(conn, meeting_id)
+        if not meeting:
+            row = conn.execute(
+                "SELECT id FROM meetings WHERE id LIKE ? LIMIT 1", (f"{meeting_id}%",)
+            ).fetchone()
+            if row:
+                meeting = db.get_meeting(conn, row["id"])
+        if not meeting:
+            return None
+
+    from pipeline import asr
+    actual_start = max(0.0, float(start_sec or 0.0))
+    snippet_text = ""
+
+    try:
+        transcript = asr.load_transcript(meeting.id)
+        if label:
+            matching = [s for s in transcript.segments if s.speaker == label]
+            if matching:
+                longest = sorted(matching, key=lambda s: s.end - s.start, reverse=True)
+                chosen = longest[0]
+                actual_start = max(0.0, chosen.start)
+                snippet_text = f'"{chosen.text}"'
+    except Exception:
+        pass
+
+    from pipeline import capture
+    audio_path: Path | None = None
+    if meeting.audio_path and Path(meeting.audio_path).is_file():
+        audio_path = Path(meeting.audio_path)
+    else:
+        for ext in (".mp3", ".m4a", ".wav", ".mp4"):
+            candidate = AUDIO_DIR / f"{meeting.id}{ext}"
+            if candidate.is_file():
+                audio_path = candidate
+                break
+        if not audio_path:
+            for f in INBOX_DIR.rglob(f"*{meeting.source_name}*"):
+                if f.is_file():
+                    audio_path = f
+                    break
+        if not audio_path:
+            try:
+                audio_path = capture.rehydrate_audio(meeting)
+            except Exception:
+                return None
+
+    if not audio_path or not audio_path.is_file():
+        return None
+
+    cmd = [
+        "ffmpeg", "-nostdin", "-y",
+        "-ss", f"{actual_start:.2f}",
+        "-t", f"{duration_sec:.2f}",
+        "-i", str(audio_path),
+        "-ac", "1",
+        "-ar", "16000",
+        "-c:a", "libmp3lame",
+        "-b:a", "64k",
+        "-f", "mp3",
+        "pipe:1",
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, check=True)
+        return res.stdout, snippet_text
+    except Exception:
+        return None
 
 
 def run(host: str = DASHBOARD_HOST, port: int = DASHBOARD_PORT, open_browser: bool = False) -> None:
@@ -595,6 +685,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/timeline":
             topic = parse_qs(parsed.query).get("topic", [""])[0]
             self._json(HTTPStatus.OK, decision_timeline(topic))
+            return
+        if path == "/api/audio/snippet":
+            qs = parse_qs(parsed.query)
+            meeting_id = qs.get("meeting_id", [""])[0]
+            label = qs.get("label", [None])[0]
+            start_sec = float(qs.get("start", [0])[0]) if qs.get("start") else None
+            duration = float(qs.get("duration", [10])[0])
+            snippet = extract_speaker_snippet(meeting_id, label=label, start_sec=start_sec, duration_sec=duration)
+            if not snippet:
+                self.send_error(HTTPStatus.NOT_FOUND, "Audio snippet could not be generated.")
+                return
+            audio_bytes, text = snippet
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Content-Length", str(len(audio_bytes)))
+            self.send_header("X-Snippet-Text", text)
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(audio_bytes)
             return
         if path.startswith("/api/meetings/"):
             detail = meeting_detail(path.rsplit("/", 1)[-1])
@@ -783,25 +892,101 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return payload
 
     def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
+            pass
+
+
+def clean_meeting_title(
+    source_name: str | None,
+    title_hint: str | None,
+    minutes_path: str | None,
+    minutes_text: str | None = None,
+) -> str:
+    """Produce a clean human-readable title without technical hash prefixes."""
+    if minutes_text:
+        for line in minutes_text.splitlines()[:25]:
+            if line.startswith("title:"):
+                clean = line.split("title:", 1)[-1].strip().strip('"\'')
+                if clean:
+                    return clean
+            if line.startswith("# ") and not line.startswith("##"):
+                clean = line.lstrip("# ").strip()
+                if clean:
+                    return clean
+
+    if minutes_path:
+        stem = Path(minutes_path).stem
+        parts = stem.split("-")
+        if len(parts) >= 4:
+            slug_words = parts[3:-1] if len(parts[-1]) in (8, 12) else parts[3:]
+            if slug_words:
+                return " ".join(slug_words).title()
+
+    if title_hint and len(title_hint) < 60 and not re.match(r"^[0-9a-zA-Z_-]{8,}", title_hint) and not re.match(r"^[0-9a-zA-Z_\-\s]{12,}?\b\d+\b", title_hint):
+        return title_hint
+
+    if source_name:
+        base = Path(source_name).name
+        for ext in (".m4a", ".mp4", ".mp3", ".wav", ".aac", ".flac"):
+            if base.lower().endswith(ext):
+                base = base[:-len(ext)]
+        base = base.replace("\u202f", " ").replace("\xa0", " ")
+        # Strip Drive ID prefix if present
+        parts = base.split("_")
+        if len(parts) >= 3 and len(parts[0]) >= 15:
+            base = "_".join(parts[2:])
+        elif len(parts) >= 2 and len(parts[0]) >= 20:
+            base = "_".join(parts[1:])
+        else:
+            space_parts = base.split()
+            if len(space_parts) >= 4 and len(space_parts[0]) >= 8 and len(space_parts[1]) >= 12:
+                base = " ".join(space_parts[3:] if space_parts[2].isdigit() else space_parts[2:])
+
+        # Strip remaining single-digit version prefixes like 6_ or 6 
+        base = re.sub(r"^\d+[\s_]+", "", base)
+
+        def _time_repl(m: Any) -> str:
+            hh = m.group(1)
+            mm = m.group(2) if m.group(2) else "00"
+            ampm = m.group(3).upper() + "M"
+            return f"{hh}:{mm} {ampm}"
+
+        clean = re.sub(r"\b(\d{1,2})(?:[-:](\d{2}))?\s*([ap])\.?m\.?", _time_repl, base, flags=re.I)
+        clean = clean.replace("_", " ").replace(" - ", " — ").replace("-", " ")
+        clean = re.sub(r"\s+", " ", clean).strip()
+        clean = clean.replace("uce", "UCE").replace("torc", "TORC").replace("usc", "USC").replace("dpm", "DPM")
+        clean = re.sub(r"\b([0-9a-f]{8,12})\b", "", clean, flags=re.I).strip()
+        if clean:
+            return clean
+
+    return "Untitled Meeting"
 
 
 def _meeting_summary(row: dict[str, Any]) -> dict[str, Any]:
     minutes = _read_minutes(row.get("minutes_path"))
     speaker_count = int(row.get("speaker_count") or 0)
     unresolved_count = int(row.get("unresolved_count") or 0)
+    name_for_title = row.get("original_drive_name") or row.get("source_name")
+    title = clean_meeting_title(
+        name_for_title,
+        row.get("title_hint"),
+        row.get("minutes_path"),
+        minutes,
+    )
     return {
         "id": row["id"],
         "short_id": row["id"][:8],
         "date": row.get("meeting_date"),
         "time": row.get("meeting_time"),
-        "title": row.get("title_hint") or row.get("source_name") or "Untitled meeting",
+        "title": title,
         "source_name": row.get("source_name"),
         "status": row.get("status"),
         "error": row.get("error"),
@@ -835,7 +1020,19 @@ def _review_state(status: str | None, speaker_count: int, unresolved_count: int)
     return "Speaker review" if unresolved_count else "Ready"
 
 
-def _excerpt(minutes: str, limit: int = 260) -> str:
+def _excerpt(minutes: str, limit: int = 220) -> str:
+    if not minutes:
+        return "No executive summary recorded yet."
     body = minutes.split("---", 2)[-1] if minutes.startswith("---") else minutes
-    condensed = " ".join(body.split())
-    return condensed[:limit].rstrip() + ("…" if len(condensed) > limit else "")
+    cleaned_lines = []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        cleaned_lines.append(line)
+    text = " ".join(cleaned_lines)
+    text = re.sub(r"[*_`]", "", text)
+    text = " ".join(text.split())
+    if not text:
+        return "Executive brief indexed in memory."
+    return text[:limit].rstrip() + ("…" if len(text) > limit else "")

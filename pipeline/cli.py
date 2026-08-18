@@ -183,7 +183,7 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
     for position, meeting in enumerate(queue, 1):
         print(f"[{position}/{len(queue)}] {meeting.label}")
         audio_path = meeting.audio_path
-        if not audio_path:
+        if not audio_path or not Path(audio_path).is_file():
             try:
                 audio_path = str(capture.rehydrate_audio(meeting))
                 print("    rehydrated archived source from Drive")
@@ -193,9 +193,9 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
                 failures += 1
                 print(f"    FAILED {exc}")
                 continue
-        if not audio_path:
+        if not audio_path or not Path(audio_path).is_file():
             with db.connect() as conn:
-                db.mark_failed(conn, meeting.id, "no audio_path recorded")
+                db.mark_failed(conn, meeting.id, "audio file missing and could not be restored")
             failures += 1
             continue
 
@@ -248,7 +248,18 @@ def cmd_speakers(args: argparse.Namespace) -> int:
 
     db.init_db()
     with db.connect() as conn:
-        queue = db.pending(conn, db.TRANSCRIBED, args.limit)
+        if getattr(args, "all", False):
+            rows = conn.execute("""
+                SELECT DISTINCT m.id
+                FROM meetings m
+                JOIN speakers s ON s.meeting_id = m.id
+                WHERE s.name IS NULL OR s.name = ''
+            """).fetchall()
+            queue = [db.get_meeting(conn, r["id"]) for r in rows if db.get_meeting(conn, r["id"])]
+            if args.limit:
+                queue = queue[: args.limit]
+        else:
+            queue = db.pending(conn, db.TRANSCRIBED, args.limit)
 
     if not queue:
         print("Nothing to resolve.")
@@ -259,34 +270,39 @@ def cmd_speakers(args: argparse.Namespace) -> int:
         print(f"[{position}/{len(queue)}] {meeting.label}")
         with db.connect() as conn:
             run_id = db.start_stage(conn, meeting.id, STAGE_SPEAKERS)
-            try:
-                transcript = asr.load_transcript(meeting.id)
+        try:
+            transcript = asr.load_transcript(meeting.id)
+            with db.connect() as conn:
                 resolved = speakers.resolve(
                     conn, meeting, transcript,
                     owner_name=args.owner,
                     use_llm=not args.no_llm,
                 )
-                # Rewrite the readable transcript with real names now that we
-                # have them; the JSON keeps the raw labels as ground truth.
-                asr.save_transcript(transcript, resolved)
-                unresolved = [
-                    label for label in transcript.speaker_labels if label not in resolved
-                ]
+            # Rewrite the readable transcript with real names now that we
+            # have them; the JSON keeps the raw labels as ground truth.
+            asr.save_transcript(transcript, resolved)
+            unresolved = [
+                label for label in transcript.speaker_labels if label not in resolved
+            ]
+            with db.connect() as conn:
                 db.finish_stage(
                     conn, run_id, True,
                     f"{len(resolved)} resolved, {len(unresolved)} unresolved",
                 )
-                db.advance(conn, meeting.id, db.SPEAKERS_RESOLVED)
-                summary = ", ".join(f"{k}={v}" for k, v in resolved.items()) or "none"
-                print(f"    {summary}")
-                if unresolved:
-                    print(f"    unresolved: {', '.join(unresolved)}")
-            except Exception as exc:
-                failures += 1
-                detail = f"{type(exc).__name__}: {exc}"
-                print(f"    FAILED {detail}")
-                if args.traceback:
-                    traceback.print_exc()
+                current = db.get_meeting(conn, meeting.id)
+                if current and current.status == db.TRANSCRIBED:
+                    db.advance(conn, meeting.id, db.SPEAKERS_RESOLVED)
+            summary = ", ".join(f"{k}={v}" for k, v in resolved.items()) or "none"
+            print(f"    {summary}")
+            if unresolved:
+                print(f"    unresolved: {', '.join(unresolved)}")
+        except Exception as exc:
+            failures += 1
+            detail = f"{type(exc).__name__}: {exc}"
+            print(f"    FAILED {detail}")
+            if args.traceback:
+                traceback.print_exc()
+            with db.connect() as conn:
                 db.finish_stage(conn, run_id, False, detail)
                 db.mark_failed(conn, meeting.id, detail)
 
@@ -316,13 +332,15 @@ def cmd_minutes(args: argparse.Namespace) -> int:
         print(f"[{position}/{len(queue)}] {meeting.label}")
         with db.connect() as conn:
             run_id = db.start_stage(conn, meeting.id, STAGE_MINUTES)
-            try:
-                transcript = asr.load_transcript(meeting.id)
-                resolved = db.get_speakers(conn, meeting.id)
+            resolved = db.get_speakers(conn, meeting.id)
+        try:
+            transcript = asr.load_transcript(meeting.id)
+            with db.connect() as conn:
                 path, document = compile_minutes.compile_meeting(
                     conn, meeting, transcript, resolved
                 )
-                words = len(document.split())
+            words = len(document.split())
+            with db.connect() as conn:
                 db.finish_stage(conn, run_id, True, f"{words} words -> {path.name}")
                 # A recompile rewinds to minutes_compiled so the index stage
                 # picks the new version up.
@@ -331,16 +349,17 @@ def cmd_minutes(args: argparse.Namespace) -> int:
                     minutes_path=str(path),
                     template_version=TEMPLATE_VERSION,
                 )
-                print(f"    {words} words -> {path.name}")
-            except Exception as exc:
-                failures += 1
-                detail = f"{type(exc).__name__}: {exc}"
-                print(f"    FAILED {detail}")
-                if args.traceback:
-                    traceback.print_exc()
+            print(f"    {words} words -> {path.name}")
+        except Exception as exc:
+            failures += 1
+            detail = f"{type(exc).__name__}: {exc}"
+            print(f"    FAILED {detail}")
+            if args.traceback:
+                traceback.print_exc()
+            with db.connect() as conn:
                 db.finish_stage(conn, run_id, False, detail)
-                # Deliberately not marked failed: the transcript is intact and
-                # the model call is retryable, so the meeting stays in the queue.
+            # Deliberately not marked failed: the transcript is intact and
+            # the model call is retryable, so the meeting stays in the queue.
 
     print(f"\nCompiled {len(queue) - failures}/{len(queue)}.")
     return 1 if failures else 0
@@ -664,6 +683,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_speakers.add_argument(
         "--no-llm", action="store_true", help="heuristics and overrides only"
+    )
+    p_speakers.add_argument(
+        "--all", action="store_true", help="resolve across all meetings with unresolved speakers"
     )
     p_speakers.set_defaults(func=cmd_speakers)
 

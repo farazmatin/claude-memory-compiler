@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from pipeline import asr, cli, db, index
+from pipeline import asr, cli, compile_minutes, db, index, llm
 from tests.e2e_harness import (
     FakeASRBackend,
     FakeLightRAG,
@@ -38,7 +38,7 @@ def app(tmp_path, monkeypatch):
 
     env = pipeline_env(tmp_path, server.url)
     env.update(install_fake_llm(tmp_path))
-    apply_env(monkeypatch, env, [asr, index, cli])
+    apply_env(monkeypatch, env, [asr, index, cli, llm, compile_minutes])
     monkeypatch.setattr(asr, "default_backend", lambda: backend)
 
     class App:

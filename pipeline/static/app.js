@@ -14,15 +14,7 @@ let state = {
 const $ = (id) => document.getElementById(id);
 const $$ = (sel) => document.querySelectorAll(sel);
 
-// ── Initialization ───────────────────────────────────────────────────
-document.addEventListener("DOMContentLoaded", () => {
-  setupTabs();
-  setupEventListeners();
-  loadOverview();
-  loadMeetings();
-  loadPeople();
-  checkPipelineStatus();
-});
+// (Initialization is handled by init() at the bottom of this file)
 
 // ── Tabs Navigation ──────────────────────────────────────────────────
 function setupTabs() {
@@ -658,11 +650,36 @@ function openSpeakerModal(meetingId, label, currentName) {
   $("modal-speaker-label").value = label;
   $("modal-speaker-name").value = currentName || "";
   $("speaker-modal-sub").textContent = `Assign contact name to speaker tag: ${label}`;
+
+  // Load and play 10s voice snippet
+  const audioEl = $("modal-snippet-audio");
+  const statusEl = $("modal-snippet-status");
+  const transcriptEl = $("modal-snippet-transcript");
+
+  if (audioEl) {
+    statusEl.textContent = "Loading 10s voice clip...";
+    transcriptEl.textContent = "";
+    audioEl.src = `/api/audio/snippet?meeting_id=${encodeURIComponent(meetingId)}&label=${encodeURIComponent(label)}&duration=10`;
+    audioEl.oncanplay = () => {
+      statusEl.textContent = "Ready to play";
+      audioEl.play().catch(() => {});
+    };
+    audioEl.onerror = () => {
+      statusEl.textContent = "Audio sample unavailable";
+    };
+    audioEl.load();
+  }
+
   $("speaker-modal").showModal();
   setTimeout(() => $("modal-speaker-name").focus(), 50);
 }
 
 function closeSpeakerModal() {
+  const audioEl = $("modal-snippet-audio");
+  if (audioEl) {
+    audioEl.pause();
+    audioEl.src = "";
+  }
   $("speaker-modal").close();
 }
 
@@ -993,12 +1010,13 @@ function init() {
   loadMeetings();
   loadPeople();
   loadVoiceClusters();
+  checkPipelineStatus();
 
-  // Poll status periodically
+  // Poll status periodically in background
   setInterval(() => {
-    loadPipelineStatus();
+    checkPipelineStatus();
     loadOverview();
-  }, 10000);
+  }, 8000);
 }
 
 document.addEventListener("DOMContentLoaded", init);

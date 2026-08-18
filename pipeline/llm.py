@@ -66,19 +66,23 @@ class CLIProvider:
         return shutil.which(self.binary) is not None
 
     def complete(self, prompt: str) -> str:
-        if not self.available():
+        resolved = shutil.which(self.binary)
+        if not resolved:
             raise LLMError(f"{self.binary} not found on PATH")
         try:
             # `input` implies stdin=PIPE; passing both raises ValueError. Piping
             # stdin also stops a CLI that wants a TTY from blocking on one and
             # hanging the batch, which the timeout then catches.
+            use_shell = os.name == "nt" and resolved.lower().endswith((".cmd", ".bat", ".ps1"))
             result = subprocess.run(
-                [self.binary, *self.args],
+                [resolved, *self.args],
                 input=prompt,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 timeout=LLM_TIMEOUT_SEC,
                 cwd=str(ROOT_DIR),
+                shell=use_shell,
             )
         except subprocess.TimeoutExpired as exc:
             raise LLMError(f"{self.name} timed out after {LLM_TIMEOUT_SEC}s") from exc

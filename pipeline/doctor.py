@@ -24,6 +24,7 @@ from dataclasses import dataclass
 
 from pipeline import db
 from pipeline.config import (
+    ASR_BACKEND,
     ASR_DEVICE,
     ASR_MODEL,
     AUDIO_DIR,
@@ -38,6 +39,8 @@ from pipeline.config import (
     LIGHTRAG_URL,
     LLM_PROVIDER_ORDER,
     MINUTES_DIR,
+    REPLICATE_API_TOKEN,
+    REPLICATE_MODEL,
     TRANSCRIPTS_DIR,
 )
 
@@ -80,16 +83,74 @@ def check_ffmpeg() -> list[Check]:
 
 
 def check_asr() -> list[Check]:
-    """whisperx and the model choice."""
+    """ASR backend (Replicate serverless GPU vs local WhisperX CPU)."""
     checks = []
 
+    use_replicate = ASR_BACKEND == "replicate" or (
+        ASR_BACKEND == "auto" and bool(REPLICATE_API_TOKEN)
+    )
+
+    if use_replicate:
+        if not REPLICATE_API_TOKEN:
+            return [
+                Check(
+                    "asr backend",
+                    FAIL,
+                    "MMC_ASR_BACKEND=replicate but REPLICATE_API_TOKEN is unset",
+                    "add REPLICATE_API_TOKEN=r8_... to .env",
+                )
+            ]
+        # Verify Replicate token and account reachability
+        try:
+            import httpx
+
+            resp = httpx.get(
+                "https://api.replicate.com/v1/account",
+                headers={"Authorization": f"Bearer {REPLICATE_API_TOKEN}"},
+                timeout=10.0,
+            )
+            if resp.status_code == 200:
+                username = resp.json().get("username", "authenticated")
+                checks.append(
+                    Check(
+                        "asr backend",
+                        OK,
+                        f"Replicate GPU ({REPLICATE_MODEL}) — account: @{username} (~1-2m/meeting)",
+                    )
+                )
+            else:
+                checks.append(
+                    Check(
+                        "asr backend",
+                        FAIL,
+                        f"Replicate auth error ({resp.status_code}): {resp.text[:60]}",
+                        "check REPLICATE_API_TOKEN at replicate.com/account/api-tokens",
+                    )
+                )
+        except Exception as exc:
+            checks.append(
+                Check(
+                    "asr backend",
+                    WARN,
+                    f"Replicate token set; connectivity check failed ({exc})",
+                    "verify internet access to api.replicate.com",
+                )
+            )
+        return checks
+
+    # Local WhisperX check
     try:
         import whisperx  # noqa: F401
 
         checks.append(Check("whisperx", OK, "importable"))
     except ImportError as exc:
         return [
-            Check("whisperx", FAIL, f"not importable: {exc}", "uv sync --extra asr")
+            Check(
+                "whisperx",
+                FAIL,
+                f"not importable: {exc}",
+                "uv sync --extra asr OR set REPLICATE_API_TOKEN in .env",
+            )
         ]
 
     if ASR_DEVICE == "cpu" and ASR_MODEL == "large-v3":
@@ -99,11 +160,11 @@ def check_asr() -> list[Check]:
                 WARN,
                 "large-v3 on CPU costs ~1.5-2.5 h per meeting with diarization; "
                 "five a day will not fit a night",
-                "unset MMC_ASR_MODEL to use large-v3-turbo",
+                "unset MMC_ASR_MODEL to use large-v3-turbo, or configure REPLICATE_API_TOKEN",
             )
         )
     else:
-        checks.append(Check("asr model", OK, f"{ASR_MODEL} on {ASR_DEVICE}"))
+        checks.append(Check("asr model", OK, f"{ASR_MODEL} on {ASR_DEVICE} (local CPU)"))
     return checks
 
 
@@ -114,6 +175,18 @@ def check_diarization() -> list[Check]:
     transcripts with no speaker attribution, which means action items with no
     owners, and the only signal is a printed warning mid-batch.
     """
+    use_replicate = ASR_BACKEND == "replicate" or (
+        ASR_BACKEND == "auto" and bool(REPLICATE_API_TOKEN)
+    )
+    if use_replicate:
+        return [
+            Check(
+                "diarization",
+                OK,
+                "handled serverless on Replicate GPU (pyannote embedded in model)",
+            )
+        ]
+
     if not ENABLE_DIARIZATION:
         return [Check("diarization", WARN, "disabled - action items will have no owners")]
     if not HF_TOKEN:

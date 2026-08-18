@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shutil
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -441,7 +443,19 @@ def _stage_download(client: DriveClient, remote: DriveFile, destination: Path) -
     try:
         client.download(remote.file_id, temporary)
         _verify_download(temporary, remote)
-        os.replace(temporary, destination)
+        if destination.exists():
+            try:
+                destination.unlink(missing_ok=True)
+            except Exception:
+                pass
+        for attempt in range(5):
+            try:
+                shutil.move(str(temporary), str(destination))
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
