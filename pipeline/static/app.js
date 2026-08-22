@@ -26,6 +26,7 @@ const categoryDomain = (value) => CATEGORY_DOMAINS[value] || CATEGORY_DOMAINS.Pr
 const GENERIC_SUBTYPES = new Set(["", "general", "work", "professional", "personal", "personal & household"]);
 
 const CHAT_SESSION_STORAGE_KEY = "meeting-memory-chat-session";
+const VOICE_LIBRARY_LIMIT = 3;
 
 function getChatSessionId() {
   let sessionId = localStorage.getItem(CHAT_SESSION_STORAGE_KEY);
@@ -78,16 +79,50 @@ const $$ = (sel) => document.querySelectorAll(sel);
 
 // ── Tabs Navigation ──────────────────────────────────────────────────
 function setupTabs() {
-  $$(".tab-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      $$(".tab-btn").forEach((button) => {
-        button.classList.remove("active");
-        button.setAttribute("aria-selected", "false");
-      });
-      $$(".tab-pane").forEach((pane) => pane.classList.remove("active"));
-      btn.classList.add("active");
-      btn.setAttribute("aria-selected", "true");
-      $(btn.dataset.tab).classList.add("active");
+  const tabs = [...$$(".tab-btn")];
+  tabs.forEach((btn, index) => {
+    btn.addEventListener("click", () => activateTab(btn));
+    btn.addEventListener("keydown", (event) => {
+      const destinations = {
+        ArrowLeft: (index - 1 + tabs.length) % tabs.length,
+        ArrowRight: (index + 1) % tabs.length,
+        Home: 0,
+        End: tabs.length - 1,
+      };
+      if (!(event.key in destinations)) return;
+      event.preventDefault();
+      activateTab(tabs[destinations[event.key]], true);
+    });
+  });
+}
+
+function activateTab(tab, moveFocus = false) {
+  $$(".tab-btn").forEach((button) => {
+    const selected = button === tab;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-selected", String(selected));
+    button.setAttribute("tabindex", selected ? "0" : "-1");
+  });
+  $$(".tab-pane").forEach((pane) => pane.classList.toggle("active", pane.id === tab.dataset.tab));
+  if (moveFocus) tab.focus();
+}
+
+function setupAskModeTabs() {
+  const tabs = [$("mode-btn-qa"), $("mode-btn-timeline")].filter(Boolean);
+  tabs.forEach((tab, index) => {
+    tab.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const destination = event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? tabs.length - 1
+          : event.key === "ArrowLeft"
+            ? (index - 1 + tabs.length) % tabs.length
+            : (index + 1) % tabs.length;
+      const next = tabs[destination];
+      switchAskMode(next === $("mode-btn-qa") ? "qa" : "timeline");
+      next.focus();
     });
   });
 }
@@ -169,8 +204,18 @@ function renderOverview(data) {
   $("metric-today").textContent = `${today.count || 0} (${today.duration_min || 0}m)`;
 
   $("metric-hours").textContent = `${data.durations?.total_hours || 0} hrs`;
-  const attentionCount = (data.failed || 0) + (data.speaker_review || 0);
-  $("metric-attention").textContent = attentionCount > 0 ? `${attentionCount} items` : "0";
+  const failedCount = data.failed || 0;
+  const speakerReviewCount = data.speaker_review || 0;
+  const attentionCount = failedCount + speakerReviewCount;
+  const attentionParts = [];
+  if (failedCount) attentionParts.push(`${failedCount} failed`);
+  if (speakerReviewCount) attentionParts.push(`${speakerReviewCount} speaker labels`);
+  $("metric-attention").textContent = attentionCount ? `${attentionCount} items` : "None";
+  const archiveAttention = $("archive-attention");
+  archiveAttention.classList.toggle("needs-attention", attentionCount > 0);
+  archiveAttention.textContent = attentionCount
+    ? `Archive Review: ${attentionParts.join(" · ")}`
+    : "Archive Ready";
 
   // Queue Funnel
   const queue = data.queue || {};
@@ -365,7 +410,7 @@ function handlePipelineStatus(status) {
     $("btn-quick-run").textContent = `⏳ ${friendlyName}...`;
   } else {
     indicator.classList.remove("running");
-    statusText.textContent = "All Caught Up";
+    statusText.textContent = "Processing Idle";
     $("btn-quick-run").disabled = false;
     $("btn-quick-run").textContent = "▶ Sync & Process Recordings";
   }
@@ -831,14 +876,20 @@ function renderPeopleTable(people) {
   }
   tbody.innerHTML = people
     .map(
-      (p) => `
+      (p) => {
+        const aliases = Array.isArray(p.aliases)
+          ? p.aliases
+          : String(p.aliases || "").split(",").map((alias) => alias.trim()).filter(Boolean);
+        const meetingCount = p.meetings || p.meeting_count || 0;
+        return `
     <tr>
       <td><strong>${escapeHtml(p.canonical)}</strong></td>
       <td>${escapeHtml(p.role || "—")}</td>
-      <td>${p.meetings || p.meeting_count || 0} meetings</td>
-      <td>${(p.aliases || []).map((a) => `<span class="chip">${escapeHtml(a)}</span>`).join(" ") || "—"}</td>
+      <td>${meetingCount} meeting${meetingCount === 1 ? "" : "s"}</td>
+      <td>${aliases.map((a) => `<span class="chip">${escapeHtml(a)}</span>`).join(" ") || "—"}</td>
     </tr>
-  `
+  `;
+      }
     )
     .join("");
 }
@@ -1152,7 +1203,7 @@ function renderVoiceCards(clusters) {
     return;
   }
 
-  const cardsHtml = clusters
+  const cards = clusters
     .map((c) => {
       const bestMatchName = c.best_canonical;
       const matchConfidence = c.best_score ? Math.round(c.best_score * 100) : null;
@@ -1209,18 +1260,23 @@ function renderVoiceCards(clusters) {
           </div>
         </div>
       `;
-    })
-    .join("");
+    });
+  const cardsHtml = cards.join("");
+  const libraryCardsHtml = cards.slice(0, VOICE_LIBRARY_LIMIT).join("");
+  const reviewAllButton = clusters.length > VOICE_LIBRARY_LIMIT
+    ? `<button type="button" class="btn-outline btn-sm js-review-all-voices" aria-controls="voice-review-people-section">Review all ${clusters.length} voices in People &amp; Team →</button>`
+    : "";
 
   if (banner) {
     banner.innerHTML = `
       <div class="voice-banner-inner">
         <div class="voice-banner-header">
-          <h3>🎙️ Speaker Identity Review (${clusters.length} pending)</h3>
-          <p>We detected recurring voices across your meetings. Confirming them enrolls their voiceprint and updates past meetings automatically.</p>
+          <h3>🎙️ Speaker Identity Review (${clusters.length} recurring voices)</h3>
+          <p>Showing the ${Math.min(clusters.length, VOICE_LIBRARY_LIMIT)} highest-impact voices. Confirming one updates every matching meeting.</p>
           <button type="button" class="btn-outline btn-sm" onclick="confirmConfidentVoiceClusters()">✓ Confirm High-Confidence Matches</button>
+          ${reviewAllButton}
         </div>
-        <div class="voice-cards-scroll">${cardsHtml}</div>
+        <div class="voice-cards-scroll">${libraryCardsHtml}</div>
       </div>
     `;
     banner.style.display = "block";
@@ -1257,6 +1313,13 @@ document.addEventListener("click", (event) => {
 //
 // Delegated from document so it survives every re-render of the card list.
 document.addEventListener("click", (event) => {
+  const reviewAll = event.target.closest(".js-review-all-voices");
+  if (reviewAll) {
+    const peopleTab = $("tab-button-knowledge");
+    activateTab(peopleTab);
+    requestAnimationFrame(() => $("voice-review-heading")?.focus());
+    return;
+  }
   const listen = event.target.closest(".js-voice-listen");
   if (listen) {
     playClusterClips(listen.dataset.cluster);
@@ -1408,12 +1471,20 @@ function switchAskMode(mode) {
   if (mode === "timeline") {
     if (qaBtn) qaBtn.classList.remove("active");
     if (tlBtn) tlBtn.classList.add("active");
+    if (qaBtn) qaBtn.setAttribute("aria-selected", "false");
+    if (qaBtn) qaBtn.setAttribute("tabindex", "-1");
+    if (tlBtn) tlBtn.setAttribute("aria-selected", "true");
+    if (tlBtn) tlBtn.setAttribute("tabindex", "0");
     if (qaPanel) qaPanel.style.display = "none";
     if (tlPanel) tlPanel.style.display = "block";
     loadTimelineForTopic("all");
   } else {
     if (tlBtn) tlBtn.classList.remove("active");
     if (qaBtn) qaBtn.classList.add("active");
+    if (tlBtn) tlBtn.setAttribute("aria-selected", "false");
+    if (tlBtn) tlBtn.setAttribute("tabindex", "-1");
+    if (qaBtn) qaBtn.setAttribute("aria-selected", "true");
+    if (qaBtn) qaBtn.setAttribute("tabindex", "0");
     if (tlPanel) tlPanel.style.display = "none";
     if (qaPanel) qaPanel.style.display = "block";
   }
@@ -1500,6 +1571,7 @@ function jumpToMeeting(meetingId) {
 // ── Application Initialization ───────────────────────────────────────
 function init() {
   setupTabs();
+  setupAskModeTabs();
   setupEventListeners();
   setupAskPanel();
   setupCommitmentsPanel();

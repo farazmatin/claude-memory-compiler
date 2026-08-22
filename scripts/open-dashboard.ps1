@@ -37,7 +37,11 @@ if (-not (Test-DashboardAvailable)) {
         -RedirectStandardError $standardError `
         -PassThru
 
-    $deadline = (Get-Date).AddSeconds(10)
+    # Importing the dashboard can take more than ten seconds on Windows after a
+    # cold start (notably while Python warms its dependency cache).  The process
+    # may already be listening by then, so a short deadline reports a false
+    # failure and leaves the user thinking the sign-in launcher is broken.
+    $deadline = (Get-Date).AddSeconds(30)
     while ((Get-Date) -lt $deadline) {
         if (Test-DashboardAvailable) {
             break

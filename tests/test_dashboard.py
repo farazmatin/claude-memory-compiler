@@ -189,6 +189,24 @@ def test_people_management_and_speaker_override(manifest):
         assert speakers.get("SPEAKER_00") == "Bob"
 
 
+def test_people_api_normalizes_aliases_for_the_frontend(manifest, monkeypatch):
+    monkeypatch.setattr(
+        db,
+        "list_people",
+        lambda conn: [
+            {"canonical": "Michael", "role": "PM", "aliases": "mike, mikey", "meetings": 2},
+            {"canonical": "Alice", "role": None, "aliases": None, "meetings": 0},
+            {"canonical": "Ruth", "role": None, "aliases": ["ruthie"], "meetings": 1},
+        ],
+    )
+
+    result = dashboard.people()
+
+    assert result[0]["aliases"] == ["mike", "mikey"]
+    assert result[1]["aliases"] == []
+    assert result[2]["aliases"] == ["ruthie"]
+
+
 def test_pipeline_status_and_trigger():
     status = dashboard.get_pipeline_status()
     assert "running" in status
@@ -545,6 +563,7 @@ def test_cluster_members_expose_clip_count_and_inferred_name(manifest, monkeypat
     """
     import json as _json
 
+    monkeypatch.setattr(dashboard.voices, "cluster_pending", lambda conn: None)
     monkeypatch.setattr(db, "pending_clusters", lambda conn, limit=50: [
         {
             "id": "cluster-1",
@@ -579,6 +598,7 @@ def test_cluster_offers_the_transcript_name_as_a_second_suggestion(manifest, mon
     so that second, independent signal was collected and never offered - which
     is exactly the case where the voiceprint is weakest.
     """
+    monkeypatch.setattr(dashboard.voices, "cluster_pending", lambda conn: None)
     monkeypatch.setattr(db, "pending_clusters", lambda conn, limit=50: [
         {
             "id": "cluster-2",

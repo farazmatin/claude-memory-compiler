@@ -16,9 +16,12 @@
           <h1>Meeting <em>Memory</em></h1>
         </div>
         <div class="masthead-controls">
-          <div class="pipeline-badge" id="pipeline-indicator">
-            <span class="badge-dot" id="badge-dot"></span>
-            <span id="pipeline-status-text">All Caught Up</span>
+          <div class="status-row">
+            <div class="pipeline-badge" id="pipeline-indicator">
+              <span class="badge-dot" id="badge-dot"></span>
+              <span id="pipeline-status-text">Checking Processing</span>
+            </div>
+            <div class="archive-badge" id="archive-attention" aria-live="polite">Checking Archive</div>
           </div>
           <div class="masthead-actions">
             <button type="button" id="btn-quick-run" class="btn-action">▶ Sync &amp; Process Recordings</button>
@@ -57,28 +60,28 @@
         </article>
         <article>
           <strong id="metric-attention">—</strong>
-          <span>Needs Speaker Name</span>
+          <span>Archive Attention</span>
         </article>
       </section>
 
       <!-- Main Navigation Tabs -->
       <nav class="nav-tabs" role="tablist">
-        <button type="button" class="tab-btn active" data-tab="tab-ledger" role="tab" aria-selected="true">
+        <button type="button" id="tab-button-ledger" class="tab-btn active" data-tab="tab-ledger" role="tab" aria-selected="true" aria-controls="tab-ledger" tabindex="0">
           📖 Meeting Library
         </button>
-        <button type="button" class="tab-btn" data-tab="tab-knowledge" role="tab" aria-selected="false">
+        <button type="button" id="tab-button-knowledge" class="tab-btn" data-tab="tab-knowledge" role="tab" aria-selected="false" aria-controls="tab-knowledge" tabindex="-1">
           👥 People &amp; Team
         </button>
-        <button type="button" class="tab-btn" data-tab="tab-ask" role="tab" aria-selected="false">
+        <button type="button" id="tab-button-ask" class="tab-btn" data-tab="tab-ask" role="tab" aria-selected="false" aria-controls="tab-ask" tabindex="-1">
           💬 Ask AI Assistant
         </button>
-        <button type="button" class="tab-btn" data-tab="tab-control" role="tab" aria-selected="false">
+        <button type="button" id="tab-button-control" class="tab-btn" data-tab="tab-control" role="tab" aria-selected="false" aria-controls="tab-control" tabindex="-1">
           ⚡ Activity &amp; Sync
         </button>
       </nav>
 
       <!-- TAB 1: MEETING LIBRARY (Reader & Archive) -->
-      <section id="tab-ledger" class="tab-pane active" role="tabpanel">
+      <section id="tab-ledger" class="tab-pane active" role="tabpanel" aria-labelledby="tab-button-ledger">
         <!-- Zero-Touch Voice Identification Review Banner -->
         <div id="voice-review-banner" class="voice-review-banner" style="display: none;"></div>
 
@@ -88,7 +91,8 @@
             <h2>Recorded Meetings &amp; Briefs</h2>
           </div>
           <div class="archive-filters">
-            <label class="search">
+            <label class="search" for="meeting-search">
+              <span class="sr-only">Search meetings</span>
               <span aria-hidden="true">⌕</span>
               <input id="meeting-search" type="search" placeholder="Search topic, attendee, or keyword..." />
             </label>
@@ -117,7 +121,7 @@
       </section>
 
       <!-- TAB 2: PEOPLE & TEAM REGISTRY -->
-      <section id="tab-knowledge" class="tab-pane" role="tabpanel">
+      <section id="tab-knowledge" class="tab-pane" role="tabpanel" aria-labelledby="tab-button-knowledge">
         <div class="pane-header">
           <div>
             <p class="eyebrow">PEOPLE &amp; KEY TOPICS</p>
@@ -128,7 +132,7 @@
 
         <!-- Voice Enrollment Review Queue in People Tab -->
         <div id="voice-review-people-section" class="section-card" style="margin-bottom: 24px; display: none;">
-          <h3>🎙️ Unrecognized Voices to Review</h3>
+          <h3 id="voice-review-heading" tabindex="-1">🎙️ Unrecognized Voices to Review</h3>
           <p class="card-desc">Recurring voices detected across meetings that need your confirmation.</p>
           <div id="voice-review-people-list" class="voice-cards-deck"></div>
         </div>
@@ -140,9 +144,18 @@
             <p class="card-desc">Assign roles and nicknames to ensure clean records across meetings.</p>
 
             <form id="form-add-person" class="inline-form">
-              <input type="text" id="person-canonical" placeholder="Full Name (e.g. Christine)" required />
-              <input type="text" id="person-role" placeholder="Role (e.g. Project Lead / Partner)" />
-              <input type="text" id="person-aliases" placeholder="Nicknames / Aliases (comma-separated)" />
+              <label class="field-stack" for="person-canonical">
+                <span>Full name</span>
+                <input type="text" id="person-canonical" placeholder="e.g. Christine" required />
+              </label>
+              <label class="field-stack" for="person-role">
+                <span>Role</span>
+                <input type="text" id="person-role" placeholder="e.g. Project Lead" />
+              </label>
+              <label class="field-stack" for="person-aliases">
+                <span>Nicknames or aliases</span>
+                <input type="text" id="person-aliases" placeholder="Comma-separated" />
+              </label>
               <button type="submit" class="btn-action">Add / Save Person</button>
             </form>
 
@@ -166,9 +179,15 @@
               <h4>Combine Duplicate Names</h4>
               <p class="card-desc">Folds a misspelled name or nickname into a person's primary profile and updates past records.</p>
               <form id="form-merge-person" class="merge-form">
-                <input type="text" id="merge-from" placeholder="Old or Nickname (e.g. Mike)" required />
+                <label class="field-stack" for="merge-from">
+                  <span>Old name</span>
+                  <input type="text" id="merge-from" placeholder="e.g. Mike" required />
+                </label>
                 <span>→</span>
-                <input type="text" id="merge-into" placeholder="Correct Name (e.g. Michael)" required />
+                <label class="field-stack" for="merge-into">
+                  <span>Correct name</span>
+                  <input type="text" id="merge-into" placeholder="e.g. Michael" required />
+                </label>
                 <button type="submit" class="btn-outline">Combine Names</button>
               </form>
             </div>
@@ -223,14 +242,14 @@
       </section>
 
       <!-- TAB 3: ASK AI ASSISTANT & DECISION TIMELINES -->
-      <section id="tab-ask" class="tab-pane" role="tabpanel">
-        <div class="ask-mode-switcher">
-          <button type="button" class="mode-btn active" id="mode-btn-qa" onclick="switchAskMode('qa')">💬 Ask a Question</button>
-          <button type="button" class="mode-btn" id="mode-btn-timeline" onclick="switchAskMode('timeline')">📈 Decision Timeline</button>
+      <section id="tab-ask" class="tab-pane" role="tabpanel" aria-labelledby="tab-button-ask">
+        <div class="ask-mode-switcher" role="tablist" aria-label="Assistant views">
+          <button type="button" class="mode-btn active" id="mode-btn-qa" role="tab" aria-selected="true" aria-controls="ask-qa-panel" tabindex="0" onclick="switchAskMode('qa')">💬 Ask a Question</button>
+          <button type="button" class="mode-btn" id="mode-btn-timeline" role="tab" aria-selected="false" aria-controls="ask-timeline-panel" tabindex="-1" onclick="switchAskMode('timeline')">📈 Decision Timeline</button>
         </div>
 
         <!-- Mode A: Q&A -->
-        <section id="ask-qa-panel" class="question-room" aria-labelledby="ask-title">
+        <section id="ask-qa-panel" class="question-room" role="tabpanel" aria-labelledby="mode-btn-qa">
           <div>
             <p class="eyebrow">CONVERSATIONAL MEETING RECALL</p>
             <h2 id="ask-title">What did we decide?</h2>
@@ -254,7 +273,7 @@
         </section>
 
         <!-- Mode B: Decision Timeline -->
-        <section id="ask-timeline-panel" class="timeline-room" style="display: none;">
+        <section id="ask-timeline-panel" class="timeline-room" role="tabpanel" aria-labelledby="mode-btn-timeline" style="display: none;">
           <div class="timeline-header">
             <div>
               <p class="eyebrow">KNOWLEDGE GRAPH CHRONOLOGY</p>
@@ -271,6 +290,7 @@
           </div>
 
           <form id="timeline-form" class="timeline-search-form" onsubmit="event.preventDefault(); loadTimelineForTopic($('timeline-topic-input').value);">
+            <label class="sr-only" for="timeline-topic-input">Timeline topic</label>
             <input type="text" id="timeline-topic-input" placeholder="Enter any project, property, or topic (e.g. Cambridge lease, Roof estimate)..." />
             <button type="submit" class="btn-action">Generate Timeline</button>
           </form>
@@ -284,7 +304,7 @@
       </section>
 
       <!-- TAB 4: ACTIVITY & OPERATIONS -->
-      <section id="tab-control" class="tab-pane" role="tabpanel">
+      <section id="tab-control" class="tab-pane" role="tabpanel" aria-labelledby="tab-button-control">
         <div class="pane-header">
           <div>
             <p class="eyebrow">RECORDING OPERATIONS</p>

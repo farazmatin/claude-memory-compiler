@@ -27,7 +27,6 @@ from pipeline.config import (
     DASHBOARD_HOST,
     DASHBOARD_PORT,
     DRIVE_CREDENTIALS_FILE,
-    DRIVE_SCOPES,
     DRIVE_TOKEN_FILE,
     GEMINI_MODEL,
     INBOX_DIR,
@@ -184,7 +183,17 @@ def people() -> list[dict[str, Any]]:
     """Return all canonical people and their aliases."""
     db.init_db()
     with db.connect() as conn:
-        return db.list_people(conn)
+        records = db.list_people(conn)
+
+    for person in records:
+        aliases = person.get("aliases")
+        if aliases is None:
+            person["aliases"] = []
+        elif isinstance(aliases, str):
+            person["aliases"] = [alias.strip() for alias in aliases.split(",") if alias.strip()]
+        elif not isinstance(aliases, list):
+            person["aliases"] = list(aliases)
+    return records
 
 
 def add_person(canonical: str, role: str | None = None, aliases: list[str] | None = None) -> None:
