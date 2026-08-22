@@ -10,10 +10,19 @@
 
 These are deliberate. Do not "improve" the template by making it shorter.
 
-- **Target 600–1200 words. This is not an executive summary.** Five tidy bullets
-  are useless for retrieval, because summaries drop *rationale*, and rationale is
-  what answers "why did we deprioritize X?" — the most common question asked of a
-  PM knowledge base months later.
+- **At least 1200 words, with no upper bound. Length follows the meeting.** This
+  is not an executive summary. Five tidy bullets are useless for retrieval,
+  because summaries drop *rationale*, and rationale is what answers "why did we
+  deprioritize X?" — the most common question asked of a PM knowledge base months
+  later.
+
+  There used to be a 600–1200 word ceiling here, applied identically to a
+  five-minute standup and a ninety-minute planning session. Measured across the
+  corpus that produced 35% word retention on average but only **9.5% on the
+  longest meeting** — 15,291 transcript words compressed into 1,454. The meetings
+  with the most worth keeping were compressed the hardest, which is exactly
+  backwards. A long meeting should produce long minutes; do not ration words to
+  hit a target that no longer exists.
 - **Preserve entities verbatim.** Feature names, people, customers, releases, and
   numbers must appear exactly as spoken. The graph index builds nodes from these
   strings; paraphrasing "Project Atlas" into "the platform project" creates a
@@ -34,7 +43,13 @@ this order. Omit any section with no genuine content.
 ---
 date: YYYY-MM-DD
 time: "HH:MM"
-title: Short descriptive title of the meeting
+title: Short, specific title naming the concrete topic, decision, or people
+  involved. Never a generic phrase like "Recording Test", "No Meeting
+  Content", or "Team Sync" on its own - it must distinguish this meeting from
+  every other one in the archive. For a near-empty or clearly accidental
+  recording (a few seconds, one stray sentence), title it plainly as "Empty
+  Recording — {date}" rather than inventing a subject that was never
+  discussed.
 type: standup | one-on-one | stakeholder | discovery | review | planning | other
 attendees: [Name, Name]
 entities: [Feature or project names, customers, releases discussed]
@@ -98,6 +113,14 @@ audio — which matters, because a PM gets asked "did we actually agree to that?
 **Attendees** should use resolved names. If a speaker is still an unresolved
 `SPEAKER_xx` label, list it as `Unknown speaker (SPEAKER_xx)` rather than
 guessing. Consistent spelling across meetings matters more than completeness.
+
+**Title** must be concrete enough to distinguish this meeting from every other
+one in the archive — name the specific topic, decision, or project, not the
+meeting's format ("Standup", "Sync", "Call"). If the metadata gives you an
+existing title from a previous compile of this same transcript, reuse it
+verbatim: the transcript has not changed between compiles, so the title
+should not drift either — a drifted title changes the minutes filename and
+orphans the previous file.
 
 **Entities and Relations** are the most mechanically important sections, and the
 reason is not obvious.

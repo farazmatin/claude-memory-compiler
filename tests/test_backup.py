@@ -75,6 +75,10 @@ def test_report_flags_manifest_failure_without_aborting(tmp_path, monkeypatch):
     monkeypatch.setattr(backup, "DB_PATH", bad_db)
     monkeypatch.setattr(backup, "GLOSSARY_FILE", tmp_path / "missing.md")
     monkeypatch.setattr(backup, "SPEAKER_OVERRIDES_FILE", tmp_path / "missing.yaml")
+    # SNIPPETS_DIR was left unpatched, so backup.run() walked the developer's
+    # real snippets/ tree. Invisible until voice enrollment put 54 files in it,
+    # then this test started counting them.
+    monkeypatch.setattr(backup, "SNIPPETS_DIR", tmp_path / "missing-snippets")
 
     report = backup.run(tmp_path / "backup")
     assert not report.ok
@@ -99,6 +103,10 @@ def test_run_copies_the_irreplaceable_tiers(tmp_path, monkeypatch):
     monkeypatch.setattr(backup, "DB_PATH", tmp_path / "missing.db")
     monkeypatch.setattr(backup, "GLOSSARY_FILE", tmp_path / "missing.md")
     monkeypatch.setattr(backup, "SPEAKER_OVERRIDES_FILE", tmp_path / "missing.yaml")
+    # SNIPPETS_DIR was left unpatched, so backup.run() walked the developer's
+    # real snippets/ tree. Invisible until voice enrollment put 54 files in it,
+    # then this test started counting them.
+    monkeypatch.setattr(backup, "SNIPPETS_DIR", tmp_path / "missing-snippets")
     monkeypatch.setattr(backup, "TEMPLATES_DIR", tmp_path / "missing")
 
     dest = tmp_path / "backup"
@@ -125,6 +133,10 @@ def test_run_can_skip_audio(tmp_path, monkeypatch):
     monkeypatch.setattr(backup, "DB_PATH", tmp_path / "missing.db")
     monkeypatch.setattr(backup, "GLOSSARY_FILE", tmp_path / "missing.md")
     monkeypatch.setattr(backup, "SPEAKER_OVERRIDES_FILE", tmp_path / "missing.yaml")
+    # SNIPPETS_DIR was left unpatched, so backup.run() walked the developer's
+    # real snippets/ tree. Invisible until voice enrollment put 54 files in it,
+    # then this test started counting them.
+    monkeypatch.setattr(backup, "SNIPPETS_DIR", tmp_path / "missing-snippets")
     monkeypatch.setattr(backup, "TEMPLATES_DIR", tmp_path / "missing")
 
     report = backup.run(tmp_path / "backup", include_audio=False)
@@ -144,6 +156,10 @@ def test_second_run_is_incremental(tmp_path, monkeypatch):
     monkeypatch.setattr(backup, "DB_PATH", tmp_path / "missing.db")
     monkeypatch.setattr(backup, "GLOSSARY_FILE", tmp_path / "missing.md")
     monkeypatch.setattr(backup, "SPEAKER_OVERRIDES_FILE", tmp_path / "missing.yaml")
+    # SNIPPETS_DIR was left unpatched, so backup.run() walked the developer's
+    # real snippets/ tree. Invisible until voice enrollment put 54 files in it,
+    # then this test started counting them.
+    monkeypatch.setattr(backup, "SNIPPETS_DIR", tmp_path / "missing-snippets")
 
     dest = tmp_path / "backup"
     assert backup.run(dest).copied["transcripts"] == 1
@@ -165,6 +181,10 @@ def test_backup_never_deletes_from_destination(tmp_path, monkeypatch):
     monkeypatch.setattr(backup, "DB_PATH", tmp_path / "missing.db")
     monkeypatch.setattr(backup, "GLOSSARY_FILE", tmp_path / "missing.md")
     monkeypatch.setattr(backup, "SPEAKER_OVERRIDES_FILE", tmp_path / "missing.yaml")
+    # SNIPPETS_DIR was left unpatched, so backup.run() walked the developer's
+    # real snippets/ tree. Invisible until voice enrollment put 54 files in it,
+    # then this test started counting them.
+    monkeypatch.setattr(backup, "SNIPPETS_DIR", tmp_path / "missing-snippets")
 
     dest = tmp_path / "backup"
     backup.run(dest)

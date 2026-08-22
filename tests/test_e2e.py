@@ -40,6 +40,14 @@ def app(tmp_path, monkeypatch):
     env.update(install_fake_llm(tmp_path))
     apply_env(monkeypatch, env, [asr, index, cli, llm, compile_minutes])
     monkeypatch.setattr(asr, "default_backend", lambda: backend)
+    # This fixture's audio is ~1s with a fixed ~30-word canned transcript,
+    # deliberately tiny for speed - by design that is exactly what the
+    # junk-recording floor (MIN_MEETING_SEC/MIN_TRANSCRIPT_WORDS) exists to
+    # park. That feature has its own coverage in test_minutes_triage.py; disable
+    # it here so it does not interfere with tests that are about pipeline
+    # plumbing rather than this feature.
+    monkeypatch.setattr(cli, "MIN_MEETING_SEC", 0.0)
+    monkeypatch.setattr(cli, "MIN_TRANSCRIPT_WORDS", 0)
 
     class App:
         root = tmp_path
@@ -87,7 +95,10 @@ def test_full_pipeline_audio_to_answer(app, capsys):
 
     # Ingest parsed the real filename and probed the real audio.
     assert meeting.meeting_date == "2026-08-10"
-    assert meeting.meeting_time == "11:00"
+    # "at 11-12 a.m." is 11:12, not an 11-to-12 range: ":" is illegal in a
+    # filename so the recorder writes the minute after a hyphen, which is the
+    # only reading that makes sense of the rest of the corpus ("at 8-40 p.m.").
+    assert meeting.meeting_time == "11:12"
     assert meeting.title_hint == "Ali"
     assert meeting.duration_sec and meeting.duration_sec > 0, "ffprobe read the file"
 
@@ -205,21 +216,27 @@ def test_recompile_rebuilds_without_retranscribing(app, monkeypatch, tmp_path):
     asr_calls = len(app.asr_backend.calls)
     old_doc_id = app.meetings()[0].lightrag_doc_id
 
-    # A new template version produces different minutes.
+    # A new template version produces different minutes. Derive the bumped
+    # value from the real one rather than hard-coding "2": the shipping version
+    # moves, and a literal here silently stops testing anything the moment it
+    # catches up - the corpus recompile that bumped it to "2" did exactly that.
+    from pipeline.config import TEMPLATE_VERSION as CURRENT_VERSION
+
+    bumped = f"{CURRENT_VERSION}-next"
     revised = (tmp_path / "minutes_response.md").read_text().replace(
-        'template_version: "1"', 'template_version: "2"'
+        f'template_version: "{CURRENT_VERSION}"', f'template_version: "{bumped}"'
     ).replace("Atlas Roadmap Review", "Atlas Roadmap Review (revised)")
     (tmp_path / "minutes_response.md").write_text(revised, encoding="utf-8")
 
     from pipeline import compile_minutes
-    monkeypatch.setattr(compile_minutes, "TEMPLATE_VERSION", "2")
-    monkeypatch.setattr(cli, "TEMPLATE_VERSION", "2")
+    monkeypatch.setattr(compile_minutes, "TEMPLATE_VERSION", bumped)
+    monkeypatch.setattr(cli, "TEMPLATE_VERSION", bumped)
 
     assert app.run("minutes", "--recompile") == 0
     assert app.run("index") == 0
 
     assert len(app.asr_backend.calls) == asr_calls, "ASR must not run again"
-    assert app.meetings()[0].template_version == "2"
+    assert app.meetings()[0].template_version == bumped
 
     # The stale copy was removed rather than left beside the new one.
     assert old_doc_id in app.lightrag.deleted, "old version deleted before re-insert"

@@ -1,88 +1,65 @@
-# Implementation Plan — Replicate Serverless GPU ASR Integration
+# Implementation Plan: Cloud ASR, Gemini 3.7 Flash, Categories, 20s Snippets, and Deletion Controls
 
-Enable sub-3-minute meeting minutes generation by integrating **Replicate serverless GPU ASR** (`victor-upmeet/whisperx`) into the Meeting Minutes Compiler (`claude-memory-compiler`). This replaces the slow multi-hour local CPU transcription with an on-demand cloud GPU pipeline while preserving the exact same WhisperX + Pyannote diarization stack and schema.
-
-## User Review Required
-
-> [!IMPORTANT]
-> **API Token Required:** To run against live Replicate servers, you will need a Replicate API token from [replicate.com/account/api-tokens](https://replicate.com/account/api-tokens) and add `REPLICATE_API_TOKEN=r8_...` to your `.env` file.
-> 
-> The pipeline will automatically detect `REPLICATE_API_TOKEN` and use Replicate as the primary ASR backend, while gracefully falling back to local CPU if the token is unset.
+This design and implementation plan details the complete architectural overhaul of `claude-memory-compiler`.
 
 ---
 
-## Proposed Changes
+## 1. Cloud-Based Serverless GPU Transcription
 
-### Configuration & Environment Layer
+### Architecture
+- Replace slow CPU transcription with **Replicate Serverless GPU ASR (`victor-upmeet/whisperx`)**.
+- Uses Pyannote diarization and word alignment in the cloud, completing 40-minute meetings in ~1–2 minutes.
+- Configured with `REPLICATE_API_TOKEN` and dynamic fallback to local CPU if token is unset.
 
-#### [MODIFY] [config.py](file:///c:/Users/faraz/Documents/Script/Git/claude-memory/claude-memory-compiler/pipeline/config.py)
-- Add `REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")`
-- Add `ASR_BACKEND = os.environ.get("MMC_ASR_BACKEND", "auto").lower()` (options: `auto`, `replicate`, `whisperx`)
-- Add `REPLICATE_MODEL = os.environ.get("MMC_REPLICATE_MODEL", "victor-upmeet/whisperx")`
-- Add `REPLICATE_POLL_INTERVAL_SEC = float(os.environ.get("MMC_REPLICATE_POLL_INTERVAL", "2.0"))`
-- Add `REPLICATE_TIMEOUT_SEC = float(os.environ.get("MMC_REPLICATE_TIMEOUT", "600"))`
-
-#### [MODIFY] [.env.example](file:///c:/Users/faraz/Documents/Script/Git/claude-memory/claude-memory-compiler/.env.example)
-- Add documentation and configuration keys for `REPLICATE_API_TOKEN`, `MMC_ASR_BACKEND`, and `MMC_REPLICATE_MODEL`.
+### Core Modules
+- [`pipeline/replicate_asr.py`](file:///c:/Users/faraz/Documents/Script/Git/claude-memory/claude-memory-compiler/pipeline/replicate_asr.py): Backend implementation uploading audio to `/v1/files` and polling predictions.
+- [`pipeline/asr.py`](file:///c:/Users/faraz/Documents/Script/Git/claude-memory/claude-memory-compiler/pipeline/asr.py): Dynamic backend factory routing.
 
 ---
 
-### ASR Engine Layer
+## 2. LLM Engine Enforcement: Gemini 3.7 Flash
 
-#### [NEW] [replicate_asr.py](file:///c:/Users/faraz/Documents/Script/Git/claude-memory/claude-memory-compiler/pipeline/replicate_asr.py)
-- Create `ReplicateBackend` implementing the `Backend` protocol.
-- Normalizes input audio using `normalize_audio()` (to optimize bandwidth and upload speed).
-- Uploads audio to Replicate's files API (`POST https://api.replicate.com/v1/files`).
-- Creates a prediction for `victor-upmeet/whisperx` with:
-  - `audio_file`: uploaded file URL
-  - `diarization`: `True`
-  - `align_output`: `True`
-  - `hf_token`: `HF_TOKEN` (for Pyannote gated access if needed)
-  - `initial_prompt`: vocabulary bias from `glossary.md`
-  - `batch_size`: `16`
-  - `min_speakers` / `max_speakers`: passed from config if configured
-- Polls prediction status with exponential backoff / interval polling until `succeeded` or `failed`.
-- Maps the result segments and word timestamps into `Transcript` dataclass via `_segments_from_whisperx()`.
+### Architecture
+- Enforce **`gemini-3.7-flash`** across minutes compilation, speaker label resolution, and RAG Q&A synthesis.
+- Replaces generic default models.
 
-#### [MODIFY] [asr.py](file:///c:/Users/faraz/Documents/Script/Git/claude-memory/claude-memory-compiler/pipeline/asr.py)
-- Update `default_backend()` to check `ASR_BACKEND` and `REPLICATE_API_TOKEN`.
-- Auto-select `ReplicateBackend()` when configured/available, otherwise use `WhisperXBackend()`.
+### Core Modules
+- [`pipeline/llm.py`](file:///c:/Users/faraz/Documents/Script/Git/claude-memory/claude-memory-compiler/pipeline/llm.py): Centralized model prompt execution with fallback cascades and timeout handling.
+- [`pipeline/config.py`](file:///c:/Users/faraz/Documents/Script/Git/claude-memory/claude-memory-compiler/pipeline/config.py): Global `GEMINI_MODEL = "gemini-3.7-flash"`.
 
 ---
 
-### Preflight Diagnostics & Verification Layer
+## 3. Full-Meeting Speaker Diarization Resolution & 20s Audio Snippets
 
-#### [MODIFY] [doctor.py](file:///c:/Users/faraz/Documents/Script/Git/claude-memory/claude-memory-compiler/pipeline/doctor.py)
-- Enhance `check_asr()` to detect whether Replicate is active.
-- If `REPLICATE_API_TOKEN` is present, verify account authentication / model accessibility via API health probe.
-- Clearly report in doctor output: `[ok] asr backend: Replicate GPU (victor-upmeet/whisperx)`.
+### Architecture
+- Multi-candidate name extraction from Google Drive filenames, title hints, known roster directory, and compiled minutes attendees.
+- Dialogue sampling spanning introduction, middle, and conclusion of meetings.
+- 20-second audio snippet streaming (`/api/audio/snippet?duration=20`) via FFmpeg extraction with 1-click modal speaker assignment.
+- Added `--all` flag to `pipeline speakers` CLI command.
 
----
-
-### Testing & Quality Control Layer
-
-#### [NEW] [test_replicate_asr.py](file:///c:/Users/faraz/Documents/Script/Git/claude-memory/claude-memory-compiler/tests/test_replicate_asr.py)
-- Unit tests for `ReplicateBackend`:
-  - Mock file upload and URL response.
-  - Mock prediction creation and polling loop (`starting` -> `processing` -> `succeeded`).
-  - Verify error handling on prediction failure (`status: failed`).
-  - Verify parsing of segments, word timestamps, and speaker labels into `Transcript`.
-  - Verify `default_backend()` routing logic (auto-detect vs explicit override vs fallback).
+### Core Modules
+- [`pipeline/speakers.py`](file:///c:/Users/faraz/Documents/Script/Git/claude-memory/claude-memory-compiler/pipeline/speakers.py): Name extraction and LLM resolution heuristics.
+- [`pipeline/cli.py`](file:///c:/Users/faraz/Documents/Script/Git/claude-memory/claude-memory-compiler/pipeline/cli.py): CLI parser with `--all` support.
+- [`pipeline/dashboard.py`](file:///c:/Users/faraz/Documents/Script/Git/claude-memory/claude-memory-compiler/pipeline/dashboard.py): `extract_speaker_snippet()` with 20s duration.
 
 ---
 
-## Verification Plan
+## 4. Meeting Categorization & Prominent Date/Time Hierarchy
 
-### Automated Tests
-- Run complete test suite:
-  ```powershell
-  uv run pytest tests/test_replicate_asr.py tests/test_db.py tests/test_compile_minutes.py
-  ```
-- Run code formatting & linter:
-  ```powershell
-  uv run ruff check .
-  ```
+### Architecture
+- Classification into `Personal` (Household, rental properties like 157 Blacklock, family, health) vs `Professional` (Standups, 1:1s, Architecture Discovery, Planning, Reviews).
+- Real meeting occurrence date and time (`📅 Monday, Aug 17 · 🕒 1:51 PM`) prominently featured at the top of cards and reader headers.
+- Category filter in archive toolbar + 1-click live category selector in the reader header.
 
-### Manual Verification
-- Run `uv run pipeline doctor` to verify environment checks and backend detection.
-- Validate with a test audio recording using `uv run pipeline transcribe --limit 1` once token is configured.
+---
+
+## 5. Storage Management & Granular Deletion Controls
+
+### Architecture
+- **Delete Local Audio (`POST /api/meetings/{id}/delete-audio`)**: Deletes the local raw audio file (`.m4a`/`.mp4`), clears `audio_path` in SQLite, and frees disk space while retaining the text minutes, speaker assignments, and LightRAG search indexing.
+- **Delete Meeting & Brief (`DELETE /api/meetings/{id}`)**: Permanently removes the meeting from SQLite, minutes markdown, transcript JSON, local audio, and the LightRAG knowledge graph with safety confirmation.
+
+### Core Modules
+- [`pipeline/db.py`](file:///c:/Users/faraz/Documents/Script/Git/claude-memory/claude-memory-compiler/pipeline/db.py): `delete_meeting()`, `clear_audio_path()`.
+- [`pipeline/dashboard.py`](file:///c:/Users/faraz/Documents/Script/Git/claude-memory/claude-memory-compiler/pipeline/dashboard.py): `delete_meeting_audio()`, `delete_entire_meeting()`, `do_DELETE`.
+- [`pipeline/static/app.js`](file:///c:/Users/faraz/Documents/Script/Git/claude-memory/claude-memory-compiler/pipeline/static/app.js), [`pipeline/static/index.html`](file:///c:/Users/faraz/Documents/Script/Git/claude-memory/claude-memory-compiler/pipeline/static/index.html): Deletion modal dialog and management bar.

@@ -118,7 +118,21 @@ def delete_document(doc_id: str) -> bool:
                 if response.status_code == 404:
                     continue
                 response.raise_for_status()
-                return True
+                # A 2xx is not proof of a delete. LightRAG's ingestion pipeline
+                # is single-threaded, and a delete issued while it is extracting
+                # is declined with 200 + {"status": "busy"} - so trusting the
+                # status code alone reports a delete that never happened, and
+                # the re-insert behind it then fails 409 on a record the caller
+                # believes is gone.
+                try:
+                    body = response.json()
+                except ValueError:
+                    return True
+                declined = isinstance(body, dict) and body.get("status") in {
+                    "busy",
+                    "not_allowed",
+                }
+                return not declined
         except httpx.HTTPError:
             continue
     return False

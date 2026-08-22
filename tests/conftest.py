@@ -80,9 +80,14 @@ def block_live_lightrag_in_unit_tests(request, monkeypatch):
     minutes; that makes the suite slow, non-deterministic, and privacy-unsafe.
     """
     if "e2e" not in request.keywords:
-        from pipeline import index
+        from pipeline import graph_sync, index
 
         monkeypatch.setattr(index, "query_context", lambda *args, **kwargs: "")
+        # graph_sync.retrieve_context() otherwise makes a real httpx call to
+        # LIGHTRAG_URL on every answer.ask(); default it to "no match" so unit
+        # tests exercise the normal (local-fallback) path deterministically
+        # unless a test opts into real graph content explicitly.
+        monkeypatch.setattr(graph_sync, "retrieve_context", lambda *args, **kwargs: "")
 
 
 @pytest.fixture()

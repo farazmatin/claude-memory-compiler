@@ -11,8 +11,10 @@ minutes compilation loses minutes of work rather than hours.
     pipeline ingest                discover + dedup new audio
     pipeline transcribe            ASR + align + diarize      (the expensive one)
     pipeline speakers              resolve SPEAKER_xx -> names
+    pipeline voices                embed voiceprints, rematch and cluster
     pipeline minutes               compile structured minutes
     pipeline index                 push minutes into LightRAG
+    pipeline graph-sync            author the graph from the manifest
     pipeline run                   every pending stage, in order
     pipeline dashboard             browse and search the local meeting record
     pipeline query "question"      ask the knowledge base
@@ -31,10 +33,12 @@ import sys
 import traceback
 from pathlib import Path
 
-from pipeline import capture, compile_minutes, db, entities, index, ingest, speakers
+from pipeline import capture, compile_minutes, db, entities, index, ingest, speakers, voices
 from pipeline.config import (
     DASHBOARD_HOST,
     DASHBOARD_PORT,
+    MIN_MEETING_SEC,
+    MIN_TRANSCRIPT_WORDS,
     OWNER_NAME,
     TEMPLATE_VERSION,
     ensure_dirs,
@@ -45,6 +49,7 @@ STAGE_TRANSCRIBE = "transcribe"
 STAGE_SPEAKERS = "speakers"
 STAGE_MINUTES = "minutes"
 STAGE_INDEX = "index"
+STAGE_VOICES = "voices"
 
 
 # ── init / status ─────────────────────────────────────────────────────
@@ -91,7 +96,20 @@ def cmd_status(_args: argparse.Namespace) -> int:
         if failed:
             print("\nFailed:")
             for meeting in failed:
-                print(f"  {meeting.label}: {(meeting.error or '').splitlines()[:1]}")
+                error = (meeting.error or "").splitlines()
+                print(f"  {meeting.label}: {error[0] if error else ''}")
+
+        # Meetings currently sitting at FAILED are listed above, but a stage
+        # that failed and was later retried successfully leaves that meeting at
+        # a healthy status - invisible here and everywhere else a human looks.
+        # This corpus once had 99 failed transcribe runs, 2 failed minutes and
+        # 1 failed index that nothing surfaced for exactly that reason.
+        history = db.recent_stage_failures(conn)
+        if history:
+            print(f"\nRecent stage failures (last {len(history)}):")
+            for row in history:
+                detail = (row["detail"] or "").splitlines()[0] if row["detail"] else ""
+                print(f"  {row['label']}: {row['stage']} - {detail[:120]}")
 
     try:
         info = index.health()
@@ -145,8 +163,11 @@ def cmd_capture(args: argparse.Namespace) -> int:
 
     try:
         counts = capture.run(dry_run=args.dry_run)
-    except capture.CaptureError as exc:
-        print(exc, file=sys.stderr)
+    except Exception as exc:
+        err_msg = f"Google Drive capture failed: {exc}"
+        print(err_msg, file=sys.stderr)
+        from pipeline import alert
+        alert.send(["drive_capture"], detail=f"{err_msg}\n\nRe-authorize with:\n  uv run pipeline auth-drive")
         return 1
     if not any(counts.values()):
         print("Drive capture is not configured; skipping.")
@@ -157,7 +178,11 @@ def cmd_capture(args: argparse.Namespace) -> int:
         f"known {counts['already_known']}, excluded {counts['excluded']}, "
         f"ambiguous {counts['ambiguous']}, failed {counts['failed']}"
     )
-    return 1 if counts["failed"] else 0
+    if counts["failed"]:
+        from pipeline import alert
+        alert.send(["drive_capture"], detail=f"Drive capture had {counts['failed']} failed downloads.")
+        return 1
+    return 0
 
 
 # ── Stage runners ─────────────────────────────────────────────────────
@@ -218,6 +243,26 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
                     asr_model=transcript.model,
                     duration_sec=transcript.duration_sec or meeting.duration_sec,
                 )
+
+            # Voice embeddings MUST be taken here, before the cleanup below.
+            # cleanup_transcribed_audio deletes the local file for any meeting with
+            # a drive_sources row - which is every Drive-captured meeting, i.e. the
+            # entire normal path. Run this as a separate batch afterwards and the
+            # waveform is already gone: only 7 of 40 meetings still had audio when
+            # enrollment was introduced, and they only did because they happened to
+            # lack that row. Without this ordering the enrollable set can never
+            # grow, so voice recognition never reaches VOICE_MIN_ENROLL_MEETINGS
+            # and the whole subsystem stays permanently below its own threshold.
+            try:
+                from pipeline import enroll
+
+                with db.connect() as conn:
+                    enroll.enroll_meeting(conn, db.get_meeting(conn, meeting.id))
+            except Exception as exc:
+                # Non-fatal, same treatment as a diarization failure: a transcript
+                # without voiceprints is still worth every minute it cost.
+                print(f"    voice embedding skipped: {type(exc).__name__}: {exc}")
+
             try:
                 if capture.cleanup_transcribed_audio(meeting.id, audio_path):
                     print("    released local Drive audio")
@@ -292,6 +337,18 @@ def cmd_speakers(args: argparse.Namespace) -> int:
                 current = db.get_meeting(conn, meeting.id)
                 if current and current.status == db.TRANSCRIBED:
                     db.advance(conn, meeting.id, db.SPEAKERS_RESOLVED)
+
+            # Cheap: no audio, no pyannote. This just notices which labels have
+            # become named and promotes the embedding taken during transcribe into
+            # a voiceprint, so the next meeting can recognise the same person.
+            try:
+                from pipeline import enroll
+
+                with db.connect() as conn:
+                    enroll.enroll_meeting(conn, meeting)
+            except Exception as exc:
+                print(f"    voice bootstrap skipped: {type(exc).__name__}: {exc}")
+
             summary = ", ".join(f"{k}={v}" for k, v in resolved.items()) or "none"
             print(f"    {summary}")
             if unresolved:
@@ -306,6 +363,60 @@ def cmd_speakers(args: argparse.Namespace) -> int:
                 db.finish_stage(conn, run_id, False, detail)
                 db.mark_failed(conn, meeting.id, detail)
 
+    return 1 if failures else 0
+
+
+def cmd_voices(args: argparse.Namespace) -> int:
+    """Embed diarized labels for voice recognition, then rematch and cluster.
+
+    Mostly a retroactive and manual entry point: the embedding itself happens
+    inside `transcribe`, because that is the only moment the audio still exists.
+    What this adds is `finalize()` - rematch and clustering - which has to see the
+    whole corpus at once and so belongs at the end of a batch rather than inside
+    the per-meeting loop.
+    """
+    from pipeline import enroll
+
+    db.init_db()
+    with db.connect() as conn:
+        queue = enroll.eligible_meetings(conn)
+    if args.limit:
+        queue = queue[: args.limit]
+    if not queue:
+        print("Nothing to embed.")
+
+    failures = 0
+    for position, meeting in enumerate(queue, 1):
+        print(f"[{position}/{len(queue)}] {meeting.label}")
+        with db.connect() as conn:
+            run_id = db.start_stage(conn, meeting.id, STAGE_VOICES)
+        try:
+            with db.connect() as conn:
+                result = enroll.enroll_meeting(conn, meeting, force=args.force)
+            summary = (
+                f"{result.embedded} embedded, {result.skipped} skipped, "
+                f"{len(result.errors)} errors"
+            )
+            with db.connect() as conn:
+                db.finish_stage(conn, run_id, not result.errors, summary)
+            print(f"    {summary}")
+            for err in result.errors:
+                print(f"    FAILED {err.label}: {err.detail}")
+        except Exception as exc:
+            failures += 1
+            detail = f"{type(exc).__name__}: {exc}"
+            print(f"    FAILED {detail}")
+            if args.traceback:
+                traceback.print_exc()
+            with db.connect() as conn:
+                db.finish_stage(conn, run_id, False, detail)
+
+    with db.connect() as conn:
+        promoted, clusters = enroll.finalize(conn)
+    print(
+        f"\nRematch promoted {promoted} label(s) to auto; "
+        f"{clusters} cluster(s) awaiting review."
+    )
     return 1 if failures else 0
 
 
@@ -328,6 +439,7 @@ def cmd_minutes(args: argparse.Namespace) -> int:
         return 0
 
     failures = 0
+    skipped = 0
     for position, meeting in enumerate(queue, 1):
         print(f"[{position}/{len(queue)}] {meeting.label}")
         with db.connect() as conn:
@@ -335,6 +447,34 @@ def cmd_minutes(args: argparse.Namespace) -> int:
             resolved = db.get_speakers(conn, meeting.id)
         try:
             transcript = asr.load_transcript(meeting.id)
+
+            # Accidental phone-in-pocket recordings and short test clips still cost
+            # a full LLM compile and land a noise document in the meeting library -
+            # at roughly five a week that is pure recurring waste. Checked here,
+            # before compile_meeting spends the LLM call. Parked rather than
+            # dropped: a genuine sub-two-minute decision is rare but real, and
+            # --force compiles one deliberately.
+            duration = meeting.duration_sec
+            if duration is None:
+                duration = transcript.duration_sec or 0.0
+            word_count = sum(len(seg.text.split()) for seg in transcript.segments)
+            if not args.force and (
+                duration < MIN_MEETING_SEC or word_count < MIN_TRANSCRIPT_WORDS
+            ):
+                reason = (
+                    f"junk recording: {duration:.0f}s / {word_count} words, under "
+                    f"the {MIN_MEETING_SEC:.0f}s / {MIN_TRANSCRIPT_WORDS}-word floor. "
+                    f"Parked, not discarded - `pipeline retry --status "
+                    f"speakers_resolved` then `pipeline minutes --force` compiles "
+                    f"it anyway."
+                )
+                with db.connect() as conn:
+                    db.finish_stage(conn, run_id, False, reason)
+                    db.mark_failed(conn, meeting.id, reason)
+                skipped += 1
+                print(f"    SKIPPED {reason}")
+                continue
+
             with db.connect() as conn:
                 path, document = compile_minutes.compile_meeting(
                     conn, meeting, transcript, resolved
@@ -361,8 +501,101 @@ def cmd_minutes(args: argparse.Namespace) -> int:
             # Deliberately not marked failed: the transcript is intact and
             # the model call is retryable, so the meeting stays in the queue.
 
-    print(f"\nCompiled {len(queue) - failures}/{len(queue)}.")
+    print(f"\nCompiled {len(queue) - failures - skipped}/{len(queue)}.")
+    if skipped:
+        print(
+            f"{skipped} meeting(s) parked as junk recordings (see `pipeline status`)."
+        )
     return 1 if failures else 0
+
+
+def cmd_graph_sync(args: argparse.Namespace) -> int:
+    """Populate the knowledge graph from entities the minutes stage already extracted.
+
+    LightRAG's own extraction runs on the local 4B model and failed all 43
+    documents; the frontier model that writes the minutes has already produced
+    the same entities and relations, so this publishes those instead of asking a
+    weaker model to rediscover them.
+    """
+    from pipeline import graph_sync
+
+    db.init_db()
+    try:
+        index.health()
+    except index.IndexError_ as exc:
+        print(f"{exc}\nStart it with: docker compose up -d")
+        return 1
+
+    before = len(graph_sync.graph_labels())
+    print(f"graph holds {before} entities before sync")
+    report = graph_sync.sync()
+    print(report.summary())
+    for err in report.errors[:10]:
+        print(f"  {err[:160]}")
+    after = len(graph_sync.graph_labels())
+    print(f"graph holds {after} entities after sync")
+    if not after:
+        return 1
+    # A populated graph is not evidence that THIS run worked. LightRAG refuses
+    # every graph edit with 409 while its ingestion pipeline is busy, so a sync
+    # can have all of its writes declined and still find a full graph waiting -
+    # the previous corpus's. Reporting success there leaves the graph quietly
+    # describing meetings that no longer exist in the form it claims.
+    wrote = report.entities_written + report.relations_written
+    if not wrote and report.errors:
+        print(
+            f"graph-sync wrote nothing: {len(report.errors)} write(s) refused. "
+            "The graph still holds the PREVIOUS corpus. Re-run once LightRAG is "
+            "idle (GET /documents/pipeline_status shows busy=false)."
+        )
+        return 1
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Sync all eligible professional minutes to the Product Manager repo."""
+    from pipeline.config import ENABLE_PM_EXPORT, EXPORT_PM_MINUTES_DIR, MINUTES_DIR
+    from pipeline.compile_minutes import is_professional_minute
+
+    if not ENABLE_PM_EXPORT:
+        print("[INFO] PM Export is disabled via MMC_ENABLE_PM_EXPORT=0")
+        return 0
+
+    EXPORT_PM_MINUTES_DIR.mkdir(parents=True, exist_ok=True)
+    all_files = sorted(MINUTES_DIR.glob("*.md"))
+    print(f"\n[SCAN] Evaluating {len(all_files)} minutes in: {MINUTES_DIR}")
+    print(f"[TARGET] Export destination: {EXPORT_PM_MINUTES_DIR}\n")
+
+    synced = 0
+    skipped = 0
+    for path in all_files:
+        try:
+            document = path.read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"  [WARN] Failed to read {path.name}: {e}")
+            continue
+
+        is_prof, reason = is_professional_minute(path, document)
+        if not is_prof:
+            skipped += 1
+            continue
+
+        dest_file = EXPORT_PM_MINUTES_DIR / path.name
+        needs_write = False
+        if not dest_file.exists():
+            needs_write = True
+        elif dest_file.stat().st_mtime < path.stat().st_mtime or dest_file.stat().st_size != path.stat().st_size:
+            needs_write = True
+
+        if needs_write:
+            dest_file.write_text(document, encoding="utf-8")
+            print(f"  + Exported: {path.name} ({reason})")
+        synced += 1
+
+    print("\n" + "=" * 60)
+    print(f"Export Complete: {synced} professional minutes in target, {skipped} personal/family quarantined.")
+    print("=" * 60 + "\n")
+    return 0
 
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -456,8 +689,12 @@ def _run_all(args: argparse.Namespace, include_ingest: bool = True) -> int:
         ("speakers", cmd_speakers, argparse.Namespace(
             limit=args.limit, owner=getattr(args, "owner", None),
             no_llm=args.no_llm, traceback=False)),
+        # After speakers so a freshly named label is promoted to a voiceprint in
+        # the same batch, and so finalize() (rematch + cluster) runs nightly.
+        ("voices", cmd_voices, argparse.Namespace(
+            limit=args.limit, force=False, traceback=False)),
         ("minutes", cmd_minutes, argparse.Namespace(
-            limit=args.limit, recompile=False, traceback=False)),
+            limit=args.limit, recompile=False, traceback=False, force=False)),
         ("index", cmd_index, argparse.Namespace(limit=args.limit)),
     ]
     failed: list[str] = []
@@ -513,10 +750,19 @@ def cmd_query(args: argparse.Namespace) -> int:
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
-    """Open the local, read-only meeting-memory control room."""
-    from pipeline import dashboard
+    """Open the local meeting-memory control room."""
+    from pipeline import dashboard, dashboard_auth
 
-    dashboard.run(host=args.host, port=args.port, open_browser=args.open)
+    try:
+        dashboard.run(host=args.host, port=args.port, open_browser=args.open)
+    except dashboard_auth.AuthError as exc:
+        # A misconfiguration, not a crash: print the fix, not a traceback.
+        print(exc, file=sys.stderr)
+        print(
+            f"\nSuggested token: MMC_DASHBOARD_TOKEN={dashboard_auth.generate_token()}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -532,7 +778,15 @@ def cmd_people(args: argparse.Namespace) -> int:
         if args.merge:
             source, target = args.merge
             rewritten = db.merge_person(conn, source, target)
+            # db.merge_person rewrites the text tables - speakers, entities,
+            # relations, commitments, decisions, aliases - but knows nothing about
+            # voiceprints. Without this the merged-away name keeps its own voice
+            # samples, so the two spellings stay two different people to voice
+            # recognition and the duplicate reappears on the next recording.
+            moved = voices.merge_people(conn, source, target)
             print(f"Merged {source!r} into {target!r} ({rewritten} speaker row(s) rewritten).")
+            if moved:
+                print(f"  moved {moved} voice sample(s) to {target!r}")
             return 0
 
         if args.add:
@@ -674,6 +928,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_transcribe.set_defaults(func=cmd_transcribe)
 
+    p_voices = subparsers.add_parser(
+        "voices", help="embed diarized labels for voice recognition"
+    )
+    add_common(p_voices)
+    p_voices.add_argument(
+        "--force", action="store_true", help="recompute even already-embedded labels"
+    )
+    p_voices.set_defaults(func=cmd_voices)
+
     p_speakers = subparsers.add_parser("speakers", help="resolve speaker labels to names")
     add_common(p_speakers)
     p_speakers.add_argument(
@@ -696,11 +959,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="rebuild minutes whose template_version is stale, from retained "
              "transcripts (no ASR cost)",
     )
+    p_minutes.add_argument(
+        "--force", action="store_true",
+        help="compile even a meeting under the junk-recording floor "
+             "(MMC_MIN_MEETING_SEC / MMC_MIN_TRANSCRIPT_WORDS)",
+    )
     p_minutes.set_defaults(func=cmd_minutes)
+
+    p_export = subparsers.add_parser(
+        "export", help="sync/export professional minutes to Product Manager repo"
+    )
+    p_export.set_defaults(func=cmd_export)
 
     p_index = subparsers.add_parser("index", help="push minutes into LightRAG")
     add_common(p_index)
     p_index.set_defaults(func=cmd_index)
+
+    p_graph = subparsers.add_parser(
+        "graph-sync", help="author the LightRAG graph from the manifest's entities"
+    )
+    p_graph.set_defaults(func=cmd_graph_sync)
 
     p_run = subparsers.add_parser("run", help="every pending stage, in order")
     p_run.add_argument("--limit", type=int, default=None)

@@ -8,6 +8,7 @@ need credentials or a network connection.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import re
@@ -232,6 +233,12 @@ def google_drive_client() -> DriveClient:
     return _GoogleDriveClient(build("drive", "v3", credentials=credentials), MediaIoBaseDownload)
 
 
+def authorize() -> None:
+    """Authorize Google Drive interactively via browser OAuth."""
+    _credentials(interactive=True)
+    print("Google Drive successfully authorized.")
+
+
 def _credentials(*, interactive: bool):
     try:
         from google.auth.transport.requests import Request
@@ -242,19 +249,26 @@ def _credentials(*, interactive: bool):
 
     credentials = None
     if DRIVE_TOKEN_FILE.exists():
-        credentials = Credentials.from_authorized_user_file(str(DRIVE_TOKEN_FILE), DRIVE_SCOPES)
+        try:
+            credentials = Credentials.from_authorized_user_file(str(DRIVE_TOKEN_FILE), DRIVE_SCOPES)
+        except Exception:
+            credentials = None
     if credentials and credentials.expired and credentials.refresh_token:
-        credentials.refresh(Request())
-    elif not credentials or not credentials.valid:
+        try:
+            credentials.refresh(Request())
+        except Exception:
+            credentials = None
+    if not credentials or not credentials.valid:
         if not interactive:
-            raise CaptureError("Drive is not authorized; run `pipeline auth-drive` once")
+            raise CaptureError("Drive is not authorized or token expired; run `python -m pipeline.cli auth-drive` once")
         if not DRIVE_CREDENTIALS_FILE.exists():
             raise CaptureError(f"OAuth desktop client file is missing: {DRIVE_CREDENTIALS_FILE}")
         credentials = InstalledAppFlow.from_client_secrets_file(
             str(DRIVE_CREDENTIALS_FILE), DRIVE_SCOPES
         ).run_local_server(port=0)
-    DRIVE_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DRIVE_TOKEN_FILE.write_text(credentials.to_json(), encoding="utf-8")
+    if credentials and credentials.valid:
+        DRIVE_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DRIVE_TOKEN_FILE.write_text(credentials.to_json(), encoding="utf-8")
     return credentials
 
 
@@ -444,10 +458,8 @@ def _stage_download(client: DriveClient, remote: DriveFile, destination: Path) -
         client.download(remote.file_id, temporary)
         _verify_download(temporary, remote)
         if destination.exists():
-            try:
+            with contextlib.suppress(Exception):
                 destination.unlink(missing_ok=True)
-            except Exception:
-                pass
         for attempt in range(5):
             try:
                 shutil.move(str(temporary), str(destination))

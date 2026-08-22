@@ -85,3 +85,37 @@ def test_failed_delete_is_reported_not_swallowed(tmp_path, monkeypatch):
     _, replaced = index.replace_minutes(path, "doc-stale")
     assert replaced is False
     assert calls == [], "must not insert when the stale copy could not be removed"
+
+
+def test_delete_reports_failure_when_the_server_is_busy(monkeypatch):
+    """LightRAG answers a delete it did not perform with 200 + status "busy".
+
+    Its ingestion pipeline is single-threaded, so a delete issued while
+    documents are still being extracted is refused - but refused with a 200,
+    not a 4xx. Treating any 2xx as success made `delete_document` report
+    "deleted 14/14" while deleting none, and the re-insert that followed hit
+    409 on every one of them.
+    """
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"status": "busy", "message": "Pipeline is busy with another operation."}
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def request(self, *a, **kw):
+            return Response()
+
+    monkeypatch.setattr(index, "_client", lambda: Client())
+    assert index.delete_document("doc-abc") is False

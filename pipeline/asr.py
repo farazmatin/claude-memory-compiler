@@ -173,11 +173,22 @@ def load_glossary_terms() -> list[str]:
     terms: list[str] = []
     for line in GLOSSARY_FILE.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith("#") or stripped.startswith(">"):
+        # A term is a list item, and only a list item. This used to accept any
+        # non-heading line, which fed the file's own instructions to Whisper as
+        # if they were vocabulary: of 19 "terms" extracted from the shipped
+        # glossary, 4 were real and the rest were prose, markdown fragments and
+        # HTML comments. Worse, the prose sits above the names, so it consumed
+        # the ~224-token budget from the top and pushed the actual people the
+        # file exists to protect toward the truncation point.
+        if not re.match(r"^[-*+]\s+", stripped):
             continue
         stripped = re.sub(r"^[-*+]\s*", "", stripped)
+        if stripped.startswith("<!--"):
+            continue
         # Drop any explanatory text after a colon or dash; only the term biases ASR.
         stripped = re.split(r"\s+[-–—]\s+|:\s+", stripped, maxsplit=1)[0].strip()
+        # Markdown emphasis around a term is formatting, not part of the word.
+        stripped = stripped.strip("*_`").strip()
         if stripped:
             terms.append(stripped)
     return terms

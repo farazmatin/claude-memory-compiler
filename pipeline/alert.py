@@ -65,24 +65,62 @@ def build_summary(failed_stages: list[str], detail: str = "") -> tuple[str, str]
     return subject, body
 
 
+def _send_windows_notification(subject: str, detail: str) -> bool:
+    """Show a native desktop balloon/toast notification on Windows."""
+    import sys
+    if sys.platform != "win32":
+        return False
+    try:
+        import base64
+        import json
+        msg = detail.strip().splitlines()[0] if detail.strip() else subject
+        ps_code = f"""
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$n = New-Object System.Windows.Forms.NotifyIcon
+$n.Icon = [System.Drawing.SystemIcons]::Warning
+$n.BalloonTipTitle = {json.dumps(subject[:60])}
+$n.BalloonTipText = {json.dumps(msg[:200])}
+$n.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Error
+$n.Visible = $true
+$n.ShowBalloonTip(5000)
+Start-Sleep -Milliseconds 400
+$n.Dispose()
+"""
+        encoded = base64.b64encode(ps_code.encode("utf-16le")).decode("ascii")
+        subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        return True
+    except Exception:
+        return False
+
+
 def send(failed_stages: list[str], detail: str = "") -> bool:
-    """Fire the alert command. Returns False if it could not be delivered.
+    """Fire the alert command and show a desktop alert on Windows.
 
     Never raises: an alerting failure must not mask the pipeline failure it is
     reporting, which would be a strictly worse outcome than no alert.
     """
-    if not ALERT_COMMAND:
-        return False
-
     subject, body = build_summary(failed_stages, detail)
+
+    # Always attempt desktop notification on Windows
+    windows_alerted = _send_windows_notification(subject, detail)
+
+    if not ALERT_COMMAND:
+        return windows_alerted
+
     try:
         argv = [part.replace("{subject}", subject) for part in split_command(ALERT_COMMAND)]
     except ValueError as exc:
         print(f"  alert command is not parseable ({exc}); not sent")
-        return False
+        return windows_alerted
 
     if not argv:
-        return False
+        return windows_alerted
 
     try:
         result = subprocess.run(
@@ -95,11 +133,11 @@ def send(failed_stages: list[str], detail: str = "") -> bool:
         )
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"  alert delivery failed: {type(exc).__name__}: {exc}")
-        return False
+        return windows_alerted
 
     if result.returncode != 0:
         print(f"  alert command exited {result.returncode}: {result.stderr.strip()[:200]}")
-        return False
+        return windows_alerted
 
     print(f"  alert sent via {argv[0]}")
     return True

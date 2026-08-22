@@ -28,8 +28,10 @@ from pipeline.config import (
     ASR_DEVICE,
     ASR_MODEL,
     AUDIO_DIR,
+    DASHBOARD_HOST,
     DB_PATH,
     DRIVE_CREDENTIALS_FILE,
+    DRIVE_SCOPES,
     DRIVE_TOKEN_FILE,
     ENABLE_DIARIZATION,
     GLOSSARY_FILE,
@@ -42,6 +44,7 @@ from pipeline.config import (
     REPLICATE_API_TOKEN,
     REPLICATE_MODEL,
     TRANSCRIPTS_DIR,
+    VOICE_MIN_ENROLL_MEETINGS,
 )
 
 OK = "ok"
@@ -287,10 +290,66 @@ def check_lightrag() -> list[Check]:
                     "use the provided docker-compose.yml (Postgres storage)",
                 )
             )
+        # Reachable is not the same as working. LightRAG answers /health while
+        # its extraction queue fails every job, and it returns 200 on insert
+        # because that only enqueues - so the index stage marked all 43 documents
+        # INDEXED, `status` printed "healthy", and the dashboard advertised "43
+        # searchable in AI" while the graph held nothing and every answer came
+        # from a keyword scan of minutes/. Two cheap reads catch that state.
+        checks.extend(_check_graph_populated())
     except index.IndexError_ as exc:
         checks.append(
             Check("lightrag", FAIL, str(exc)[:160], "docker compose up -d")
         )
+    return checks
+
+
+def _check_graph_populated() -> list[Check]:
+    """The graph has nodes, and documents actually finished processing."""
+    from pipeline import graph_sync
+
+    checks: list[Check] = []
+    labels = graph_sync.graph_labels()
+    if labels:
+        checks.append(Check("lightrag graph", OK, f"{len(labels)} entities"))
+    else:
+        checks.append(
+            Check(
+                "lightrag graph",
+                FAIL,
+                "graph is empty - retrieval silently falls back to a keyword scan",
+                "pipeline graph-sync",
+            )
+        )
+
+    try:
+        import httpx
+
+        headers = {"X-API-Key": LIGHTRAG_API_KEY} if LIGHTRAG_API_KEY else {}
+        resp = httpx.get(f"{LIGHTRAG_URL}/documents/status_counts", headers=headers, timeout=15.0)
+        counts = resp.json().get("status_counts", resp.json()) if resp.status_code == 200 else {}
+        failed = int(counts.get("failed", 0) or 0)
+        processed = int(counts.get("processed", 0) or 0)
+        if failed:
+            # A populated graph makes this expected rather than broken: LightRAG's
+            # own extraction runs on the local model and is bypassed on purpose,
+            # so failing documents alongside a full graph is the design working.
+            # Only an empty graph AND failed documents means retrieval is dead.
+            authored = bool(labels)
+            checks.append(
+                Check(
+                    "lightrag documents",
+                    WARN if (processed or authored) else FAIL,
+                    f"{failed} failed extraction, {processed} processed"
+                    + (" - graph is authored from the manifest instead" if authored else ""),
+                    "" if authored else "pipeline graph-sync",
+                )
+            )
+        elif processed:
+            checks.append(Check("lightrag documents", OK, f"{processed} processed"))
+    except Exception as exc:  # diagnostics must never crash the run
+        checks.append(Check("lightrag documents", WARN, f"status unavailable ({exc})"[:120]))
+
     return checks
 
 
@@ -454,16 +513,49 @@ def check_drive() -> list[Check]:
             )
         )
 
-    if DRIVE_TOKEN_FILE.exists():
-        checks.append(Check("drive token", OK, "configured"))
-    else:
+    if not DRIVE_TOKEN_FILE.exists():
         checks.append(
             Check(
                 "drive token", WARN,
                 f"missing: {DRIVE_TOKEN_FILE}",
-                "run: pipeline auth-drive",
+                "run: uv run pipeline auth-drive",
             )
         )
+    else:
+        try:
+            from google.oauth2.credentials import Credentials
+            from google.auth.transport.requests import Request
+            creds = Credentials.from_authorized_user_file(str(DRIVE_TOKEN_FILE), DRIVE_SCOPES)
+            if creds.expired and creds.refresh_token:
+                try:
+                    creds.refresh(Request())
+                except Exception as exc:
+                    checks.append(
+                        Check(
+                            "drive token", FAIL,
+                            f"token expired/revoked ({exc})",
+                            "run: uv run pipeline auth-drive",
+                        )
+                    )
+                    return checks
+            if creds.valid:
+                checks.append(Check("drive token", OK, "authorized and valid"))
+            else:
+                checks.append(
+                    Check(
+                        "drive token", FAIL,
+                        "token expired or invalid",
+                        "run: uv run pipeline auth-drive",
+                    )
+                )
+        except Exception as exc:
+            checks.append(
+                Check(
+                    "drive token", FAIL,
+                    f"token error: {exc}",
+                    "run: uv run pipeline auth-drive",
+                )
+            )
     return checks
 
 
@@ -507,11 +599,131 @@ def check_nightly_task() -> list[Check]:
     ]
 
 
+def check_dashboard_auth() -> list[Check]:
+    """The dashboard's exposure matches its credentials."""
+    from pipeline import dashboard_auth
+
+    host = DASHBOARD_HOST
+    if dashboard_auth.token_configured():
+        return [Check("dashboard auth", OK, dashboard_auth.describe())]
+    if dashboard_auth.is_loopback(host):
+        return [
+            Check(
+                "dashboard auth",
+                OK,
+                f"no token; bound to {host} only, which is the single-user default",
+            )
+        ]
+    return [
+        Check(
+            "dashboard auth",
+            FAIL,
+            f"MMC_DASHBOARD_HOST={host} with no token - the dashboard will refuse to start",
+            "set MMC_DASHBOARD_TOKEN in .env, or bind to 127.0.0.1",
+        )
+    ]
+
+
+def check_alerting() -> list[Check]:
+    """A nightly failure has to reach a human somehow.
+
+    Without this the only signal is a non-zero exit code and `pipeline status` -
+    which is exactly how 99 failed transcribe runs went unnoticed.
+    """
+    from pipeline import alert
+
+    command = getattr(alert, "ALERT_COMMAND", "") or ""
+    if not command.strip():
+        return [
+            Check(
+                "alerting",
+                WARN,
+                "MMC_ALERT_COMMAND unset - a failed nightly batch notifies nobody",
+                'set MMC_ALERT_COMMAND in .env, e.g. curl -s -d @- https://ntfy.sh/your-topic',
+            )
+        ]
+    # A malformed command should surface here, not at 3am when it is also
+    # swallowing the failure it was meant to report.
+    try:
+        parts = alert.split_command(command)
+    except Exception as exc:
+        return [
+            Check(
+                "alerting",
+                FAIL,
+                f"MMC_ALERT_COMMAND does not parse ({type(exc).__name__}: {exc})",
+                "check quoting in .env",
+            )
+        ]
+    if not parts:
+        return [Check("alerting", FAIL, "MMC_ALERT_COMMAND parses to nothing", "check .env")]
+    return [Check("alerting", OK, f"via {parts[0]}")]
+
+
+def check_voice_enrollment() -> list[Check]:
+    """Whether voice recognition can actually accumulate voiceprints."""
+    checks: list[Check] = []
+    try:
+        import pyannote.audio  # noqa: F401
+    except Exception as exc:
+        return [
+            Check(
+                "voice enrollment",
+                WARN,
+                f"pyannote not importable ({type(exc).__name__}) - no voiceprints will be built",
+                "uv sync --extra asr",
+            )
+        ]
+    if not HF_TOKEN:
+        checks.append(
+            Check(
+                "voice enrollment",
+                WARN,
+                "HF_TOKEN unset - the speaker-embedding model is gated",
+                "set HF_TOKEN and accept the model licence",
+            )
+        )
+        return checks
+
+    with db.connect() as conn:
+        samples = conn.execute("SELECT COUNT(*) FROM voice_samples").fetchone()[0]
+        enrolled = conn.execute(
+            "SELECT COUNT(*) FROM ("
+            "  SELECT canonical FROM voice_samples GROUP BY canonical"
+            "  HAVING COUNT(DISTINCT meeting_id) >= ?"
+            ")",
+            (VOICE_MIN_ENROLL_MEETINGS,),
+        ).fetchone()[0]
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM speaker_matches WHERE state = 'pending'"
+        ).fetchone()[0]
+
+    if not samples:
+        checks.append(
+            Check(
+                "voice enrollment",
+                WARN,
+                "no voiceprints yet - speakers stay unnamed across meetings",
+                "pipeline voices",
+            )
+        )
+    else:
+        detail = (
+            f"{samples} sample(s); {enrolled} person(s) past the "
+            f"{VOICE_MIN_ENROLL_MEETINGS}-meeting auto-match threshold; {pending} pending"
+        )
+        checks.append(Check("voice enrollment", OK, detail))
+    return checks
+
+
 ALL_CHECKS = (
     check_ffmpeg,
     check_asr,
     check_diarization,
+    check_voice_enrollment,
     check_providers,
+    check_dashboard_auth,
+    check_alerting,
     check_postgres,
     check_lightrag,
     check_ollama,

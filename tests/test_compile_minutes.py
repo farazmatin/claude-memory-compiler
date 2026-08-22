@@ -280,3 +280,217 @@ def test_topical_lookup_skipped_without_dialogue(manifest, monkeypatch):
     meeting = make_meeting(manifest, "m1", "2026-08-10")
     cm.load_prior_context(manifest, meeting)
     assert called == []
+
+
+# ── title stability across recompiles ──────────────────────────────────
+#
+# A recompile re-runs the SAME retained transcript through a newer template -
+# the words spoken never change - so a title that drifts on every pass is a
+# model quirk, not a reflection of new content. Left unchecked, every drift
+# also orphans the previous minutes file: this corpus already has 32 of them.
+
+def _stub_meeting(minutes_path: str | None) -> db.Meeting:
+    """A Meeting with just enough fields for the helpers under test."""
+    return db.Meeting(
+        id="abc123def456", source_path="", source_name="", audio_path=None,
+        meeting_date="2026-08-10", meeting_time="09:00", title_hint=None,
+        duration_sec=60.0, status=db.MINUTES_COMPILED, asr_model=None,
+        template_version=None, transcript_path=None, minutes_path=minutes_path,
+        lightrag_doc_id=None, error=None, created_at="", updated_at="",
+    )
+
+
+def test_existing_title_reads_prior_frontmatter(tmp_path):
+    old = tmp_path / "old.md"
+    old.write_text("---\ndate: 2026-08-10\ntitle: Prior Title\n---\nbody", encoding="utf-8")
+    assert cm._existing_title(_stub_meeting(str(old))) == "Prior Title"
+
+
+def test_existing_title_is_none_without_a_prior_file():
+    assert cm._existing_title(_stub_meeting(None)) is None
+
+
+def test_existing_title_is_none_when_file_is_gone(tmp_path):
+    assert cm._existing_title(_stub_meeting(str(tmp_path / "missing.md"))) is None
+
+
+def test_build_prompt_anchors_to_the_existing_title(manifest):
+    meeting = make_meeting(manifest, "m1", "2026-08-10")
+    prompt = cm.build_prompt(
+        meeting, build_transcript(), {}, "none", source_audio="audio/x.m4a",
+        existing_title="Prior Title",
+    )
+    assert "Prior Title" in prompt
+    assert "reuse it verbatim" in prompt
+
+
+def test_build_prompt_has_no_title_anchor_on_a_first_compile(manifest):
+    meeting = make_meeting(manifest, "m1", "2026-08-10")
+    prompt = cm.build_prompt(
+        meeting, build_transcript(), {}, "none", source_audio="audio/x.m4a",
+    )
+    assert "reuse it verbatim" not in prompt
+
+
+def test_delete_superseded_minutes_removes_the_old_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(cm, "MINUTES_DIR", tmp_path)
+    old = tmp_path / "old.md"
+    old.write_text("stale", encoding="utf-8")
+    cm._delete_superseded_minutes(_stub_meeting(str(old)), tmp_path / "new.md")
+    assert not old.exists()
+
+
+def test_delete_superseded_minutes_leaves_file_when_path_is_unchanged(tmp_path, monkeypatch):
+    """Rewriting the same path is not a rename - nothing should be unlinked."""
+    monkeypatch.setattr(cm, "MINUTES_DIR", tmp_path)
+    same = tmp_path / "same.md"
+    same.write_text("content", encoding="utf-8")
+    cm._delete_superseded_minutes(_stub_meeting(str(same)), same)
+    assert same.exists()
+
+
+def test_delete_superseded_minutes_refuses_to_touch_outside_minutes_dir(tmp_path, monkeypatch):
+    """Same guard as voices._delete_snippet_files: never unlink outside the
+    directory this stage owns, no matter what the manifest says."""
+    minutes_dir = tmp_path / "minutes"
+    minutes_dir.mkdir()
+    monkeypatch.setattr(cm, "MINUTES_DIR", minutes_dir)
+    outside = tmp_path / "outside.md"
+    outside.write_text("do not touch", encoding="utf-8")
+    cm._delete_superseded_minutes(_stub_meeting(str(outside)), minutes_dir / "new.md")
+    assert outside.exists()
+
+
+def test_delete_superseded_minutes_tolerates_an_already_missing_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(cm, "MINUTES_DIR", tmp_path)
+    cm._delete_superseded_minutes(_stub_meeting(str(tmp_path / "gone.md")), tmp_path / "new.md")
+
+
+def test_delete_superseded_minutes_noop_without_a_prior_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(cm, "MINUTES_DIR", tmp_path)
+    cm._delete_superseded_minutes(_stub_meeting(None), tmp_path / "new.md")
+
+
+def test_recompile_with_a_stable_title_rewrites_the_same_file(manifest, monkeypatch, tmp_path):
+    monkeypatch.setattr(cm, "MINUTES_DIR", tmp_path)
+    old_path = tmp_path / "2026-08-10-stable-title-abc123de.md"
+    old_path.write_text(
+        "---\ndate: 2026-08-10\ntitle: Stable Title\n---\n# Stable Title\n\nold body",
+        encoding="utf-8",
+    )
+    prompts: list[str] = []
+
+    def fake_complete(prompt, order=None):
+        prompts.append(prompt)
+        return "---\ndate: 2026-08-10\ntitle: Stable Title\n---\n# Stable Title\n\nnew body"
+
+    monkeypatch.setattr(cm, "complete", fake_complete)
+    meeting = make_meeting(
+        manifest, "abc123def456", "2026-08-10",
+        status=db.MINUTES_COMPILED, minutes_path=str(old_path),
+    )
+
+    path, doc = cm.compile_meeting(manifest, meeting, build_transcript(), {})
+
+    assert "Stable Title" in prompts[0], "the model must see its own previous title"
+    assert "reuse it verbatim" in prompts[0]
+    assert path == old_path
+    assert path.exists()
+    assert "new body" in doc
+
+
+def test_recompile_with_a_changed_title_orphans_nothing(manifest, monkeypatch, tmp_path):
+    monkeypatch.setattr(cm, "MINUTES_DIR", tmp_path)
+    old_path = tmp_path / "2026-08-10-old-title-abc123de.md"
+    old_path.write_text(
+        "---\ndate: 2026-08-10\ntitle: Old Title\n---\n# Old Title\n\nbody", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        cm, "complete",
+        lambda prompt, order=None: "---\ndate: 2026-08-10\ntitle: New Title\n---\n# New Title\n\nbody",
+    )
+    meeting = make_meeting(
+        manifest, "abc123def456", "2026-08-10",
+        status=db.MINUTES_COMPILED, minutes_path=str(old_path),
+    )
+
+    path, _ = cm.compile_meeting(manifest, meeting, build_transcript(), {})
+
+    assert path != old_path
+    assert path.exists()
+    assert not old_path.exists(), "a retitled recompile must not leave the old file behind"
+
+
+# ── Commitments, decisions and open questions ───────────────────────────
+# compile_meeting parses these out of the same document it just got back from
+# the model, in the same pass as entities - see pipeline/commitments.py.
+
+_NOTES_DOCUMENT = """---
+date: 2026-08-10
+title: Notes Test
+---
+
+# Notes Test
+
+## Decisions
+- **Ship the change today** — decided by Faraz. Rationale: the window closes tonight. [0:01:00]
+
+## Open Questions
+- Who owns the follow-up? Faraz needs to resolve this. [0:02:00]
+
+## Action Items
+- [ ] **Faraz** — file the change request. Due: 2026-08-11. [0:03:00]
+"""
+
+
+def test_compile_meeting_populates_commitments_decisions_and_open_questions(
+    manifest, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(cm, "complete", lambda prompt, order=None: _NOTES_DOCUMENT)
+    monkeypatch.setattr(cm, "MINUTES_DIR", tmp_path)
+
+    meeting = make_meeting(manifest, "m1", "2026-08-10")
+    cm.compile_meeting(manifest, meeting, build_transcript(), {})
+
+    commitment_rows = db.list_commitments(manifest)
+    assert [r["text"] for r in commitment_rows] == ["file the change request."]
+    assert commitment_rows[0]["due_date_iso"] == "2026-08-11"
+
+    decisions = db.get_decisions(manifest, "m1")
+    assert decisions[0]["decided_by"] == "Faraz"
+
+    questions = db.get_open_questions(manifest, "m1")
+    assert questions[0]["owner"] == "Faraz"
+
+
+def test_recompile_replaces_rather_than_duplicates_notes(manifest, monkeypatch, tmp_path):
+    monkeypatch.setattr(cm, "MINUTES_DIR", tmp_path)
+    meeting = make_meeting(manifest, "m1", "2026-08-10")
+
+    monkeypatch.setattr(cm, "complete", lambda prompt, order=None: _NOTES_DOCUMENT)
+    cm.compile_meeting(manifest, meeting, build_transcript(), {})
+    meeting = db.get_meeting(manifest, "m1")  # picks up the just-written minutes_path
+
+    second_pass = _NOTES_DOCUMENT.replace("file the change request", "file the change request v2")
+    monkeypatch.setattr(cm, "complete", lambda prompt, order=None: second_pass)
+    cm.compile_meeting(manifest, meeting, build_transcript(), {})
+
+    commitment_rows = db.list_commitments(manifest)
+    assert [r["text"] for r in commitment_rows] == ["file the change request v2."]
+    assert len(db.get_decisions(manifest, "m1")) == 1
+    assert len(db.get_open_questions(manifest, "m1")) == 1
+
+
+def test_owner_canonicalizes_during_compile(manifest, monkeypatch, tmp_path):
+    db.add_person(manifest, "Faraz", aliases=["Faraz Matin"])
+    doc = _NOTES_DOCUMENT.replace("**Faraz**", "**Faraz Matin**").replace(
+        "decided by Faraz", "decided by Faraz Matin"
+    )
+    monkeypatch.setattr(cm, "complete", lambda prompt, order=None: doc)
+    monkeypatch.setattr(cm, "MINUTES_DIR", tmp_path)
+
+    meeting = make_meeting(manifest, "m1", "2026-08-10")
+    cm.compile_meeting(manifest, meeting, build_transcript(), {})
+
+    assert db.list_commitments(manifest)[0]["owner"] == "Faraz"
+    assert db.get_decisions(manifest, "m1")[0]["decided_by"] == "Faraz"

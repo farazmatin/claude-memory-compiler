@@ -7,7 +7,7 @@
   --clay: #bf573d;
   --clay-pale: #f3d4c7;
   --rule: #c8c1b0;
-  --muted: #68716a;
+  --muted: #5c655e;
   --panel: #fbf8f0;
   --shadow: 8px 10px 0 rgba(29, 41, 35, 0.12);
   --terminal-bg: #141c18;
@@ -51,8 +51,9 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-
 .masthead {
   display: flex;
   justify-content: space-between;
-  gap: 24px;
-  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 20px 32px;
+  align-items: center;
   border-bottom: 2px solid var(--ink);
   padding-bottom: 20px;
 }
@@ -72,8 +73,8 @@ h1, h2, h3, h4 {
 }
 
 h1 {
-  font-size: clamp(3.2rem, 7vw, 6.5rem);
-  letter-spacing: -0.065em;
+  font-size: clamp(2.3rem, 3.4vw, 3.4rem);
+  letter-spacing: -0.05em;
   font-weight: 500;
 }
 
@@ -99,17 +100,21 @@ h3 {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 10px;
+  gap: 14px;
   text-align: right;
+  flex: 0 1 auto;
 }
 
 .masthead-actions {
   display: flex;
-  gap: 8px;
+  gap: 10px;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .masthead-note {
+  max-width: 360px;
   font-size: 0.84rem;
   color: var(--muted);
 }
@@ -145,7 +150,7 @@ h3 {
 .pipeline-badge.running {
   background: var(--clay-pale);
   border-color: var(--clay);
-  color: var(--clay);
+  color: #7d2d1d;
 }
 
 .badge-dot {
@@ -198,7 +203,7 @@ h3 {
 .btn-warn {
   border: 1px solid var(--warn-border);
   background: var(--warn-bg);
-  color: var(--clay);
+  color: #7d2d1d;
   padding: 6px 12px;
   font-weight: 700;
   font-size: 0.8rem;
@@ -218,6 +223,8 @@ h3 {
 }
 
 .signal-strip article {
+  display: flex;
+  flex-direction: column;
   padding: 16px 14px 18px 0;
   border-right: 1px solid var(--rule);
   margin-right: 14px;
@@ -228,13 +235,21 @@ h3 {
   margin-right: 0;
 }
 
+/* Value box is a fixed-height slot (room for up to 2 lines) so a long
+   value (e.g. "37 (1063.1m)") wrapping never shifts the label below it
+   out of alignment with shorter single-line values in neighbouring cells. */
 .signal-strip strong {
-  display: block;
-  font: 500 2.2rem/1 "Palatino Linotype", "Book Antiqua", Palatino, serif;
+  display: flex;
+  align-items: flex-end;
+  min-height: 4.65rem;
+  font: 500 clamp(1.5rem, 2vw, 2.2rem)/1.05 "Palatino Linotype", "Book Antiqua", Palatino, serif;
   color: var(--moss);
+  word-break: break-word;
 }
 
 .signal-strip span {
+  display: block;
+  margin-top: 6px;
   color: var(--muted);
   font-size: 0.74rem;
   text-transform: uppercase;
@@ -327,16 +342,25 @@ h3 {
 }
 
 .archive-layout {
+  /* Shared fill target: reaches down to the viewport bottom on tall
+     screens, but never collapses smaller than 420px on short ones. */
+  --ledger-fill: max(420px, calc(100vh - 620px));
   display: grid;
   grid-template-columns: minmax(300px, 0.95fr) minmax(0, 1.5fr);
-  align-items: start;
+  align-items: stretch;
   gap: 30px;
+  /* Fill the remaining viewport height below the masthead/signal-strip/tabs
+     chrome instead of stopping at a fixed pixel height and leaving dead
+     space above the footer; still grows further if content is taller. */
+  min-height: var(--ledger-fill);
 }
 
 .meeting-list {
   display: grid;
+  align-content: start;
   gap: 10px;
-  max-height: 780px;
+  max-height: var(--ledger-fill);
+  min-height: 420px;
   overflow-y: auto;
   padding-right: 6px;
 }
@@ -396,7 +420,9 @@ h3 {
 
 /* ── Meeting Reader ────────────────────────────────────────────────── */
 .meeting-reader {
-  min-height: 600px;
+  max-height: var(--ledger-fill);
+  min-height: 420px;
+  overflow-y: auto;
   padding: 28px 32px;
   background: var(--panel);
   border-top: 5px solid var(--clay);
@@ -567,7 +593,7 @@ h3 {
 .btn-stage-warn {
   border-color: var(--warn-border);
   background: var(--warn-bg);
-  color: var(--clay);
+  color: #7d2d1d;
 }
 
 .btn-stage-warn:hover {
@@ -994,6 +1020,18 @@ footer {
 }
 
 @media (max-width: 900px) {
+  .masthead {
+    align-items: flex-start;
+  }
+  .masthead-controls {
+    align-items: flex-start;
+    text-align: left;
+    width: 100%;
+    max-width: none;
+  }
+  .masthead-note {
+    max-width: none;
+  }
   .signal-strip {
     grid-template-columns: repeat(3, 1fr);
   }
@@ -1002,6 +1040,7 @@ footer {
   }
   .archive-layout {
     grid-template-columns: 1fr;
+    min-height: 0;
   }
   .question-room {
     grid-template-columns: 1fr;
@@ -1011,6 +1050,10 @@ footer {
   }
   .inline-form {
     grid-template-columns: 1fr;
+  }
+  .section-card,
+  .table-scroll {
+    overflow-x: auto;
   }
 }
 
@@ -1546,3 +1589,30 @@ footer {
 }
 
 
+
+/* Speaker review: clip playback and evidence source. */
+.voice-src {
+  font-size: 0.7rem;
+  font-weight: 600;
+  opacity: 0.7;
+  margin-left: 4px;
+}
+
+/* Eight of the pending speakers have no retained clip and never will - the
+   source audio was deleted after transcription. Say so in place of the play
+   button rather than offering a control that cannot work. */
+.voice-noclip {
+  display: inline-block;
+  font-size: 0.78rem;
+  color: var(--muted);
+  font-style: italic;
+  padding: 4px 0;
+}
+
+/* A sub-threshold voiceprint match is context, not a recommendation. */
+.voice-weak {
+  font-size: 0.75rem;
+  color: var(--muted);
+  font-style: italic;
+  margin-left: 4px;
+}

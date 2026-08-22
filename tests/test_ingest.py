@@ -16,9 +16,17 @@ MTIME = datetime(2026, 8, 10, 14, 30, tzinfo=TZ)
 @pytest.mark.parametrize(
     "filename,date,time,hint",
     [
-        # The real Pixel Recorder convention.
-        ("Ali Aug 10 at 11-12 a.m..m4a", "2026-08-10", "11:00", "Ali"),
+        # The real Pixel Recorder convention. ":" is illegal in a filename, so a
+        # two-digit tail after the hyphen is the minute, not the end of an hour
+        # range - "at 8-40 p.m." can only be 20:40, and 11-12 reads the same way.
+        ("Ali Aug 10 at 11-12 a.m..m4a", "2026-08-10", "11:12", "Ali"),
+        ("Ali Aug 10 at 8-40 p.m..m4a", "2026-08-10", "20:40", "Ali"),
+        # A one-digit tail stays an hour span, which is the honest reading.
         ("Natalie Mar 13 at 2-3 p.m..m4a", "2026-03-13", "14:00", "Natalie"),
+        # Google Drive swaps every space for "_" on download. \s and \b both
+        # fail on that form, which is what stamped Drive captures with mtime.
+        ("Paul_Aug_10_at_11-31_a.m..m4a", "2026-08-10", "11:31", "Paul"),
+        ("1AbC-dEf_6_Yuliya_Aug_11_at_5-11_p.m..m4a", "2026-08-11", "17:11", "1AbC dEf 6 Yuliya"),
         # ISO form a configurable recorder can emit. The "T" separator is
         # preceded by a digit, which is why the date span must be masked before
         # the time is matched.
@@ -118,6 +126,28 @@ def test_distinct_content_is_a_new_meeting(inbox):
     (inbox / "a Aug 10 at 9-10 a.m..m4a").write_bytes(b"one")
     (inbox / "b Aug 11 at 9-10 a.m..m4a").write_bytes(b"two")
     assert ingest.run(verbose=False)["ingested"] == 2
+
+
+def test_delete_meeting_allows_reingesting_the_same_file(inbox):
+    """delete_meeting must clear seen_files, or a source file still in inbox/
+    can never be re-ingested: file_unchanged matches on path/size/mtime alone
+    and has no idea the meeting behind that path was deleted."""
+    target = inbox / "a Aug 10 at 9-10 a.m..m4a"
+    target.write_bytes(b"one")
+    assert ingest.run(verbose=False)["ingested"] == 1
+
+    with db.connect() as conn:
+        meeting_id = conn.execute("SELECT id FROM meetings").fetchone()["id"]
+        assert db.delete_meeting(conn, meeting_id) is True
+
+    # Same path, same size, same mtime - the exact case file_unchanged exists
+    # to skip. Without clearing seen_files, this stays "skipped" forever.
+    counts = ingest.run(verbose=False)
+    assert counts["ingested"] == 1
+    assert counts["skipped"] == 0
+
+    with db.connect() as conn:
+        assert sum(db.status_counts(conn).values()) == 1
 
 
 def test_inbox_files_are_never_removed(inbox):

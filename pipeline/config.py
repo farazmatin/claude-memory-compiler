@@ -42,6 +42,14 @@ ALL_DIRS = [
     INBOX_DIR, DRIVE_HANDOFF_DIR, AUDIO_DIR, TRANSCRIPTS_DIR, MINUTES_DIR, DB_DIR, TEMPLATES_DIR,
 ]
 
+# ── External Export Targets ───────────────────────────────────────────
+# Automatically push sanitized professional minutes to the Product Manager repo
+DEFAULT_PM_MINUTES_DIR = ROOT_DIR.parent.parent / "Product Manager" / "minutes"
+EXPORT_PM_MINUTES_DIR = Path(
+    os.environ.get("MMC_EXPORT_PM_MINUTES_DIR", DEFAULT_PM_MINUTES_DIR)
+).resolve()
+ENABLE_PM_EXPORT = os.environ.get("MMC_ENABLE_PM_EXPORT", "1").lower() not in ("0", "false", "no")
+
 # Populated further down, once SNIPPETS_DIR is defined; kept out of the literal
 # above so the voice settings stay in one block.
 
@@ -125,7 +133,13 @@ VOICE_MODEL = os.environ.get("MMC_VOICE_MODEL", "pyannote/wespeaker-voxceleb-res
 # Retained voice clips, so speakers stay labellable by ear after the source audio
 # is deleted. ~30 KB per speaker against 2-4 MB per audio-hour.
 SNIPPETS_DIR = Path(os.environ.get("MMC_SNIPPETS", ROOT_DIR / "snippets"))
-SNIPPET_COUNT = int(os.environ.get("MMC_SNIPPET_COUNT", "3"))
+# Four clips, not three. Reviewers asked to hear ~20 seconds before putting a
+# name to a voice, and 3x6s tops out at 18. This cannot be applied backwards:
+# clips are cut once, at enrollment, from audio that transcription deletes in
+# the same loop iteration - so the existing corpus keeps whatever it retained
+# (18s for 30 of 57 speakers, 6s for 11, none for 8) and only new meetings
+# reach 24s. Cost stays trivial at ~40 KB per speaker.
+SNIPPET_COUNT = int(os.environ.get("MMC_SNIPPET_COUNT", "4"))
 SNIPPET_SEC = float(os.environ.get("MMC_SNIPPET_SEC", "6"))
 # The opening of a meeting is join noise and overlapping greetings. Clips taken
 # from it are the worst possible evidence to hand someone for a decision.
@@ -174,11 +188,27 @@ HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
 # serve LightRAG, which needs an HTTP endpoint - that runs on local Ollama.
 LLM_PROVIDER_ORDER = [
     name.strip()
-    for name in os.environ.get("MMC_LLM_PROVIDERS", "gemini,codex,claude").split(",")
+    for name in os.environ.get(
+        "MMC_LLM_PROVIDERS", "antigravity,codex,claude,gemini"
+    ).split(",")
     if name.strip()
 ]
 
-# Pin the minutes model to gemini-3.7-flash.
+# Antigravity first. It is the CLI that actually holds a live Google session on
+# this machine - the standalone `gemini` CLI has no oauth_creds.json and burns
+# ~12s per call hitting an interactive prompt it can never satisfy. Antigravity
+# also exposes newer Flash models than the standalone CLI knows about, and it
+# answered a probe in 7.7s where codex takes ~59s.
+ANTIGRAVITY_BIN = os.environ.get("MMC_ANTIGRAVITY_BIN", "agy")
+# `agy models` lists gemini-3.7-flash-{high,medium,low}. The suffix is reasoning
+# effort, not a version: medium is the sensible default for summarisation, and
+# the pipeline's prompts are strict output-format asks rather than open problems.
+ANTIGRAVITY_MODEL = os.environ.get("MMC_ANTIGRAVITY_MODEL", "gemini-3.7-flash-medium")
+
+# The standalone `gemini` CLI's own registry tops out at gemini-3.5-flash and it
+# does not validate ids locally, so a bad id is forwarded and fails server-side
+# rather than failing fast. Note this is a DIFFERENT namespace from Antigravity's:
+# "gemini-3.7-flash" is real there and unknown here.
 GEMINI_MODEL = os.environ.get("MMC_GEMINI_MODEL", "gemini-3.7-flash")
 
 # Per-call ceiling. Generous: a full transcript is a large prompt, and a CLI that
@@ -201,12 +231,31 @@ ALERT_TIMEOUT_SEC = float(os.environ.get("MMC_ALERT_TIMEOUT", "30"))
 # Bump when templates/minutes.md changes semantically. Stamped into every
 # minutes file's frontmatter so `pipeline minutes --recompile` can find stale
 # documents and rebuild them from retained transcripts without re-running ASR.
-TEMPLATE_VERSION = "1"
+TEMPLATE_VERSION = "2"
+
+# Below either floor, `pipeline minutes` parks the meeting instead of spending a
+# full LLM compile on it. Accidental phone-in-pocket recordings and short test
+# clips still produce a document and a card in the meeting library same as a
+# real meeting - at roughly five a week that is pure recurring waste. A genuine
+# sub-two-minute decision is rare but real, so this parks rather than discards:
+# `pipeline minutes --force` compiles a short meeting deliberately.
+MIN_MEETING_SEC = float(os.environ.get("MMC_MIN_MEETING_SEC", "120"))
+# A meeting can clear the duration floor and still be near-silent; word count
+# catches that independently, so either floor alone is enough to park.
+MIN_TRANSCRIPT_WORDS = int(os.environ.get("MMC_MIN_TRANSCRIPT_WORDS", "150"))
 
 # Structured and comprehensive, not a 5-bullet executive summary. Summaries drop
 # rationale, and rationale is what answers "why did we deprioritize X".
-MINUTES_TARGET_WORDS_MIN = 600
-MINUTES_TARGET_WORDS_MAX = 1200
+#
+# A floor with no ceiling, deliberately. The old fixed 600-1200 band was applied
+# identically to a five-minute standup and a ninety-minute planning session:
+# measured across the corpus that kept 35% of the transcript's words on average
+# but only 9.5% of the longest meeting (15,291 words compressed into 1,454). The
+# meetings worth the most were compressed the hardest. Length should follow the
+# meeting, so MAX defaults to 0, meaning unbounded; set MMC_MINUTES_WORDS_MAX to
+# a positive number to reimpose a ceiling.
+MINUTES_TARGET_WORDS_MIN = int(os.environ.get("MMC_MINUTES_WORDS_MIN", "1200"))
+MINUTES_TARGET_WORDS_MAX = int(os.environ.get("MMC_MINUTES_WORDS_MAX", "0"))
 
 # How many prior related minutes to feed the compiler so it can flag decisions
 # that reverse earlier positions.
@@ -228,11 +277,25 @@ LIGHTRAG_TIMEOUT = float(os.environ.get("MMC_LIGHTRAG_TIMEOUT", "600"))
 # spans many meetings ("summarize all budget discussion this year").
 LIGHTRAG_DEFAULT_MODE = os.environ.get("MMC_LIGHTRAG_MODE", "hybrid")
 
+# ── Ask AI conversation history ─────────────────────────────────────────
+# Hard cap on how many prior turns of a chat session join a synthesis prompt,
+# regardless of how many the dashboard has stored - a long-running session
+# must not grow the prompt without bound. answer.py trims further by an
+# approximate token budget on top of this turn count.
+CHAT_HISTORY_TURNS = int(os.environ.get("MMC_CHAT_HISTORY_TURNS", "6"))
+
 # ── Local meeting-memory dashboard ────────────────────────────────────
 # It renders private minutes and Drive links, so LAN exposure requires an explicit
 # environment override. The default remains available only on this machine.
 DASHBOARD_HOST = os.environ.get("MMC_DASHBOARD_HOST", "127.0.0.1")
 DASHBOARD_PORT = int(os.environ.get("MMC_DASHBOARD_PORT", "8765"))
+
+# Shared secret for the dashboard. Empty is fine while the dashboard is bound to
+# loopback - that is the existing single-user setup and the bind address is the
+# boundary. Binding anywhere else without this set makes the dashboard refuse to
+# start, because it serves meeting minutes and DELETE /api/meetings/{id}.
+# Generate one with: python -c "import secrets;print(secrets.token_urlsafe(32))"
+DASHBOARD_TOKEN = os.environ.get("MMC_DASHBOARD_TOKEN", "").strip()
 
 # ── Google Drive capture ─────────────────────────────────────────────
 # Audio reaches this pipeline through a private Drive folder populated by Easy

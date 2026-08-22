@@ -62,9 +62,17 @@ def test_mostly_silent_candidates_are_rejected():
 
 
 def test_dense_speech_is_accepted_at_full_quality():
+    """Dense speech yields a full set of clips - however many that is.
+
+    Asserting a literal 3 pinned the test to the shipping SNIPPET_COUNT, so
+    raising it to give reviewers ~20s of audio broke a test that was never about
+    the count. Derive it, and the test keeps testing quality instead.
+    """
+    from pipeline.config import SNIPPET_COUNT
+
     regions = [(100.0, 400.0)]
     chosen, quality = voices.choose_snippets(regions, words=dense_words(100.0, 400.0))
-    assert len(chosen) == 3
+    assert len(chosen) == SNIPPET_COUNT
     assert quality == voices.QUALITY_OK
 
 

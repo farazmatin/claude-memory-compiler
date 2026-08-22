@@ -1,94 +1,121 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code working in this repository.
 
-## What This Is
+> This file previously described a different project entirely — an Obsidian-wiki
+> compiler with `hooks/`, `scripts/compile.py` and `knowledge/`, none of which
+> exist here. It was left over from an earlier project in the same directory tree
+> and every command in it was wrong. Kept short on purpose: it loads into every
+> session, so depth belongs in AGENTS.md.
 
-A self-evolving personal knowledge base that captures Claude Code conversations, extracts knowledge via the Claude Agent SDK, and compiles it into a searchable markdown wiki. Follows Andrej Karpathy's "LLM Knowledge Base" compiler analogy: `daily/` logs are source code, the LLM is the compiler, `knowledge/` articles are the executable.
+## What this is
+
+The **Meeting Minutes Compiler**. Meeting audio in, a queryable knowledge base out:
+
+```
+audio/        raw recordings (immutable)
+transcripts/  verbatim, retained forever  -> source code
+LLM           extracts structure + rationale -> compiler
+minutes/      the indexed corpus          -> object code
+LightRAG      knowledge graph + vectors   -> linked binary
+```
+
+The load-bearing property: **the compile step is repeatable.** Transcription is the
+only irreversible cost and happens once per recording. A better
+`templates/minutes.md` can rebuild every minutes file from retained transcripts.
+
+**Read [AGENTS.md](AGENTS.md) for the full technical reference** — it is thorough and
+current. Also `docs/PRD.md` (scope), `docs/ARCHITECTURE.md` (what was rejected and
+why), `docs/REVIEW.md`, `docs/VOICE_LABELLING_PLAN.md`.
 
 ## Commands
 
 ```bash
-# Install/sync dependencies
-uv sync
+uv run pipeline init          # dirs + manifest
+uv run pipeline doctor        # preflight; run this first when something is wrong
+uv run pipeline capture       # pull new audio from the private Drive folder
+uv run pipeline ingest        # discover + content-hash dedup
+uv run pipeline transcribe    # ASR + align + diarize (the expensive stage)
+uv run pipeline speakers      # SPEAKER_xx -> names
+uv run pipeline minutes       # compile structured minutes
+uv run pipeline index         # push minutes into LightRAG
+uv run pipeline graph-sync    # author the graph from the manifest's entities
+uv run pipeline run           # every pending stage, in order
+uv run pipeline dashboard     # local web UI on 127.0.0.1:8765
+uv run pipeline query "..."   # ask the knowledge base
+uv run pipeline status        # where everything is, plus stage timings
+uv run pipeline retry         # requeue failed meetings
+uv run pipeline people        # registry: --add / --merge
+uv run pipeline entities      # extracted entities and graph health
+uv run pipeline backup        # snapshot the manifest and artifacts
+uv run pipeline auth-drive    # authorize the private Drive collector
 
-# Compile daily logs → knowledge articles (incremental)
-uv run python scripts/compile.py
-
-# Force recompile all logs
-uv run python scripts/compile.py --all
-
-# Compile a specific log
-uv run python scripts/compile.py --file daily/2026-04-08.md
-
-# Preview what would compile
-uv run python scripts/compile.py --dry-run
-
-# Query the knowledge base
-uv run python scripts/query.py "question here"
-
-# Query and save answer back to KB
-uv run python scripts/query.py "question here" --file-back
-
-# Run all 7 health checks (includes LLM contradiction check)
-uv run python scripts/lint.py
-
-# Structural checks only (free, no LLM)
-uv run python scripts/lint.py --structural-only
+uv run pytest -q              # full suite
+uvx ruff check pipeline/ tests/   # ruff is NOT a declared dependency; use uvx
 ```
 
-Linting uses ruff with 100-char line length (configured in pyproject.toml).
+Stages are resumable and each claims meetings at one status. A crash costs minutes,
+not the hours of transcription behind it.
 
-## Architecture
+## Non-obvious things that will bite you
 
-### Data Flow
+- **The manifest is `db/manifest.db`**, set by `config.DB_PATH`. Anything that opens
+  a bare `./manifest.db` silently reads an empty database and every count comes back
+  zero. This has produced false conclusions more than once.
+- **ASR runs on Replicate** by default (`replicate_asr.py`), because local CPU
+  transcription costs 30–50 minutes per meeting. Do not spend Replicate credits
+  casually; the owner has asked that they be conserved.
+- **The local stack IS installed**, contrary to what this file said earlier:
+  `whisperx` 3.8.6, `pyannote.audio` 4.0.7 and `torch` 2.8.0+cpu all import, and the
+  `pyannote/wespeaker-voxceleb-resnet34-LM` weights are already cached. Verify by
+  running it, not by trusting a doc.
+- **`torchcodec` cannot load its bundled FFmpeg DLLs here**, so pyannote's default
+  file-path decoding fails. pyannote's own warning names the fix and
+  `pipeline/enroll.py` uses it: decode with `whisperx.load_audio` (which shells out
+  to the real ffmpeg on PATH) and hand pyannote
+  `{"waveform": tensor, "sample_rate": sr}` in memory.
+- **Audio is deleted right after transcription.** `cmd_transcribe` calls
+  `capture.cleanup_transcribed_audio()` in the same loop iteration, which removes
+  local audio for any meeting with a `drive_sources` row — i.e. every Drive-captured
+  meeting. Anything that needs the waveform (voice embeddings, snippets) must run
+  BEFORE that call or the audio is already gone. Only 7 of 40 meetings still have
+  audio on disk, and they do only because they lack a `drive_sources` row.
+- **LightRAG's own document extraction does not work on this machine.** It runs on
+  Ollama `qwen3:4b` at ~3.6 tok/s against a 240s `llm_timeout`, so every document
+  fails. The graph is authored instead by `pipeline graph-sync`, from entities the
+  minutes stage already extracted with a frontier model. `doctor` checks that the
+  graph is non-empty; a reachable LightRAG is not the same as a working one.
+- **Retrieval does not use LightRAG's `/query`.** That endpoint runs keyword
+  extraction through the same local model and returns HTTP 500 after ~242s.
+  `graph_sync.retrieve_context()` does a label match plus a `GET /graphs` traversal
+  in ~5s with no LLM. Ollama serves embeddings only.
+- **The LLM chain is subscription-backed CLIs, not metered APIs**, tried in order
+  (`config.LLM_PROVIDER_ORDER`). Antigravity (`agy`) is first and is the one holding
+  a live Google session; the standalone `gemini` CLI has no credentials here. Note
+  the two have *different model namespaces* — `gemini-3.7-flash-*` exists in
+  Antigravity and is unknown to `gemini`.
+- **Antigravity must be driven via `--input-format stream-json`.** `agy --print`
+  takes the prompt as an argument and rejects stdin, and a transcript is far past
+  the ~32 KB Windows argv limit. Every provider is fed on stdin for this reason.
+- **Filenames arrive with underscores.** Google Drive substitutes `_` for every
+  space, and `_` is a word character so `\b` never fires beside it. `ingest.py` uses
+  `[\s_]` plus explicit alphanumeric lookarounds; a naive `\b` fix does not work.
+  Also `at 11-31 a.m.` means 11:31 — `:` is illegal in filenames.
+- **`templates/minutes.md` is the compiler specification.** Editing it changes every
+  future compile. A semantic change should bump `TEMPLATE_VERSION` in `config.py`,
+  which marks existing minutes stale — but recompiling is ~7.8 min per meeting, so
+  confirm with the owner before bumping.
+- **The dashboard has no authentication** and exposes `DELETE /api/meetings/{id}`.
+  It is safe only because it binds to `127.0.0.1`. Do not expose it.
+- **`pipeline doctor` verifies the environment, not output quality.** It cannot tell
+  you the minutes are any good.
 
-```
-Claude Code session
-  → SessionEnd/PreCompact hook fires
-  → hooks extract transcript context (local I/O only, no API calls)
-  → spawn flush.py as detached background process
-  → flush.py calls Agent SDK (allowed_tools=[]) to decide what's worth saving
-  → appends to daily/YYYY-MM-DD.md
-  → if past 6 PM local time, spawns compile.py
-  → compile.py calls Agent SDK (with Read/Write/Edit/Glob/Grep tools)
-  → writes knowledge/concepts/*.md, connections/*.md, updates index.md + log.md
-  → next SessionStart hook injects index.md into new session context
-```
+## Conventions
 
-### Three Layers
-
-- **`hooks/`** — Claude Code lifecycle hooks (SessionStart, PreCompact, SessionEnd). Pure local I/O, fast (<1s). Spawn background processes but never call LLM directly.
-- **`scripts/`** — CLI tools and background agents. These call the Claude Agent SDK. `flush.py` is spawned by hooks; `compile.py`, `query.py`, `lint.py` are run manually or triggered by flush.
-- **`knowledge/`** — LLM-owned output. `index.md` is the master catalog and primary retrieval mechanism (no RAG/embeddings). Articles use YAML frontmatter + Obsidian-style `[[wikilinks]]`.
-
-### Key Patterns
-
-**Recursion prevention:** Hooks check `os.environ.get("CLAUDE_INVOKED_BY")` and exit early if set. `flush.py` sets `os.environ["CLAUDE_INVOKED_BY"] = "memory_flush"` at the top of the file *before any other imports* to prevent Agent SDK from re-triggering hooks.
-
-**Import convention:** Scripts in `scripts/` use sibling imports (`from config import ...`, `from utils import ...`). They are invoked via `uv run python scripts/<name>.py` from project root — the scripts directory is the import context, not the project root.
-
-**Agent SDK usage:** All LLM calls import `claude_agent_sdk` inside async functions (lazy import). Pattern:
-```python
-async def run():
-    from claude_agent_sdk import query, ClaudeAgentOptions, ...
-    async for message in query(prompt=..., options=ClaudeAgentOptions(...)):
-        ...
-```
-
-**Background process spawning:** Hooks use `subprocess.Popen()` with `start_new_session=True` (Linux/Mac) or `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS` (Windows). Stdout/stderr go to DEVNULL; observability is via `scripts/flush.log`.
-
-**Incremental compilation:** `scripts/state.json` tracks SHA-256 hashes of daily logs. compile.py skips unchanged files unless `--all` is passed.
-
-**Deduplication:** `scripts/last-flush.json` tracks session_id + timestamp. flush.py skips if same session was flushed within 60 seconds.
-
-## Configuration
-
-- **Timezone:** `scripts/config.py` line 23 — `TIMEZONE = "America/Toronto"`. Used for daily log dates and the 6 PM auto-compile trigger.
-- **Auto-compile hour:** `scripts/flush.py` line 142 — `COMPILE_AFTER_HOUR = 18`.
-- **Context limits:** session-start.py caps injected context at 20,000 chars. session-end.py extracts last 30 turns (max 15KB).
-- **Hooks:** `.claude/settings.json` — empty matcher catches all events.
-
-## Generated Directories (gitignored)
-
-`daily/`, `knowledge/`, `reports/` — created at runtime. `scripts/state.json`, `scripts/last-flush.json`, `scripts/flush.log` — runtime state files also gitignored.
+- Comments explain **why**, not what. Match the surrounding density — this codebase
+  documents the reasoning behind non-obvious choices, and that is deliberate.
+- Tests: `tests/test_*.py` are unit tests; `tests/test_e2e.py` drives the real CLI
+  over a throwaway tree with real ffmpeg and is marked `e2e`. `tests/e2e_harness.py`
+  fakes only what needs a GPU, a subscription, or a docker stack.
+- `SESSION_STATE.md` carries hand-off notes from recent work, including corrections
+  to earlier wrong conclusions. Read it before re-deriving anything.

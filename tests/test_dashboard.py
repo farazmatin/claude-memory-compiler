@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 from pipeline import dashboard, db
 
 from .conftest import make_meeting
@@ -55,7 +57,11 @@ def test_library_and_detail_read_minutes_inside_archive(manifest, tmp_path, monk
     library = dashboard.meetings("Roadmap")
     detail = dashboard.meeting_detail(meeting_id)
 
-    assert library[0]["title"] == "Roadmap decision"
+    # The minutes document's own heading wins over the filename-derived hint.
+    # The compiler writes that heading from the transcript, so it is the most
+    # specific name available; title_hint is a fallback scraped off the audio
+    # filename and is only reached when the document offers nothing better.
+    assert library[0]["title"] == "Roadmap"
     assert "ship in September" in library[0]["excerpt"]
     assert detail is not None
     assert detail["drive_url"].startswith("https://drive.google.com/")
@@ -97,6 +103,33 @@ def test_overview_computes_extended_metrics(manifest):
     assert "timings" in data
     assert "knowledge" in data
     assert data["knowledge"]["people_count"] >= 1
+
+
+def test_stage_failures_is_its_own_endpoint_not_folded_into_overview(manifest):
+    """Deliberately not a key on overview(): overview is polled every 8s and
+    already makes a network call, so this history is fetched separately, only
+    when the diagnostics drawer is opened."""
+    make_meeting(manifest, "m1", "2026-08-14", title_hint="Sprint Planning")
+    run_id = db.start_stage(manifest, "m1", "transcribe")
+    db.finish_stage(manifest, run_id, False, "OSError: ffmpeg not found")
+    manifest.commit()
+
+    assert "failures" not in dashboard.overview()
+
+    result = dashboard.stage_failures()
+    assert len(result["failures"]) == 1
+    assert result["failures"][0]["stage"] == "transcribe"
+    assert result["failures"][0]["detail"] == "OSError: ffmpeg not found"
+
+
+def test_stage_failures_respects_limit(manifest):
+    make_meeting(manifest, "m1", "2026-08-14")
+    for i in range(3):
+        run_id = db.start_stage(manifest, "m1", "transcribe")
+        db.finish_stage(manifest, run_id, False, f"failure {i}")
+    manifest.commit()
+
+    assert len(dashboard.stage_failures(limit=1)["failures"]) == 1
 
 
 def test_retry_failed_and_retry_meeting(manifest):
@@ -181,8 +214,13 @@ def test_minutes_outside_archive_are_not_exposed(manifest, tmp_path, monkeypatch
     detail = dashboard.meeting_detail(meeting_id)
 
     assert detail is not None
+    # The security property is that the file's CONTENT never leaves the archive.
+    # The excerpt is a fixed UI placeholder, not a read of the file, so it is
+    # allowed to be non-empty - what matters is that it says nothing about the
+    # document sitting outside MINUTES_DIR.
     assert detail["minutes"] == ""
-    assert detail["excerpt"] == ""
+    assert detail["excerpt"] == "No executive summary recorded yet."
+    assert "secret" not in detail["excerpt"].lower()
 
 
 def test_question_validation_and_static_assets_exist():
@@ -198,9 +236,393 @@ def test_question_validation_and_static_assets_exist():
         raise AssertionError("empty dashboard query should be rejected")
 
 
+# ── Ask AI session handling ───────────────────────────────────────────
+
+def _stub_answer(text="ok", provider="gemini", synthesized=True):
+    from pipeline import answer as answer_module
+
+    return answer_module.Answer(
+        text=text, retrieval_sec=0.1, synthesis_sec=0.2, provider=provider,
+        context_chars=10, synthesized=synthesized,
+    )
+
+
+def test_ask_mints_and_returns_a_session_id(manifest, monkeypatch):
+    from pipeline import answer as answer_module
+
+    monkeypatch.setattr(
+        answer_module, "ask",
+        lambda question, mode=None, top_k=None, synthesize=True, history=None: _stub_answer(),
+    )
+
+    result = dashboard.ask("what happened?")
+
+    assert dashboard._valid_session_id(result["session_id"]) == result["session_id"]
+    assert result["provider"] == "gemini"
+
+
+def test_ask_persists_and_replays_history_within_a_session(manifest, monkeypatch):
+    from pipeline import answer as answer_module
+
+    captured_history: list[list[tuple[str, str]] | None] = []
+
+    def fake_ask(question, mode=None, top_k=None, synthesize=True, history=None):
+        captured_history.append(history)
+        return _stub_answer(text=f"answer to {question}", provider="codex")
+
+    monkeypatch.setattr(answer_module, "ask", fake_ask)
+
+    first = dashboard.ask("what did we decide?")
+    session_id = first["session_id"]
+    second = dashboard.ask("why?", session_id=session_id)
+
+    assert second["session_id"] == session_id
+    assert captured_history[0] == []
+    assert captured_history[1] == [("what did we decide?", "answer to what did we decide?")]
+
+
+def test_ask_rejects_malformed_session_id_by_minting_a_fresh_one(manifest, monkeypatch):
+    from pipeline import answer as answer_module
+
+    monkeypatch.setattr(
+        answer_module, "ask",
+        lambda question, mode=None, top_k=None, synthesize=True, history=None: _stub_answer(),
+    )
+
+    result = dashboard.ask("q", session_id="not-a-valid-session-id")
+
+    assert result["session_id"] != "not-a-valid-session-id"
+    assert dashboard._valid_session_id(result["session_id"]) == result["session_id"]
+
+
+def test_clear_chat_session_removes_history_and_returns_new_id(manifest, monkeypatch):
+    from pipeline import answer as answer_module
+
+    monkeypatch.setattr(
+        answer_module, "ask",
+        lambda question, mode=None, top_k=None, synthesize=True, history=None: _stub_answer(),
+    )
+    session_id = dashboard.ask("q", session_id=None)["session_id"]
+
+    result = dashboard.clear_chat_session(session_id)
+
+    assert result["cleared"] == 1
+    assert result["session_id"] != session_id
+    with db.connect() as conn:
+        assert db.recent_chat_turns(conn, session_id) == []
+
+
+def test_clear_chat_session_with_invalid_id_clears_nothing():
+    result = dashboard.clear_chat_session("garbage")
+    assert result["cleared"] == 0
+    assert dashboard._valid_session_id(result["session_id"]) == result["session_id"]
+
+
+def test_valid_session_id_accepts_only_32_hex_chars():
+    good = uuid.uuid4().hex
+    assert dashboard._valid_session_id(good) == good
+    assert dashboard._valid_session_id("not-hex-and-wrong-length") is None
+    assert dashboard._valid_session_id("a" * 31) is None
+    assert dashboard._valid_session_id("g" * 32) is None  # not hex
+    assert dashboard._valid_session_id(None) is None
+
+
 def test_dashboard_command_accepts_local_options():
     args = __import__("pipeline.cli", fromlist=["build_parser"]).build_parser().parse_args(
         ["dashboard", "--host", "127.0.0.1", "--port", "9876"]
     )
     assert args.host == "127.0.0.1"
     assert args.port == 9876
+
+
+def test_classifier_does_not_read_software_vocabulary_as_personal():
+    """Substring matching filed seven work meetings as Personal.
+
+    "lease" matched *re*lease, "tenant" matched multi-tenant, "separation"
+    matched separation of concerns, and "personal" matched personal data - all
+    ordinary vocabulary in a security-software corpus.
+    """
+    for text, title in (
+        ("We shipped the release notes for the multi-tenant refactor.", "USC Release"),
+        ("Separation of concerns between the query and control services.", "Architecture"),
+        ("Personal data handling and the health check endpoint.", "API Security"),
+    ):
+        assert dashboard.classify_meeting_category(text, title, None)["domain"] == "Professional"
+
+
+def test_classifier_still_catches_genuinely_personal_meetings():
+    strong = dashboard.classify_meeting_category(
+        "Discussion about the rental property and the tenant.", "Rental property", None
+    )
+    assert strong["domain"] == "Personal"
+
+    # A weak term in the title is enough on its own.
+    titled = dashboard.classify_meeting_category("Notes.", "Landlord call", None)
+    assert titled["domain"] == "Personal"
+
+
+def test_declared_frontmatter_category_beats_keyword_guessing():
+    """An explicit category is deliberate; heuristics must not override it."""
+    minutes = "---\ndate: 2026-08-12\ncategory: professional\n---\n\nRental property and the landlord."
+    assert dashboard.classify_meeting_category(minutes, "Ops", None)["domain"] == "Professional"
+
+
+def test_transcript_body_drops_the_file_header():
+    rendered = "# Transcript ab\n\n- Model: `x`\n- Language: en\n\n---\n\n**[0:45] A:** hello"
+    assert dashboard._transcript_body(rendered) == "**[0:45] A:** hello"
+    assert dashboard._transcript_body("**[0:01] A:** only turns") == "**[0:01] A:** only turns"
+
+
+# ── Decision timeline (reads decisions/open_questions, not markdown) ───
+
+def test_decision_timeline_reads_the_decisions_table_without_touching_disk(manifest):
+    """No minutes_path is ever set here, and MINUTES_DIR is never monkeypatched -
+    if this passes, the timeline did not read a markdown file to build it."""
+    make_meeting(manifest, "m1", "2026-08-10", title_hint="Roadmap Review", status=db.INDEXED)
+    db.replace_decisions(
+        manifest, "m1",
+        [{"text": "Ship Atlas in Q1", "decided_by": "Faraz", "rationale": "capacity"}],
+    )
+    manifest.commit()  # dashboard.decision_timeline opens its own connection
+
+    result = dashboard.decision_timeline()
+
+    assert result["total_milestones"] == 1
+    event = result["events"][0]
+    assert event["meeting_id"] == "m1"
+    assert event["headline"] == "Ship Atlas in Q1"
+    assert event["decisions"] == ["Ship Atlas in Q1"]
+
+
+def test_decision_timeline_falls_back_to_an_open_question_when_undecided(manifest):
+    make_meeting(manifest, "m1", "2026-08-10", status=db.INDEXED)
+    db.replace_open_questions(manifest, "m1", [{"text": "Who owns onboarding?", "owner": "Faraz"}])
+    manifest.commit()
+
+    event = dashboard.decision_timeline()["events"][0]
+    assert event["headline"] == "Who owns onboarding?"
+
+
+def test_decision_timeline_falls_back_to_a_placeholder_when_nothing_recorded(manifest):
+    make_meeting(manifest, "m1", "2026-08-10", status=db.INDEXED)
+    manifest.commit()
+    event = dashboard.decision_timeline()["events"][0]
+    assert event["headline"] == "Meeting indexed and archived in memory."
+
+
+def test_decision_timeline_caps_decisions_at_three(manifest):
+    make_meeting(manifest, "m1", "2026-08-10", status=db.INDEXED)
+    db.replace_decisions(manifest, "m1", [{"text": f"Decision {i}"} for i in range(5)])
+    manifest.commit()
+    event = dashboard.decision_timeline()["events"][0]
+    assert len(event["decisions"]) == 3
+
+
+def test_decision_timeline_topic_filter_matches_decision_text(manifest):
+    """The topic filter must reach into decision/open-question text, not just
+    the meeting title and entities."""
+    make_meeting(manifest, "m1", "2026-08-10", title_hint="Standup", status=db.INDEXED)
+    make_meeting(manifest, "m2", "2026-08-11", title_hint="Standup", status=db.INDEXED)
+    db.replace_decisions(manifest, "m1", [{"text": "Use Kafka for the event bus"}])
+    db.replace_decisions(manifest, "m2", [{"text": "Ship the UI redesign"}])
+    manifest.commit()
+
+    result = dashboard.decision_timeline("kafka")
+
+    assert result["total_milestones"] == 1
+    assert result["events"][0]["meeting_id"] == "m1"
+
+
+def test_decision_timeline_only_includes_indexed_meetings(manifest):
+    make_meeting(manifest, "m1", "2026-08-10", status=db.MINUTES_COMPILED)
+    manifest.commit()
+    assert dashboard.decision_timeline()["total_milestones"] == 0
+
+
+# ── Commitments and decisions API-backing functions ─────────────────────
+
+def test_commitments_list_wraps_db_query(manifest):
+    make_meeting(manifest, "m1", "2026-08-10")
+    db.replace_commitments(
+        manifest, "m1",
+        [{"text": "task A", "owner": "Faraz"}, {"text": "task B", "owner": "Yuliya"}],
+    )
+    manifest.commit()
+
+    result = dashboard.commitments_list()
+    assert {c["text"] for c in result["commitments"]} == {"task A", "task B"}
+
+    filtered = dashboard.commitments_list(owner="faraz")
+    assert [c["text"] for c in filtered["commitments"]] == ["task A"]
+
+
+def test_commitments_list_overdue_filter(manifest):
+    make_meeting(manifest, "m1", "2026-08-10")
+    db.replace_commitments(
+        manifest, "m1",
+        [
+            {"text": "overdue", "owner": "A", "due_date_iso": "2000-01-01", "state": "open"},
+            {"text": "not due yet", "owner": "A", "due_date_iso": "2999-01-01", "state": "open"},
+        ],
+    )
+    manifest.commit()
+
+    result = dashboard.commitments_list(overdue=True)
+    assert [c["text"] for c in result["commitments"]] == ["overdue"]
+
+
+def test_decisions_list_wraps_db_query_and_topic_filter(manifest):
+    make_meeting(manifest, "m1", "2026-08-10", title_hint="Kafka Review")
+    db.replace_decisions(manifest, "m1", [{"text": "Use Kafka ACLs"}, {"text": "Ship the UI"}])
+    manifest.commit()
+
+    assert len(dashboard.decisions_list()["decisions"]) == 2
+    filtered = dashboard.decisions_list(topic="kafka")
+    assert [d["text"] for d in filtered["decisions"]] == ["Use Kafka ACLs"]
+
+
+# ── Voice snippet serving and merge completeness ──────────────────────
+
+def test_merge_people_moves_voice_samples_too(manifest, monkeypatch):
+    """db.merge_person handles the text tables and knows nothing about voiceprints.
+
+    Merging without moving them leaves the folded-away name holding its own
+    embeddings, so the duplicate identity reappears the next time that person
+    speaks and voice recognition treats the two spellings as two people.
+    """
+    calls = []
+    monkeypatch.setattr(
+        dashboard.voices,
+        "merge_people",
+        lambda conn, source, target: calls.append((source, target)) or 1,
+    )
+    dashboard.add_person("Michael")
+    dashboard.add_person("Mike")
+    dashboard.merge_people("Mike", "Michael")
+    assert calls == [("Mike", "Michael")], "voice samples must follow the merge"
+
+
+def test_voice_snippet_requires_both_identifiers():
+    """A missing label would otherwise match an arbitrary row."""
+    import json as _json
+    from http import HTTPStatus
+
+    captured = {}
+
+    class Fake:
+        _json = lambda self, status, payload: captured.update(status=status, payload=payload)  # noqa: E731
+        _serve_voice_snippet = dashboard.DashboardHandler._serve_voice_snippet
+
+    Fake()._serve_voice_snippet("", "", 0)
+    assert captured["status"] == HTTPStatus.BAD_REQUEST
+    assert "required" in _json.dumps(captured["payload"])
+
+
+def _pending_match(manifest, meeting_id, label, cluster_id, **fields):
+    """A pending speaker_matches row attached to a cluster."""
+    make_meeting(manifest, meeting_id, "2026-08-12", title_hint="Standup")
+    db.upsert_speaker_match(
+        manifest,
+        meeting_id=meeting_id,
+        label=label,
+        cluster_id=cluster_id,
+        state="pending",
+        speech_sec=120.0,
+        **fields,
+    )
+    # get_voice_clusters opens its own connection, so these rows have to land.
+    manifest.commit()
+
+
+def test_cluster_members_expose_clip_count_and_inferred_name(manifest, monkeypatch):
+    """The review card has to say how much audio it can actually play.
+
+    Clips are cut at enrollment and the source audio is deleted right after
+    transcription, so a speaker has whatever was retained and no more: 3 clips
+    for some, 1 for others, none for 8 of them. A card that offers "listen"
+    without saying how long has to guess, and a 6-second speaker then looks
+    broken rather than short.
+    """
+    import json as _json
+
+    monkeypatch.setattr(db, "pending_clusters", lambda conn, limit=50: [
+        {
+            "id": "cluster-1",
+            "size": 1,
+            "total_speech": 120.0,
+            "best_canonical": "Yuliya",
+            "best_score": 0.81,
+            "next_canonical": None,
+            "band": "review",
+        }
+    ])
+    _pending_match(
+        manifest,
+        "b" * 64,
+        "SPEAKER_02",
+        "cluster-1",
+        snippet_paths=_json.dumps(["m/SPEAKER_02-0.opus", "m/SPEAKER_02-1.opus"]),
+        llm_name="Ruth",
+    )
+
+    clusters = dashboard.get_voice_clusters()
+    member = clusters[0]["members"][0]
+    assert member["snippet_count"] == 2
+    assert member["llm_name"] == "Ruth"
+
+
+def test_cluster_offers_the_transcript_name_as_a_second_suggestion(manifest, monkeypatch):
+    """A voiceprint match and a name heard in the room are different evidence.
+
+    The minutes stage already infers names from direct address ("thanks, Ruth")
+    and stores them on the match. The card showed only the voiceprint's guess,
+    so that second, independent signal was collected and never offered - which
+    is exactly the case where the voiceprint is weakest.
+    """
+    monkeypatch.setattr(db, "pending_clusters", lambda conn, limit=50: [
+        {
+            "id": "cluster-2",
+            "size": 2,
+            "total_speech": 240.0,
+            "best_canonical": "Yuliya",
+            "best_score": 0.55,
+            "next_canonical": None,
+            "band": "review",
+        }
+    ])
+    for i, mid in enumerate(("c" * 64, "d" * 64)):
+        _pending_match(manifest, mid, f"SPEAKER_0{i}", "cluster-2", llm_name="Ruth")
+
+    cluster = dashboard.get_voice_clusters()[0]
+    assert cluster["llm_suggestion"] == "Ruth", "the name heard in the room must reach the card"
+
+
+def test_confirm_all_only_touches_clusters_above_the_threshold(manifest, monkeypatch):
+    """Bulk accept is for the confident tail, not the whole queue.
+
+    Confirming a voice writes a name onto every meeting the cluster appears in,
+    so a bulk action that swept up weak matches would spread one wrong guess
+    across the archive - and the per-cluster undo is a manual rename per meeting.
+    """
+    confirmed = []
+    monkeypatch.setattr(
+        dashboard,
+        "get_voice_clusters",
+        lambda: [
+            {"id": "strong", "best_canonical": "Yuliya", "best_score": 0.91},
+            {"id": "weak", "best_canonical": "Catherine", "best_score": 0.62},
+            {"id": "nameless", "best_canonical": None, "best_score": 0.99},
+        ],
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "confirm_voice_cluster",
+        lambda cluster_id, canonical: confirmed.append((cluster_id, canonical)) or 3,
+    )
+
+    result = dashboard.confirm_confident_clusters(threshold=0.85)
+
+    assert confirmed == [("strong", "Yuliya")], "only the confident, named cluster"
+    assert result["clusters"] == 1
+    assert result["meetings"] == 3
+    assert result["skipped"] == 2

@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from pipeline.config import DB_PATH, now_iso
+from pipeline.config import DB_PATH, now_iso, today_iso
 
 # ── Status ladder ─────────────────────────────────────────────────────
 # Ordered. Each stage claims rows at status N and advances them to N+1.
@@ -153,6 +153,55 @@ CREATE TABLE IF NOT EXISTS relations (
 
 CREATE INDEX IF NOT EXISTS idx_relations_subject ON relations(subject);
 
+-- Commitments, decisions and open questions emitted by the minutes compiler.
+-- Same reasoning as entities/relations above: 279 action items and 41 meetings'
+-- worth of decisions existed only as prose the compiler wrote and nothing ever
+-- read back, so "what did I commit to?" had no answer short of grepping 45
+-- markdown files by hand. Parsed out of the same document, in the same pass.
+CREATE TABLE IF NOT EXISTS commitments (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    meeting_id      TEXT NOT NULL,
+    owner           TEXT,               -- canonicalized through people/person_aliases
+    text            TEXT NOT NULL,
+    due_date        TEXT,               -- raw, as written: "unspecified", "before 2026-08-17", ...
+    -- A second column, not in the original table sketch: "raw AND normalised"
+    -- cannot both live in one TEXT column. NULL whenever due_date has no literal
+    -- YYYY-MM-DD in it ("unspecified" and prose-only dates both land here).
+    due_date_iso    TEXT,
+    timestamp_cite  TEXT,               -- verbatim [H:MM:SS] citation(s), never parsed
+    state           TEXT NOT NULL DEFAULT 'open',   -- open | done, from "- [ ]" / "- [x]"
+    created_at      TEXT NOT NULL,
+    UNIQUE(meeting_id, text),
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_commitments_owner_state ON commitments(owner, state);
+-- Powers ?overdue=1: filtering/sorting a raw "unspecified"/"before X" string is
+-- useless, so this indexes the normalised column rather than due_date itself.
+CREATE INDEX IF NOT EXISTS idx_commitments_due_date ON commitments(due_date_iso);
+
+CREATE TABLE IF NOT EXISTS decisions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    meeting_id      TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    decided_by      TEXT,               -- canonicalized; NULL when the prose names no one
+    rationale       TEXT,
+    timestamp_cite  TEXT,
+    created_at      TEXT NOT NULL,
+    UNIQUE(meeting_id, text),
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS open_questions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    meeting_id      TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    owner           TEXT,               -- canonicalized; NULL when the prose names no one
+    created_at      TEXT NOT NULL,
+    UNIQUE(meeting_id, text),
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+);
+
 -- Inbox files already seen, keyed by identity rather than content. Lets ingest
 -- skip hashing a file it has already hashed: the inbox is never emptied (it is a
 -- synced folder), so by year five a nightly run would otherwise re-read ~165 GB
@@ -242,6 +291,32 @@ CREATE TABLE IF NOT EXISTS voice_clusters (
     band            TEXT NOT NULL,      -- review | new
     created_at      TEXT NOT NULL
 );
+
+-- ── Ask AI conversation history ─────────────────────────────────────
+--
+-- One row per question/answer turn. Keyed by a client-held session id rather
+-- than a login, since the dashboard has no accounts - the browser mints one
+-- with localStorage and a "New conversation" click clears it. answer.py stays
+-- storage-agnostic (it takes `history` as a plain list of tuples); this table
+-- is what the dashboard route reads and writes around that call.
+CREATE TABLE IF NOT EXISTS chat_turns (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT NOT NULL,
+    turn_index      INTEGER NOT NULL,   -- 0-based, per session; see append_chat_turn
+    question        TEXT NOT NULL,
+    answer          TEXT NOT NULL,
+    mode            TEXT,
+    provider        TEXT,
+    synthesized     INTEGER NOT NULL,
+    context_chars   INTEGER,
+    retrieval_sec   REAL,
+    synthesis_sec   REAL,
+    created_at      TEXT NOT NULL,
+    UNIQUE(session_id, turn_index)
+);
+
+-- DESC because every read is "the last N turns of this session".
+CREATE INDEX IF NOT EXISTS idx_chat_turns_session ON chat_turns(session_id, turn_index DESC);
 """
 
 
@@ -517,6 +592,29 @@ def reset_to(conn: sqlite3.Connection, meeting_id: str, status: str) -> None:
     advance(conn, meeting_id, status)
 
 
+def clear_audio_path(conn: sqlite3.Connection, meeting_id: str) -> None:
+    """Clear audio_path when the local recording is deleted to save space."""
+    conn.execute(
+        "UPDATE meetings SET audio_path = NULL, updated_at = ? WHERE id = ?",
+        (now_iso(), meeting_id),
+    )
+
+
+def delete_meeting(conn: sqlite3.Connection, meeting_id: str) -> bool:
+    """Delete a meeting and all its related records completely from the database."""
+    conn.execute("DELETE FROM speakers WHERE meeting_id = ?", (meeting_id,))
+    conn.execute("DELETE FROM stage_runs WHERE meeting_id = ?", (meeting_id,))
+    conn.execute("DELETE FROM drive_sources WHERE meeting_id = ?", (meeting_id,))
+    # seen_files is keyed by inbox path, not meeting_id, and ingest.file_unchanged
+    # matches on path/size/mtime alone - it has no idea the meeting behind that
+    # path was deleted. Leaving this row behind means a source file still sitting
+    # in inbox/ can never be re-ingested: every future `pipeline ingest` sees the
+    # same path/size/mtime and skips it, silently and permanently.
+    conn.execute("DELETE FROM seen_files WHERE meeting_id = ?", (meeting_id,))
+    cur = conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
+    return cur.rowcount > 0
+
+
 # ── Speakers ──────────────────────────────────────────────────────────
 
 def set_speaker(
@@ -653,6 +751,12 @@ def merge_person(conn: sqlite3.Connection, from_name: str, into: str) -> int:
     conn.execute("UPDATE entities SET name = ? WHERE name = ?", (into, from_name))
     conn.execute("UPDATE relations SET subject = ? WHERE subject = ?", (into, from_name))
     conn.execute("UPDATE relations SET object = ? WHERE object = ?", (into, from_name))
+    # Same reasoning for the commitment register and decision store: a merge
+    # made after a meeting was already parsed must not leave that meeting's
+    # commitments still attributed to the old spelling.
+    conn.execute("UPDATE commitments SET owner = ? WHERE owner = ?", (into, from_name))
+    conn.execute("UPDATE decisions SET decided_by = ? WHERE decided_by = ?", (into, from_name))
+    conn.execute("UPDATE open_questions SET owner = ? WHERE owner = ?", (into, from_name))
     conn.execute(
         "UPDATE person_aliases SET canonical = ? WHERE canonical = ?", (into, from_name)
     )
@@ -739,6 +843,161 @@ def entity_mentions(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str,
     return [dict(r) for r in rows]
 
 
+# ── Commitments, decisions and open questions ─────────────────────────
+
+def replace_commitments(
+    conn: sqlite3.Connection, meeting_id: str, commitments: list[dict[str, object]]
+) -> None:
+    """Store a meeting's parsed action items, replacing any prior set.
+
+    Replace rather than append, for the same reason replace_entities does: a
+    recompile must not leave the previous run's commitments duplicated
+    underneath the new ones.
+    """
+    conn.execute("DELETE FROM commitments WHERE meeting_id = ?", (meeting_id,))
+    ts = now_iso()
+    for item in commitments:
+        text = (item.get("text") or "").strip()
+        if not text:
+            continue
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO commitments
+                (meeting_id, owner, text, due_date, due_date_iso, timestamp_cite, state, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                meeting_id, item.get("owner"), text, item.get("due_date"),
+                item.get("due_date_iso"), item.get("timestamp_cite"),
+                item.get("state") or "open", ts,
+            ),
+        )
+
+
+def replace_decisions(
+    conn: sqlite3.Connection, meeting_id: str, decisions: list[dict[str, object]]
+) -> None:
+    """Store a meeting's parsed decisions, replacing any prior set."""
+    conn.execute("DELETE FROM decisions WHERE meeting_id = ?", (meeting_id,))
+    ts = now_iso()
+    for item in decisions:
+        text = (item.get("text") or "").strip()
+        if not text:
+            continue
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO decisions
+                (meeting_id, text, decided_by, rationale, timestamp_cite, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (meeting_id, text, item.get("decided_by"), item.get("rationale"),
+             item.get("timestamp_cite"), ts),
+        )
+
+
+def replace_open_questions(
+    conn: sqlite3.Connection, meeting_id: str, questions: list[dict[str, object]]
+) -> None:
+    """Store a meeting's parsed open questions, replacing any prior set."""
+    conn.execute("DELETE FROM open_questions WHERE meeting_id = ?", (meeting_id,))
+    ts = now_iso()
+    for item in questions:
+        text = (item.get("text") or "").strip()
+        if not text:
+            continue
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO open_questions (meeting_id, text, owner, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (meeting_id, text, item.get("owner"), ts),
+        )
+
+
+def get_decisions(conn: sqlite3.Connection, meeting_id: str) -> list[dict[str, object]]:
+    rows = conn.execute(
+        "SELECT * FROM decisions WHERE meeting_id = ? ORDER BY id", (meeting_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_open_questions(conn: sqlite3.Connection, meeting_id: str) -> list[dict[str, object]]:
+    rows = conn.execute(
+        "SELECT * FROM open_questions WHERE meeting_id = ? ORDER BY id", (meeting_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_commitments(
+    conn: sqlite3.Connection, owner: str | None = None, overdue: bool = False
+) -> list[dict[str, object]]:
+    """Commitments across the corpus, joined with meeting context.
+
+    `overdue` implies open: a completed commitment past its due date is not
+    a thing to chase, so it is excluded rather than shown crossed out.
+    """
+    sql = """
+        SELECT c.*, m.meeting_date, m.meeting_time, m.title_hint, m.source_name, m.minutes_path
+        FROM commitments c
+        JOIN meetings m ON m.id = c.meeting_id
+        WHERE 1 = 1
+    """
+    params: list[object] = []
+    if owner:
+        sql += " AND LOWER(c.owner) = LOWER(?)"
+        params.append(owner)
+    if overdue:
+        sql += " AND c.state = 'open' AND c.due_date_iso IS NOT NULL AND c.due_date_iso < ?"
+        params.append(today_iso())
+    sql += " ORDER BY c.state, c.due_date_iso IS NULL, c.due_date_iso, c.owner"
+    rows = conn.execute(sql, params).fetchall()
+    today = today_iso()
+    return [
+        {**dict(r), "overdue": bool(r["state"] == "open" and r["due_date_iso"] and r["due_date_iso"] < today)}
+        for r in rows
+    ]
+
+
+def list_decisions(conn: sqlite3.Connection, topic: str | None = None) -> list[dict[str, object]]:
+    """Decisions across the corpus, joined with meeting context, newest first."""
+    sql = """
+        SELECT d.*, m.meeting_date, m.meeting_time, m.title_hint, m.source_name, m.minutes_path
+        FROM decisions d
+        JOIN meetings m ON m.id = d.meeting_id
+    """
+    params: list[object] = []
+    if topic:
+        like = f"%{topic}%"
+        sql += " WHERE d.text LIKE ? OR d.decided_by LIKE ? OR d.rationale LIKE ?"
+        params += [like, like, like]
+    sql += " ORDER BY m.meeting_date DESC, m.meeting_time DESC, d.id"
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def list_open_questions(
+    conn: sqlite3.Connection, topic: str | None = None
+) -> list[dict[str, object]]:
+    """Open questions across the corpus, joined with meeting context.
+
+    The third register, and the only one with no reader until now: 148 rows were
+    parsed at compile time and had neither an endpoint nor a retrieval path. An
+    unanswered question is often the most useful thing in a meeting - it is the
+    thing still owed.
+    """
+    sql = """
+        SELECT q.*, m.meeting_date, m.meeting_time, m.title_hint, m.source_name, m.minutes_path
+        FROM open_questions q
+        JOIN meetings m ON m.id = q.meeting_id
+    """
+    params: list[object] = []
+    if topic:
+        like = f"%{topic}%"
+        sql += " WHERE q.text LIKE ? OR q.owner LIKE ?"
+        params += [like, like]
+    sql += " ORDER BY m.meeting_date DESC, m.meeting_time DESC, q.id"
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
 # ── Seen-file cache ───────────────────────────────────────────────────
 
 def file_unchanged(conn: sqlite3.Connection, path: str, size: int, mtime: int) -> bool:
@@ -812,6 +1071,52 @@ def stage_timings(conn: sqlite3.Connection) -> list[dict[str, object]]:
         """
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def recent_stage_failures(conn: sqlite3.Connection, limit: int = 20) -> list[dict[str, object]]:
+    """Most recent failed stage_runs, each carrying enough meeting context to
+    read on its own.
+
+    `detail` is written to stage_runs on every run, but until now it was only
+    ever read back in aggregate by `stage_timings`. That means a meeting that
+    failed a stage and was later retried successfully leaves no trace anywhere
+    a human looks: its CURRENT status is healthy, and `pending(conn, FAILED)`
+    only ever sees meetings failing RIGHT NOW. This is that missing history.
+
+    Includes junk-recording parks alongside genuine crashes - both set ok=0 on
+    the stage_run - but each row's `detail` says which: a real failure reads
+    "TypeError: ..." and a park reads "junk recording: ...". Ordered newest
+    first, capped at `limit` so a bad week does not flood the status output.
+    """
+    rows = conn.execute(
+        """
+        SELECT sr.stage, sr.started_at, sr.finished_at, sr.detail,
+               m.id AS meeting_id, m.meeting_date, m.title_hint, m.source_name
+        FROM stage_runs sr
+        JOIN meetings m ON m.id = sr.meeting_id
+        WHERE sr.ok = 0
+        ORDER BY sr.started_at DESC, sr.rowid DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    out = []
+    for r in rows:
+        # Same shape as Meeting.label, computed here because this is a raw join
+        # row rather than a Meeting instance.
+        date = r["meeting_date"] or "????-??-??"
+        hint = r["title_hint"] or r["source_name"]
+        out.append(
+            {
+                "meeting_id": r["meeting_id"],
+                "label": f"{date} {hint} ({r['meeting_id'][:12]})",
+                "stage": r["stage"],
+                "started_at": r["started_at"],
+                "finished_at": r["finished_at"],
+                "detail": r["detail"],
+            }
+        )
+    return out
 
 
 # ── Drive capture ────────────────────────────────────────────────────
@@ -1116,3 +1421,69 @@ def get_setting_float(conn: sqlite3.Connection, key: str, default: float) -> flo
         return float(raw)
     except ValueError:
         return default
+
+
+# ── Ask AI conversation history ──────────────────────────────────────
+
+def append_chat_turn(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    question: str,
+    answer: str,
+    mode: str | None,
+    provider: str | None,
+    synthesized: bool,
+    context_chars: int | None,
+    retrieval_sec: float | None,
+    synthesis_sec: float | None,
+) -> int:
+    """Append one turn to a session and return its turn_index.
+
+    The index is computed here, not trusted from the caller: two requests for
+    the same session landing in the same transaction race onto the same
+    COALESCE(MAX(...)+1, 0) read, and the UNIQUE(session_id, turn_index)
+    constraint turns that race into a clear IntegrityError instead of a
+    silently overwritten turn.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(MAX(turn_index) + 1, 0) AS next_index FROM chat_turns "
+        "WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    turn_index = int(row["next_index"])
+    conn.execute(
+        """
+        INSERT INTO chat_turns (
+            session_id, turn_index, question, answer, mode, provider, synthesized,
+            context_chars, retrieval_sec, synthesis_sec, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id, turn_index, question, answer, mode, provider,
+            1 if synthesized else 0, context_chars, retrieval_sec, synthesis_sec, now_iso(),
+        ),
+    )
+    return turn_index
+
+
+def recent_chat_turns(
+    conn: sqlite3.Connection, session_id: str, limit: int = 6
+) -> list[dict[str, object]]:
+    """The most recent turns of a session, oldest first.
+
+    Oldest-first because this feeds straight into a prompt in conversation
+    order; the DESC index that makes "most recent N" cheap to fetch is undone
+    with a single reverse here rather than in SQL.
+    """
+    rows = conn.execute(
+        "SELECT * FROM chat_turns WHERE session_id = ? ORDER BY turn_index DESC LIMIT ?",
+        (session_id, limit),
+    ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+def clear_chat_session(conn: sqlite3.Connection, session_id: str) -> int:
+    """Delete every turn of a session ("New conversation"). Returns rows removed."""
+    cursor = conn.execute("DELETE FROM chat_turns WHERE session_id = ?", (session_id,))
+    return int(cursor.rowcount or 0)

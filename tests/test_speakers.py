@@ -221,3 +221,251 @@ def test_transcript_without_diarization_resolves_to_nothing(manifest):
     )
     meeting = make_meeting(manifest, "m1", "2026-08-10")
     assert spk.resolve(manifest, meeting, no_speakers) == {}
+
+
+# ── never downgrade a resolved label ────────────────────────────────────
+#
+# db.set_speaker is an unconditional upsert, and resolve() used to call it for
+# every label on every pass - including labels the LLM failed to name this
+# time. Re-running the resolver over the whole corpus therefore reset already
+# -confirmed names back to unknown. These pin the fix at both levels: the pure
+# merge decision, and the full resolve() cascade that must apply it.
+
+def test_merge_keeps_a_confirmed_name_when_the_new_pass_finds_nothing():
+    kept = spk._merge_with_existing(("Faraz", spk.CONFIDENCE_CONFIRMED), None, spk.CONFIDENCE_UNKNOWN)
+    assert kept == ("Faraz", spk.CONFIDENCE_CONFIRMED)
+
+
+def test_merge_keeps_a_confirmed_name_against_a_weaker_inferred_guess():
+    """A human's confirmation must not be second-guessed by a later LLM pass."""
+    kept = spk._merge_with_existing(
+        ("Faraz", spk.CONFIDENCE_CONFIRMED), "SomeoneElse", spk.CONFIDENCE_INFERRED
+    )
+    assert kept == ("Faraz", spk.CONFIDENCE_CONFIRMED)
+
+
+def test_merge_lets_a_new_confirmed_value_replace_an_old_one():
+    """A human editing speaker-overrides.yaml a second time must still win."""
+    replaced = spk._merge_with_existing(
+        ("Faraz", spk.CONFIDENCE_CONFIRMED), "Ali", spk.CONFIDENCE_CONFIRMED
+    )
+    assert replaced == ("Ali", spk.CONFIDENCE_CONFIRMED)
+
+
+def test_merge_keeps_an_inferred_name_when_the_new_pass_finds_nothing():
+    """A visible gap turning into an invisible loss is the exact bug this
+    guards against - silence on a later pass is not evidence of anything."""
+    kept = spk._merge_with_existing(("Ali", spk.CONFIDENCE_INFERRED), None, spk.CONFIDENCE_UNKNOWN)
+    assert kept == ("Ali", spk.CONFIDENCE_INFERRED)
+
+
+def test_merge_lets_a_fresh_inferred_guess_update_an_older_one():
+    """Only nulling-out and downgrading a confirmed row are blocked - a new,
+    equally-weak guess replacing an old one is normal cascade behaviour."""
+    updated = spk._merge_with_existing(("Ali", spk.CONFIDENCE_INFERRED), "Alistair", spk.CONFIDENCE_INFERRED)
+    assert updated == ("Alistair", spk.CONFIDENCE_INFERRED)
+
+
+def test_merge_resolves_a_fresh_label_normally():
+    fresh = spk._merge_with_existing(None, "Faraz", spk.CONFIDENCE_INFERRED)
+    assert fresh == ("Faraz", spk.CONFIDENCE_INFERRED)
+
+
+def test_resolve_does_not_erase_a_confirmed_name_on_a_later_pass(manifest, monkeypatch, tmp_path):
+    """End-to-end regression: a second `resolve()` call where the LLM comes
+    back empty must not wipe out a name a human already confirmed."""
+    overrides = tmp_path / "overrides.yaml"
+    overrides.write_text("default:\n  SPEAKER_00: Faraz\n", encoding="utf-8")
+    monkeypatch.setattr(spk, "SPEAKER_OVERRIDES_FILE", overrides)
+    monkeypatch.setattr(spk, "complete", lambda prompt, order=None: "{}")
+
+    meeting = make_meeting(manifest, "m1", "2026-08-10")
+    spk.resolve(manifest, meeting, two_speaker_transcript())
+
+    # The override file is gone, as if the human never wrote it and this pass
+    # is relying purely on the (now silent) LLM - the confirmed row must survive.
+    monkeypatch.setattr(spk, "SPEAKER_OVERRIDES_FILE", tmp_path / "gone.yaml")
+    resolved = spk.resolve(manifest, meeting, two_speaker_transcript())
+
+    assert resolved.get("SPEAKER_00") == "Faraz"
+    row = manifest.execute(
+        "SELECT name, confidence FROM speakers WHERE meeting_id = 'm1' AND label = 'SPEAKER_00'"
+    ).fetchone()
+    assert row["name"] == "Faraz"
+    assert row["confidence"] == spk.CONFIDENCE_CONFIRMED
+
+
+def test_resolve_does_not_erase_an_inferred_name_on_a_later_pass(manifest, monkeypatch, tmp_path):
+    monkeypatch.setattr(spk, "SPEAKER_OVERRIDES_FILE", tmp_path / "none.yaml")
+    monkeypatch.setattr(spk, "complete", lambda prompt, order=None: '{"SPEAKER_00": "Faraz"}')
+
+    meeting = make_meeting(manifest, "m1", "2026-08-10")
+    spk.resolve(manifest, meeting, two_speaker_transcript())
+
+    # A later pass that returns nothing for this label must not blank it out.
+    monkeypatch.setattr(spk, "complete", lambda prompt, order=None: "{}")
+    resolved = spk.resolve(manifest, meeting, two_speaker_transcript())
+
+    assert resolved.get("SPEAKER_00") == "Faraz"
+    assert db.get_speakers(manifest, "m1") == {"SPEAKER_00": "Faraz"}
+
+
+# ── glossary as a candidate source ───────────────────────────────────────
+
+def test_glossary_people_reads_only_the_people_section(tmp_path, monkeypatch):
+    glossary = tmp_path / "glossary.md"
+    glossary.write_text(
+        "# Glossary\n\n"
+        "## People\n\n"
+        "- Faraz\n"
+        "- Ali - the co-founder\n\n"
+        "## Acronyms and jargon\n\n"
+        "- PRD\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(spk, "GLOSSARY_FILE", glossary)
+    assert spk.glossary_people() == ["Faraz", "Ali"]
+
+
+def test_glossary_people_missing_file_is_fine(tmp_path, monkeypatch):
+    monkeypatch.setattr(spk, "GLOSSARY_FILE", tmp_path / "nope.md")
+    assert spk.glossary_people() == []
+
+
+def test_glossary_people_feed_the_resolution_candidates(manifest, monkeypatch, tmp_path):
+    glossary = tmp_path / "glossary.md"
+    glossary.write_text("## People\n\n- Christine\n", encoding="utf-8")
+    monkeypatch.setattr(spk, "GLOSSARY_FILE", glossary)
+    monkeypatch.setattr(spk, "SPEAKER_OVERRIDES_FILE", tmp_path / "none.yaml")
+
+    seen_prompts: list[str] = []
+
+    def fake_complete(prompt, order=None):
+        seen_prompts.append(prompt)
+        return "{}"
+
+    monkeypatch.setattr(spk, "complete", fake_complete)
+    meeting = make_meeting(manifest, "m1", "2026-08-10")
+    spk.resolve(manifest, meeting, two_speaker_transcript())
+
+    assert "Christine" in seen_prompts[0], "a glossary name is a candidate even with no filename hint"
+
+
+# ── direct address as evidence ───────────────────────────────────────────
+
+def test_direct_address_catches_a_thanks_greeting():
+    transcript = Transcript(
+        meeting_id="m", model="t", language="en", duration_sec=10.0,
+        segments=[Segment(start=0.0, end=2.0, text="Thanks, Ruth, that's helpful.", speaker="SPEAKER_00")],
+    )
+    assert "Ruth" in spk.direct_address_names(transcript)
+
+
+def test_direct_address_catches_a_vocative_at_the_end_of_a_turn():
+    transcript = Transcript(
+        meeting_id="m", model="t", language="en", duration_sec=10.0,
+        segments=[Segment(start=0.0, end=2.0, text="What do you think, Paul", speaker="SPEAKER_00")],
+    )
+    assert "Paul" in spk.direct_address_names(transcript)
+
+
+def test_direct_address_ignores_filler_words():
+    transcript = Transcript(
+        meeting_id="m", model="t", language="en", duration_sec=10.0,
+        segments=[Segment(start=0.0, end=2.0, text="Thanks, right, sounds good.", speaker="SPEAKER_00")],
+    )
+    assert spk.direct_address_names(transcript) == []
+
+
+def test_direct_address_names_are_deduplicated():
+    transcript = Transcript(
+        meeting_id="m", model="t", language="en", duration_sec=10.0,
+        segments=[
+            Segment(start=0.0, end=2.0, text="Thanks, Ruth.", speaker="SPEAKER_00"),
+            Segment(start=2.0, end=4.0, text="No problem, Ruth", speaker="SPEAKER_01"),
+        ],
+    )
+    assert spk.direct_address_names(transcript) == ["Ruth"]
+
+
+# ── time-bounded introduction window ────────────────────────────────────
+
+def test_dialogue_excerpt_covers_the_full_intro_window_even_when_choppy():
+    """A fast back-and-forth must not burn through the intro window before the
+    self-introductions happen - see INTRO_WINDOW_SEC."""
+    # 80 one-second segments: introductions land at second 60, well inside
+    # INTRO_WINDOW_SEC (240s), but past the old fixed 50-segment cutoff.
+    segments = [
+        Segment(start=float(i), end=float(i + 1), text=f"filler {i}", speaker="SPEAKER_00")
+        for i in range(80)
+    ]
+    segments[60] = Segment(start=60.0, end=61.0, text="Hi, I'm Ruth", speaker="SPEAKER_01")
+    transcript = Transcript(
+        meeting_id="m", model="t", language="en", duration_sec=80.0, segments=segments
+    )
+    excerpt = spk.dialogue_excerpt(transcript, max_lines=70)
+    assert "Hi, I'm Ruth" in excerpt
+
+
+# ── folding near-duplicate identities ────────────────────────────────────
+
+def _confirm(conn, meeting_id: str, name: str) -> None:
+    """Register one confirmed speaker row so `name` gains meeting history.
+
+    Mirrors what resolve() itself does: a speaker row alone does not put a
+    name in the people registry, `add_person` does - so both calls are needed
+    to reproduce real meeting history for fold_into_existing_person to see.
+    """
+    make_meeting(conn, meeting_id, "2026-08-10")
+    db.set_speaker(conn, meeting_id, "SPEAKER_00", name, spk.CONFIDENCE_CONFIRMED)
+    db.add_person(conn, name)
+
+
+def test_fold_prefers_the_name_with_more_meeting_history(manifest):
+    for i in range(3):
+        _confirm(manifest, f"faraz{i}", "Faraz")
+    _confirm(manifest, "farazmatin0", "Faraz Matin")
+
+    assert spk.fold_into_existing_person(manifest, "Faraz Matin") == "Faraz"
+    assert spk.fold_into_existing_person(manifest, "Faraz") == "Faraz"
+
+
+def test_fold_declines_when_a_bare_name_is_ambiguous(manifest):
+    """Three different Pauls already in the registry - a bare "Paul" cannot
+    be assumed to be any particular one of them."""
+    _confirm(manifest, "graham0", "Paul Graham")
+    _confirm(manifest, "mclean0", "Paul McLean")
+    _confirm(manifest, "wood0", "Paul Wood")
+
+    assert spk.fold_into_existing_person(manifest, "Paul") == "Paul"
+
+
+def test_fold_returns_the_name_unchanged_when_nothing_matches(manifest):
+    _confirm(manifest, "m1", "Faraz")
+    assert spk.fold_into_existing_person(manifest, "Someone New") == "Someone New"
+
+
+def test_fold_does_not_conflate_unrelated_single_token_names(manifest):
+    """Spelling-similarity folding is deliberately not implemented - see the
+    docstring on fold_into_existing_person for why."""
+    _confirm(manifest, "m1", "Tarun")
+    assert spk.fold_into_existing_person(manifest, "Varun") == "Varun"
+
+
+def test_resolve_folds_a_fuller_name_and_registers_the_alias(manifest, monkeypatch, tmp_path):
+    _confirm(manifest, "history0", "Faraz")
+    _confirm(manifest, "history1", "Faraz")
+
+    overrides = tmp_path / "overrides.yaml"
+    overrides.write_text("default:\n  SPEAKER_00: Faraz Matin\n", encoding="utf-8")
+    monkeypatch.setattr(spk, "SPEAKER_OVERRIDES_FILE", overrides)
+    monkeypatch.setattr(spk, "complete", lambda prompt, order=None: "{}")
+
+    meeting = make_meeting(manifest, "new-meeting", "2026-08-11")
+    resolved = spk.resolve(manifest, meeting, two_speaker_transcript())
+
+    assert resolved["SPEAKER_00"] == "Faraz"
+    alias = manifest.execute(
+        "SELECT canonical FROM person_aliases WHERE alias = 'faraz matin'"
+    ).fetchone()
+    assert alias["canonical"] == "Faraz"

@@ -32,19 +32,29 @@ MONTHS = {
     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
 }
 
+# Names arrive with spaces OR underscores. Google Drive substitutes "_" for
+# every space on download, so the Pixel Recorder's "Ali Aug 10 at 11-12 a.m."
+# reaches us as "Ali_Aug_10_at_11-12_a.m.". Both \s and \b fail on that form -
+# "_" is itself a word character, so \b never fires beside it - which sent
+# every Drive-captured recording down the mtime fallback and stamped 32 of 44
+# meetings with their import time rather than when they actually happened.
+# Hence an explicit separator class, and alphanumeric lookarounds instead of
+# \b so the boundary survives an adjacent underscore.
+_SEP = r"[\s_]"
+_LB = r"(?<![A-Za-z0-9])"   # left boundary, underscore-safe
+_RB = r"(?![A-Za-z0-9])"    # right boundary, underscore-safe
+_MONTH = r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?"
+
 # 2026-08-10, 2026_08_10, 20260810
 _ISO_DATE = re.compile(r"(?<!\d)(20\d{2})[-_]?(\d{2})[-_]?(\d{2})(?!\d)")
-# "Aug 10", "August 10", "10 Aug"
-_NAME_DATE = re.compile(
-    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})\b", re.I
-)
-_NAME_DATE_REV = re.compile(
-    r"\b(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\b", re.I
-)
-# "at 11-12 a.m.", "at 2-3 pm", "at 11:30 am", "T1100", "_1430"
+# "Aug 10", "August 10", "Aug_10", "10 Aug", "10_Aug"
+_NAME_DATE = re.compile(_LB + _MONTH + _SEP + r"+(\d{1,2})" + _RB, re.I)
+_NAME_DATE_REV = re.compile(_LB + r"(\d{1,2})" + _SEP + r"+" + _MONTH + _RB, re.I)
+# "at 11-12 a.m.", "at_11-12_a.m.", "at 2-3 pm", "at 11:30 am", "T1100", "_1430"
 _TIME_RANGE = re.compile(
-    r"\bat\s+(\d{1,2})(?::(\d{2}))?\s*(?:[-–]\s*\d{1,2}(?::\d{2})?)?\s*"
-    r"([ap])\.?\s*m\.?", re.I
+    _LB + r"at" + _SEP + r"+(\d{1,2})(?::(\d{2}))?" + _SEP + r"*"
+    r"(?:[-–]" + _SEP + r"*(\d{1,2})(?::\d{2})?)?" + _SEP + r"*"
+    r"([ap])\.?" + _SEP + r"*m\.?", re.I
 )
 _TIME_COMPACT = re.compile(r"(?<!\d)[T_](\d{2})(\d{2})(?!\d)")
 _TIME_COLON = re.compile(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)")
@@ -64,8 +74,19 @@ def _parse_time(stem: str) -> tuple[str | None, tuple[int, int] | None]:
     m = _TIME_RANGE.search(stem)
     if m:
         hour = int(m.group(1))
-        minute = int(m.group(2) or 0)
-        meridiem = m.group(3).lower()
+        # ":" is illegal in a filename, so the recorder writes the minute after a
+        # hyphen: "at 11-31 a.m." is 11:31, not an 11-to-31 range. Read a
+        # two-digit tail as minutes and keep the range reading only for the
+        # one-digit form ("at 2-3 pm"), where an hour span is the honest guess.
+        # Treating every tail as a range silently floored 33 meetings to :00.
+        tail = m.group(3)
+        if m.group(2):
+            minute = int(m.group(2))
+        elif tail and len(tail) == 2:
+            minute = int(tail)
+        else:
+            minute = 0
+        meridiem = m.group(4).lower()
         if meridiem == "p" and hour != 12:
             hour += 12
         elif meridiem == "a" and hour == 12:

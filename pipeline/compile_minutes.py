@@ -16,9 +16,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from pipeline import db, entities
+from pipeline import commitments, db, entities
 from pipeline.asr import Transcript, format_timestamp
 from pipeline.config import (
+    ENABLE_PM_EXPORT,
+    EXPORT_PM_MINUTES_DIR,
     MINUTES_DIR,
     MINUTES_MAP_WINDOW_TOKENS,
     MINUTES_PROMPT_TOKEN_BUDGET,
@@ -273,6 +275,7 @@ def build_prompt(
     source_audio: str,
     dialogue: str | None = None,
     condensed: bool = False,
+    existing_title: str | None = None,
 ) -> str:
     template = MINUTES_TEMPLATE_FILE.read_text(encoding="utf-8")
     attendees = sorted(set(speaker_names.values())) or ["(unresolved)"]
@@ -285,6 +288,32 @@ def build_prompt(
         if unresolved
         else ""
     )
+    # A recompile passes the same transcript through again - only the template
+    # changed, not what was said - so the title should not drift on every pass.
+    # Without this anchor the model re-titles freely each time, and a changed
+    # title means a changed filename, which orphans the previous file.
+    title_note = (
+        f'\n- Existing title from a previous compile of this exact transcript: '
+        f'"{existing_title}" - reuse it verbatim unless it is clearly wrong for '
+        f"what the transcript actually contains."
+        if existing_title
+        else ""
+    )
+    # A floor with no ceiling unless one is configured. A fixed upper bound made
+    # the model ration words, and it rationed them hardest on the longest
+    # meetings - see MINUTES_TARGET_WORDS_MAX in config for the measurement.
+    if MINUTES_TARGET_WORDS_MAX > 0:
+        word_target_rule = (
+            f"Target {MINUTES_TARGET_WORDS_MIN}-{MINUTES_TARGET_WORDS_MAX} words. "
+            "Do not compress into an executive summary - rationale must survive."
+        )
+    else:
+        word_target_rule = (
+            f"Write at least {MINUTES_TARGET_WORDS_MIN} words, with no upper limit. "
+            "Length follows the meeting: a long, dense discussion should produce "
+            "long minutes. Do not ration words or compress into an executive "
+            "summary - rationale must survive."
+        )
     transcript_rel = _relative(meeting.transcript_path)
     body = dialogue if dialogue is not None else render_dialogue(transcript, speaker_names)
 
@@ -315,7 +344,7 @@ structured minutes that follow the specification exactly.
 - Resolved attendees: {", ".join(attendees)}{unresolved_note}
 - template_version: "{TEMPLATE_VERSION}"
 - source_audio: {source_audio}
-- source_transcript: {transcript_rel}
+- source_transcript: {transcript_rel}{title_note}
 
 ## Earlier minutes, for detecting reversals
 
@@ -333,8 +362,7 @@ materially advances something recorded here.
 
 - Output ONLY the minutes document: YAML frontmatter, then the body. No preamble,
   no explanation, no code fences around the whole thing.
-- Target {MINUTES_TARGET_WORDS_MIN}-{MINUTES_TARGET_WORDS_MAX} words. Do not
-  compress into an executive summary - rationale must survive.
+- {word_target_rule}
 - Preserve feature names, people, customers, releases, and numbers verbatim.
 - Every decision gets its rationale and who decided it.
 - Cite timestamps in [H:MM:SS] form, taken from the transcript.
@@ -408,6 +436,7 @@ def compile_meeting(
         source_audio_reference(conn, meeting),
         dialogue=dialogue,
         condensed=condensed,
+        existing_title=_existing_title(meeting),
     )
     document = strip_wrapping_fence(complete(prompt))
 
@@ -425,10 +454,140 @@ def compile_meeting(
         if entity.get("kind") == "person":
             db.add_person(conn, entity["name"])
 
+    # Same document, same pass: the commitment register and decision store are
+    # parsed here rather than as a separate stage, for the same reason entities
+    # are - by the time minutes exist this is the only place that ever sees the
+    # freshly compiled document before it is written to disk.
+    parsed_notes = commitments.canonicalize(conn, commitments.extract(document))
+    db.replace_commitments(conn, meeting.id, parsed_notes["commitments"])
+    db.replace_decisions(conn, meeting.id, parsed_notes["decisions"])
+    db.replace_open_questions(conn, meeting.id, parsed_notes["open_questions"])
+
     MINUTES_DIR.mkdir(parents=True, exist_ok=True)
     path = minutes_path(meeting, extract_title(document))
+    _delete_superseded_minutes(meeting, path)
+    _delete_superseded_pm_minutes(meeting, path)
     path.write_text(document + "\n", encoding="utf-8")
+    export_to_product_manager(path, document)
     return path, document
+
+
+def is_professional_minute(path: Path, document: str) -> tuple[bool, str]:
+    """Inspect frontmatter, title, and content to determine if this minute belongs in Product Manager."""
+    # 1. Check explicit category in frontmatter
+    category_match = re.search(r"^category:\s*['\"]?([\w-]+)['\"]?", document, re.MULTILINE | re.IGNORECASE)
+    category = category_match.group(1).lower() if category_match else ""
+    if category in {"personal", "family", "household", "medical", "legal-personal"}:
+        return False, f"quarantined category: {category}"
+    if category in {"professional", "work", "allstate", "tech", "career"}:
+        return True, f"explicit professional category: {category}"
+
+    # 2. Check title and filename for personal red flags (quarantine)
+    title = (extract_title(document) or "").lower()
+    filename = path.name.lower()
+    combined_name = f"{filename} {title}"
+    personal_keywords = [
+        "separation", "divorce", "child support", "custody", "household",
+        "family", "parenting", "spouse", "doctor", "clinic", "therapy"
+    ]
+    for pkw in personal_keywords:
+        if pkw in combined_name:
+            return False, f"quarantined personal keyword: '{pkw}'"
+
+    # 3. Check for enterprise / product keywords
+    work_keywords = [
+        "allstate", "usc", "crud", "dpm", "cybersecurity", "control",
+        "servicenow", "kafka", "dmarc", "valimail", "fabric",
+        "contractiq", "agility", "roadmap", "standup", "rbac",
+        "nagomi", "snyk", "wiz", "purview", "adcs", "ciso", "governance",
+        "architecture", "lakehouse", "sprint", "backlog", "discovery"
+    ]
+    for wkw in work_keywords:
+        if wkw in combined_name:
+            return True, f"matched work keyword: '{wkw}'"
+
+    # 4. Check frontmatter attendees / entities
+    entities_match = re.search(r"^entities:\s*\[(.*?)\]", document, re.MULTILINE | re.IGNORECASE)
+    if entities_match:
+        entities_text = entities_match.group(1).lower()
+        for wkw in work_keywords:
+            if wkw in entities_text:
+                return True, f"matched work entity: '{wkw}'"
+
+    return False, "unmatched category"
+
+
+def export_to_product_manager(path: Path, document: str) -> bool:
+    """Export newly compiled professional minutes to the Product Manager repo."""
+    if not ENABLE_PM_EXPORT:
+        return False
+
+    is_prof, reason = is_professional_minute(path, document)
+    if not is_prof:
+        return False
+
+    try:
+        EXPORT_PM_MINUTES_DIR.mkdir(parents=True, exist_ok=True)
+        dest_file = EXPORT_PM_MINUTES_DIR / path.name
+        dest_file.write_text(document + "\n", encoding="utf-8")
+        print(f"    [EXPORT -> PM] Synced professional minute: {path.name} ({reason})")
+        return True
+    except Exception as e:
+        print(f"    [WARN] Failed to export minute to Product Manager: {e}")
+        return False
+
+
+def _delete_superseded_pm_minutes(meeting: db.Meeting, new_path: Path) -> None:
+    """Remove previous minute from Product Manager if the recompiled filename changed."""
+    if not ENABLE_PM_EXPORT or not meeting.minutes_path:
+        return
+    old_file_name = Path(meeting.minutes_path).name
+    new_file_name = new_path.name
+    if old_file_name != new_file_name:
+        old_dest = EXPORT_PM_MINUTES_DIR / old_file_name
+        if old_dest.exists():
+            try:
+                old_dest.unlink()
+            except OSError:
+                pass
+
+
+
+def _existing_title(meeting: db.Meeting) -> str | None:
+    """The title recorded in this meeting's current minutes file, if any.
+
+    Feeds build_prompt the anchor described there. Reads straight from disk
+    rather than from a cached field, because the manifest tracks the path, not
+    the title.
+    """
+    if not meeting.minutes_path:
+        return None
+    path = Path(meeting.minutes_path)
+    if not path.exists():
+        return None
+    try:
+        return extract_title(path.read_text(encoding="utf-8"))
+    except OSError:
+        return None
+
+
+def _delete_superseded_minutes(meeting: db.Meeting, new_path: Path) -> None:
+    """Remove the previous minutes file when a recompile changes its path.
+
+    minutes_path() is derived from the title, so a title that drifts between
+    recompiles orphans the old file - this corpus has 32 of them. Same guard
+    as voices._delete_snippet_files: never unlink outside the directory this
+    stage owns, and never touch anything when the path did not actually change.
+    """
+    if not meeting.minutes_path:
+        return
+    old_path = Path(meeting.minutes_path).resolve()
+    if old_path == new_path.resolve():
+        return
+    if not old_path.is_relative_to(MINUTES_DIR.resolve()):
+        return
+    if old_path.exists():
+        old_path.unlink()
 
 
 def source_audio_reference(conn, meeting: db.Meeting) -> str:

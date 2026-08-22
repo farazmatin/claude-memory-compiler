@@ -55,7 +55,12 @@ services:
       # Serialize generation. LightRAG issues several extraction calls per
       # document, and running them concurrently on a CPU just thrashes.
       - OLLAMA_NUM_PARALLEL=1
-      - OLLAMA_MAX_LOADED_MODELS=1
+      # Two, not one. LightRAG alternates between the generation model and the
+      # embedding model, and with a cap of one the 3.5 GB qwen3:4b evicted
+      # mxbai-embed-large on every single call. Measured: a one-sentence
+      # embedding took 69s, then 239s, while thrashing; with the embedder left
+      # resident the same call is 2.5s. Both together fit in ~4.2 GB.
+      - OLLAMA_MAX_LOADED_MODELS=2
     healthcheck:
       test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
       interval: 30s
@@ -160,7 +165,20 @@ services:
       # can take many minutes. LightRAG's default timeout assumes a hosted API and
       # is far too short for this. Generous on purpose - a slow index is
       # recoverable, a failed one needs the whole document reprocessed.
+      #
+      # TIMEOUT alone did nothing: LightRAG 1.5.6 reads LLM_TIMEOUT (default 240)
+      # and EMBEDDING_TIMEOUT (default 30), and ignores this name entirely. The
+      # running container reported llm_timeout=240 the whole time, which is what
+      # failed all 43 documents - measured at 3.6 tok/s, qwen3:4b needs ~390s for
+      # a single small extraction call, so every chunk-000 hit the 240s wall.
+      # Kept for compatibility with older LightRAG; the two below are the ones
+      # that actually apply.
       - TIMEOUT=1800
+      - LLM_TIMEOUT=1800
+      # Embeddings are ~2.5s a chunk once mxbai-embed-large is resident, but the
+      # very first call pays a 200s+ model load on this machine. 30s guaranteed
+      # a cold-start failure.
+      - EMBEDDING_TIMEOUT=300
 
       # Minutes are 600-1200 words, so a chunk this size usually keeps a whole
       # meeting's decisions in one chunk with its rationale intact.

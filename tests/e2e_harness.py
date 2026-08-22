@@ -178,7 +178,7 @@ title: Atlas Roadmap Review
 type: stakeholder
 attendees: [Faraz, Ali]
 entities: [Atlas, Northwind]
-template_version: "1"
+template_version: "__TEMPLATE_VERSION__"
 source_audio: audio/x.m4a
 source_transcript: transcripts/x.json
 ---
@@ -252,8 +252,14 @@ def install_fake_llm(tmp_path: Path, minutes: str = MINUTES_DOC) -> dict[str, st
         cmd_script.write_text(f'@echo off\n"{sys.executable}" "{script}" %*\n', encoding="utf-8")
         bin_path = cmd_script
 
+    # Stamp whatever version actually ships. A hard-coded "1" here meant the
+    # fixture meeting was born stale the moment TEMPLATE_VERSION moved past it.
+    from pipeline.config import TEMPLATE_VERSION
+
     minutes_file = tmp_path / "minutes_response.md"
-    minutes_file.write_text(minutes, encoding="utf-8")
+    minutes_file.write_text(
+        minutes.replace("__TEMPLATE_VERSION__", TEMPLATE_VERSION), encoding="utf-8"
+    )
 
     return {
         "MMC_LLM_PROVIDERS": "gemini",

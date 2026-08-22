@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light" />
-    <title>Meeting Memory — Executive Archive & Assistant</title>
+    <title>Meeting Memory — Executive Archive &amp; Assistant</title>
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
@@ -13,7 +13,7 @@
       <header class="masthead">
         <div>
           <p class="eyebrow">PRIVATE EXECUTIVE ARCHIVE &amp; MEMORY</p>
-          <h1>Meeting<br /><em>Memory</em></h1>
+          <h1>Meeting <em>Memory</em></h1>
         </div>
         <div class="masthead-controls">
           <div class="pipeline-badge" id="pipeline-indicator">
@@ -22,6 +22,7 @@
           </div>
           <div class="masthead-actions">
             <button type="button" id="btn-quick-run" class="btn-action">▶ Sync &amp; Process Recordings</button>
+            <button type="button" id="btn-export-pm" class="btn-outline">📁 Push to Product Manager</button>
             <button type="button" id="btn-refresh" class="btn-outline" title="Refresh dashboard data">↻ Refresh</button>
           </div>
           <div class="masthead-note">
@@ -91,8 +92,13 @@
               <span aria-hidden="true">⌕</span>
               <input id="meeting-search" type="search" placeholder="Search topic, attendee, or keyword..." />
             </label>
+            <select id="meeting-filter-category" aria-label="Filter category">
+              <option value="all">All Categories</option>
+              <option value="Professional">💼 Professional</option>
+              <option value="Personal">🏠 Personal</option>
+            </select>
             <select id="meeting-filter-status" aria-label="Filter status">
-              <option value="all">All meetings</option>
+              <option value="all">All statuses</option>
               <option value="ready">Ready to search</option>
               <option value="review">Needs speaker check</option>
               <option value="failed">Needs attention</option>
@@ -166,6 +172,7 @@
                 <button type="submit" class="btn-outline">Combine Names</button>
               </form>
             </div>
+
           </div>
 
           <!-- Key Discussion Subjects & Drive Stats -->
@@ -467,15 +474,14 @@
           <p id="speaker-modal-sub" class="card-desc">Assign a contact name to this voice in the recording.</p>
           <input type="hidden" id="modal-meeting-id" />
           <input type="hidden" id="modal-speaker-label" />
-          
-          <!-- 10-Second Snippet Player -->
-          <div class="snippet-player-box" style="margin: 14px 0; padding: 12px; background: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0;">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-              <span style="font-size:12px; font-weight:600; color:#334155;">🎧 10-Second Voice Clip:</span>
-              <span id="modal-snippet-status" style="font-size:11px; color:#64748b;">Loading audio...</span>
+
+          <div class="snippet-player-box" style="margin:14px 0;padding:12px;background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+              <span style="font-size:12px;font-weight:600;color:#334155;">🎧 Voice Clip:</span>
+              <span id="modal-snippet-status" style="font-size:11px;color:#64748b;">Loading audio...</span>
             </div>
-            <audio id="modal-snippet-audio" controls style="width: 100%; height: 36px; border-radius: 4px; outline: none;"></audio>
-            <p id="modal-snippet-transcript" style="font-size: 12px; color: #64748b; margin-top: 6px; font-style: italic; line-height: 1.4;"></p>
+            <audio id="modal-snippet-audio" controls style="width:100%;height:36px;border-radius:4px;outline:none;"></audio>
+            <p id="modal-snippet-transcript" style="font-size:12px;color:#64748b;margin-top:6px;font-style:italic;line-height:1.4;"></p>
           </div>
 
           <label for="modal-speaker-name">Contact / Person Name</label>
@@ -487,6 +493,21 @@
             <button type="submit" class="btn-action">Save Speaker Name</button>
           </div>
         </form>
+      </dialog>
+
+      <!-- Meeting deletion confirmation -->
+      <dialog id="delete-confirm-modal" class="custom-modal">
+        <div class="modal-card">
+          <h3 id="delete-modal-title">Delete Meeting</h3>
+          <p id="delete-modal-sub" class="card-desc"></p>
+          <p id="delete-warning-text"></p>
+          <input type="hidden" id="delete-meeting-id" />
+          <input type="hidden" id="delete-action-type" />
+          <div class="modal-actions">
+            <button type="button" class="btn-outline" onclick="$('delete-confirm-modal').close()">Cancel</button>
+            <button type="button" id="btn-confirm-delete" class="btn-warn" onclick="executePendingDelete()">Delete</button>
+          </div>
+        </div>
       </dialog>
 
       <!-- Toast Notifications Container -->
