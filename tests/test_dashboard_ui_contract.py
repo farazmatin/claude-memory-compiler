@@ -130,3 +130,14 @@ def test_duplicate_speaker_merge_and_noise_actions_explain_their_effects():
     assert "choose the spelling you want to see everywhere" in markup.lower()
     assert "No audio, transcript, or minutes will be deleted" in script
     assert "runStage('speaker-refresh')" in markup
+
+
+def test_people_merge_controls_allow_typed_targets_and_preview_before_apply():
+    page = _index()
+
+    assert page.by_id["people-suggestion-rename"]["type"] == "button"
+    assert "people-suggestion-target" in page.labels_for
+    assert "disabled" in page.by_id["people-suggestion-confirm"]
+    assert "person-merge-target-custom" in page.labels_for
+    assert "disabled" in page.by_id["person-merge-save"]
+    assert "person-rename-preview" in page.by_id

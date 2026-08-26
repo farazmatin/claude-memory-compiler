@@ -8,6 +8,12 @@ let state = {
   people: [],
   peopleSuggestions: [],
   selectedPeople: new Set(),
+  peopleSuggestionMergePreview: null,
+  peopleSuggestionMergeBusy: false,
+  personMergePreview: null,
+  personMergeBusy: false,
+  personRenamePreview: null,
+  personRenameBusy: false,
   pipelineRunning: false,
   pollTimer: null,
 };
@@ -163,6 +169,7 @@ function setupEventListeners() {
     submitMergePerson();
   });
   $("person-merge-target").addEventListener("change", updatePersonMergePreview);
+  $("person-merge-target-custom").addEventListener("input", updatePersonMergePreview);
   $("people-search").addEventListener("input", () => renderPeopleList(state.people));
   $("people-merge-selected").addEventListener("click", openSelectedPeopleMergeModal);
   $("people-clear-selection").addEventListener("click", clearPeopleSelection);
@@ -170,7 +177,12 @@ function setupEventListeners() {
     e.preventDefault();
     submitPersonRename();
   });
+  $("person-rename-name").addEventListener("input", invalidatePersonRenamePreview);
   $("people-suggestion-yes").addEventListener("click", acceptPeopleSuggestion);
+  $("people-suggestion-rename").addEventListener("click", revealPeopleSuggestionRename);
+  $("people-suggestion-review").addEventListener("click", previewPeopleSuggestion);
+  $("people-suggestion-confirm").addEventListener("click", confirmPeopleSuggestionMerge);
+  $("people-suggestion-target").addEventListener("input", invalidatePeopleSuggestionPreview);
   $("people-suggestion-no").addEventListener("click", dismissPeopleSuggestion);
   $("speaker-form").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -988,6 +1000,7 @@ function renderPeopleSuggestion() {
   const panel = $("people-suggestions");
   const empty = $("people-suggestions-empty");
   const suggestion = state.peopleSuggestions[0];
+  state.peopleSuggestionMergePreview = null;
   if (!suggestion) {
     panel.hidden = true;
     if (empty) empty.hidden = false;
@@ -996,6 +1009,7 @@ function renderPeopleSuggestion() {
   }
   if (empty) empty.hidden = true;
   $("people-suggestion-yes").disabled = false;
+  $("people-suggestion-rename").disabled = false;
   $("people-suggestion-no").disabled = false;
   const names = Array.isArray(suggestion.names) ? suggestion.names : [suggestion.source, suggestion.target];
   panel.dataset.names = JSON.stringify(names);
@@ -1005,7 +1019,155 @@ function renderPeopleSuggestion() {
   $("people-suggestion-result").textContent =
     `Yes keeps “${suggestion.target}” and folds the other spelling${names.length === 2 ? "" : "s"} into it.`;
   panel.hidden = false;
+  $("people-suggestion-rename-panel").hidden = true;
+  $("people-suggestion-preview-panel").hidden = true;
+  $("people-suggestion-target").value = suggestion.target;
+  $("people-suggestion-confirm").disabled = true;
   updateSpeakerResolutionSummary();
+}
+
+function revealPeopleSuggestionRename() {
+  const panel = $("people-suggestions");
+  const target = $("people-suggestion-target");
+  target.value = panel.dataset.target || "";
+  $("people-suggestion-rename-panel").hidden = false;
+  $("people-suggestion-preview-panel").hidden = true;
+  $("people-suggestion-confirm").disabled = true;
+  target.focus();
+}
+
+const PEOPLE_SUGGESTION_CONTROL_IDS = [
+  "people-suggestion-yes",
+  "people-suggestion-rename",
+  "people-suggestion-no",
+  "people-suggestion-target",
+  "people-suggestion-review",
+  "people-suggestion-confirm",
+];
+
+function setPeopleSuggestionBusy(busy) {
+  state.peopleSuggestionMergeBusy = busy;
+  PEOPLE_SUGGESTION_CONTROL_IDS.forEach((id) => {
+    const control = $(id);
+    if (control) control.disabled = busy;
+  });
+  if (!busy && $("people-suggestion-confirm")) {
+    $("people-suggestion-confirm").disabled = !state.peopleSuggestionMergePreview;
+  }
+}
+
+function invalidatePeopleSuggestionPreview() {
+  state.peopleSuggestionMergePreview = null;
+  $("people-suggestion-preview-panel").hidden = true;
+  $("people-suggestion-confirm").disabled = true;
+}
+
+function mergePreviewText(preview, orderNote = "") {
+  const missing = (preview.missing_files || []).length;
+  const conflicts = (preview.conflicts || []).length;
+  const retained = preview.actual_target === preview.requested_target
+    ? `Retain “${preview.actual_target}”.`
+    : `Requested “${preview.requested_target}”; the hidden redirect retains “${preview.actual_target}”.`;
+  return [
+    retained,
+    `${preview.affected_meetings} affected meeting(s); ${preview.files_changed} file(s); ${preview.literal_matches} literal match(es).`,
+    `${missing} missing file(s); ${conflicts} warning(s).`,
+    "Folded spellings become hidden redirects, not visible aliases.",
+    orderNote,
+  ].filter(Boolean).join(" ");
+}
+
+async function requestPeopleMergePreview(names, into) {
+  const res = await fetch("/api/people/merge-preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ names, into }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "Could not preview this merge");
+  return data;
+}
+
+async function previewPeopleSuggestion() {
+  if (state.peopleSuggestionMergeBusy) return false;
+  const panel = $("people-suggestions");
+  const names = JSON.parse(panel.dataset.names || "[]");
+  const into = $("people-suggestion-target").value.trim() || panel.dataset.target;
+  if (names.length < 2 || !into) return false;
+  setPeopleSuggestionBusy(true);
+  try {
+    const preview = await requestPeopleMergePreview(names, into);
+    state.peopleSuggestionMergePreview = preview;
+    $("people-suggestion-preview").textContent = mergePreviewText(preview);
+    $("people-suggestion-preview-panel").hidden = false;
+    return true;
+  } catch (err) {
+    state.peopleSuggestionMergePreview = null;
+    showToast(err.message, "error");
+    return false;
+  } finally {
+    setPeopleSuggestionBusy(false);
+  }
+}
+
+function mergeResultText(data, sourceCount) {
+  const outstanding = Number(data.minutes_missing || 0)
+    + Number(data.rewrite_conflicts || 0)
+    + Number(data.pending_rewrites || 0);
+  const indexState = outstanding
+    ? "Resolve the outstanding minutes before re-indexing."
+    : "Corrected minutes are ready to re-index.";
+  return [
+    `Merged ${sourceCount} spelling(s) into “${data.target}”.`,
+    `${data.minutes_rewritten || 0} minutes rewritten; ${data.minutes_unchanged || 0} already correct;`,
+    `${data.minutes_missing || 0} missing; ${data.rewrite_conflicts || 0} conflicting; ${data.pending_rewrites || 0} pending.`,
+    indexState,
+  ].join(" ");
+}
+
+async function postPeopleMerge(names, into, expectedDigest) {
+  const res = await fetch("/api/people/merge-many", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ names, into, expected_digest: expectedDigest }),
+  });
+  const data = await res.json();
+  return { res, data };
+}
+
+async function confirmPeopleSuggestionMerge() {
+  const preview = state.peopleSuggestionMergePreview;
+  if (state.peopleSuggestionMergeBusy || !preview) return false;
+  const panel = $("people-suggestions");
+  const names = JSON.parse(panel.dataset.names || "[]");
+  setPeopleSuggestionBusy(true);
+  try {
+    const { res, data } = await postPeopleMerge(
+      names,
+      preview.requested_target,
+      preview.digest,
+    );
+    if (res.status === 409) {
+      state.peopleSuggestionMergePreview = null;
+      $("people-suggestion-preview").textContent =
+        "This preview is stale. Review the merge again before confirming.";
+      showToast(data.error || "The merge preview changed", "error");
+      return false;
+    }
+    if (!res.ok) throw new Error(data.error || "Failed to combine names");
+    state.peopleSuggestions.shift();
+    state.peopleSuggestionMergePreview = null;
+    state.selectedPeople.clear();
+    renderPeopleSuggestion();
+    refreshPeopleDependentViews();
+    showToast(mergeResultText(data, names.length), "success");
+    return true;
+  } catch (err) {
+    showToast(err.message, "error");
+    return false;
+  } finally {
+    setPeopleSuggestionBusy(false);
+  }
 }
 
 function updateSpeakerResolutionSummary() {
@@ -1029,21 +1191,15 @@ function updateSpeakerResolutionSummary() {
 
 async function acceptPeopleSuggestion() {
   const panel = $("people-suggestions");
-  $("people-suggestion-yes").disabled = true;
-  $("people-suggestion-no").disabled = true;
-  const names = JSON.parse(panel.dataset.names || "[]");
-  const merged = await mergeManyPersonProfiles(names, panel.dataset.target);
-  if (merged) {
-    state.peopleSuggestions.shift();
-    renderPeopleSuggestion();
-  } else {
-    $("people-suggestion-yes").disabled = false;
-    $("people-suggestion-no").disabled = false;
-  }
+  $("people-suggestion-target").value = panel.dataset.target || "";
+  $("people-suggestion-rename-panel").hidden = true;
+  return previewPeopleSuggestion();
 }
 
 async function dismissPeopleSuggestion() {
+  if (state.peopleSuggestionMergeBusy) return false;
   const panel = $("people-suggestions");
+  setPeopleSuggestionBusy(true);
   try {
     const res = await fetch("/api/people/suggestions/dismiss", {
       method: "POST",
@@ -1054,8 +1210,12 @@ async function dismissPeopleSuggestion() {
     if (!res.ok) throw new Error(data.error || "Could not dismiss this suggestion");
     state.peopleSuggestions.shift();
     renderPeopleSuggestion();
+    return true;
   } catch (err) {
     showToast(err.message, "error");
+    return false;
+  } finally {
+    setPeopleSuggestionBusy(false);
   }
 }
 
@@ -1070,19 +1230,48 @@ function openSelectedPeopleMergeModal() {
     '<option value="">Choose a spelling…</option>',
     ...selected.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`),
   ].join("");
-  $("person-merge-preview").textContent = "Nothing changes until you confirm.";
-  $("person-merge-save").disabled = false;
+  $("person-merge-target").value = "";
+  $("person-merge-target-custom").value = "";
+  state.personMergePreview = null;
+  $("person-merge-preview").textContent =
+    "Nothing changes until you review the exact impact. Selected names are considered in alphabetical order.";
+  $("person-merge-save").disabled = true;
+  $("person-merge-save").textContent = "Review Merge";
   $("person-merge-modal").showModal();
   setTimeout(() => $("person-merge-target").focus(), 50);
 }
 
 function updatePersonMergePreview() {
-  const selected = JSON.parse($("person-merge-sources").value || "[]");
-  const target = $("person-merge-target").value;
-  const aliases = selected.filter((name) => name !== target);
+  state.personMergePreview = null;
+  const target = personMergeTarget();
   $("person-merge-preview").textContent = target
-    ? `Keep ${target}. ${aliases.join(", ")} ${aliases.length === 1 ? "becomes an alias" : "become aliases"}, and all meeting history moves to ${target}.`
-    : "Nothing changes until you confirm.";
+    ? `Review the exact impact of retaining “${target}”. Folded spellings will become hidden redirects, not visible aliases.`
+    : "Nothing changes until you review the exact impact.";
+  $("person-merge-save").disabled = !target;
+  $("person-merge-save").textContent = "Review Merge";
+}
+
+function personMergeTarget() {
+  return $("person-merge-target-custom").value.trim()
+    || $("person-merge-target").value.trim();
+}
+
+const PERSON_MERGE_CONTROL_IDS = [
+  "person-merge-target",
+  "person-merge-target-custom",
+  "person-merge-save",
+  "person-merge-cancel",
+];
+
+function setPersonMergeBusy(busy) {
+  state.personMergeBusy = busy;
+  PERSON_MERGE_CONTROL_IDS.forEach((id) => {
+    const control = $(id);
+    if (control) control.disabled = busy;
+  });
+  if (!busy && $("person-merge-save")) {
+    $("person-merge-save").disabled = !personMergeTarget();
+  }
 }
 
 function closePersonMergeModal() {
@@ -1092,6 +1281,10 @@ function closePersonMergeModal() {
 function openPersonRenameModal(name) {
   $("person-rename-source").value = name;
   $("person-rename-name").value = name;
+  state.personRenamePreview = null;
+  $("person-rename-preview").textContent =
+    "Nothing changes until you review the exact impact.";
+  $("person-rename-save").textContent = "Review Spelling";
   $("person-rename-modal").showModal();
   setTimeout(() => {
     $("person-rename-name").focus();
@@ -1101,6 +1294,27 @@ function openPersonRenameModal(name) {
 
 function closePersonRenameModal() {
   $("person-rename-modal").close();
+}
+
+function invalidatePersonRenamePreview() {
+  state.personRenamePreview = null;
+  $("person-rename-preview").textContent =
+    "Review the exact impact before changing this spelling.";
+  $("person-rename-save").textContent = "Review Spelling";
+}
+
+const PERSON_RENAME_CONTROL_IDS = [
+  "person-rename-name",
+  "person-rename-save",
+  "person-rename-cancel",
+];
+
+function setPersonRenameBusy(busy) {
+  state.personRenameBusy = busy;
+  PERSON_RENAME_CONTROL_IDS.forEach((id) => {
+    const control = $(id);
+    if (control) control.disabled = busy;
+  });
 }
 
 async function submitAddPerson() {
@@ -1130,40 +1344,48 @@ async function submitAddPerson() {
 
 async function submitMergePerson() {
   const names = JSON.parse($("person-merge-sources").value || "[]");
-  const into = $("person-merge-target").value.trim();
-  if (names.length < 2 || !into) return;
+  const into = personMergeTarget();
+  if (state.personMergeBusy || names.length < 2 || !into) return false;
   const save = $("person-merge-save");
-  save.disabled = true;
-  save.textContent = "Merging…";
+  setPersonMergeBusy(true);
   try {
-    const data = await mergeManyPersonProfiles(names, into);
-    if (!data) return;
-    closePersonMergeModal();
-    showToast(
-      `Merged ${data.merged} names into '${into}'. All speaker history was kept; affected minutes are ready to refresh.`,
-      "success",
-    );
-  } finally {
-    save.disabled = false;
-    save.textContent = "Merge Names";
-  }
-}
+    if (!state.personMergePreview) {
+      const preview = await requestPeopleMergePreview(names, into);
+      state.personMergePreview = preview;
+      $("person-merge-preview").textContent = mergePreviewText(
+        preview,
+        "Selected names are considered in alphabetical order for role inheritance.",
+      );
+      save.textContent = "Confirm Merge";
+      return true;
+    }
 
-async function mergeManyPersonProfiles(names, into) {
-  try {
-    const res = await fetch("/api/people/merge-many", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ names, into }),
-    });
-    const data = await res.json();
+    const { res, data } = await postPeopleMerge(
+      names,
+      state.personMergePreview.requested_target,
+      state.personMergePreview.digest,
+    );
+    if (res.status === 409) {
+      state.personMergePreview = null;
+      $("person-merge-preview").textContent =
+        "This preview is stale. Refresh the preview before confirming.";
+      save.textContent = "Refresh Preview";
+      showToast(data.error || "The merge preview changed", "error");
+      return false;
+    }
     if (!res.ok) throw new Error(data.error || "Failed to combine names");
+    state.personMergePreview = null;
     state.selectedPeople.clear();
+    closePersonMergeModal();
     refreshPeopleDependentViews();
-    return data;
+    showToast(mergeResultText(data, names.length), "success");
+    return true;
   } catch (err) {
     showToast(err.message, "error");
-    return null;
+    return false;
+  } finally {
+    setPersonMergeBusy(false);
+    if (state.personMergePreview) save.textContent = "Confirm Merge";
   }
 }
 
@@ -1175,54 +1397,55 @@ function refreshPeopleDependentViews() {
   if (state.activeMeetingId) selectMeeting(state.activeMeetingId);
 }
 
-async function mergePersonProfiles(fromName, into) {
+async function submitPersonRename() {
+  const fromName = $("person-rename-source").value.trim();
+  const newName = $("person-rename-name").value.trim();
+  if (
+    state.personRenameBusy
+    || !fromName
+    || !newName
+    || fromName === newName
+  ) return false;
+  const save = $("person-rename-save");
+  setPersonRenameBusy(true);
   try {
-    const res = await fetch("/api/people/merge", {
+    if (!state.personRenamePreview) {
+      const preview = await requestPeopleMergePreview([fromName], newName);
+      state.personRenamePreview = preview;
+      $("person-rename-preview").textContent = mergePreviewText(preview);
+      save.textContent = "Confirm Spelling";
+      return true;
+    }
+    const res = await fetch("/api/people/rename", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ from_name: fromName, into }),
+      body: JSON.stringify({
+        from_name: fromName,
+        new_name: state.personRenamePreview.requested_target,
+        expected_digest: state.personRenamePreview.digest,
+      }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Failed to combine names");
-    showToast(
-      `Merged '${fromName}' into '${into}'. ${data.rewritten} speaker record${data.rewritten === 1 ? "" : "s"} updated; affected minutes are ready to refresh.`,
-      "success",
-    );
+    if (res.status === 409) {
+      state.personRenamePreview = null;
+      $("person-rename-preview").textContent =
+        "This preview is stale. Refresh the preview before confirming.";
+      save.textContent = "Refresh Preview";
+      showToast(data.error || "The spelling preview changed", "error");
+      return false;
+    }
+    if (!res.ok) throw new Error(data.error || "Could not change this spelling");
+    state.personRenamePreview = null;
+    showToast(mergeResultText(data, 1), "success");
+    closePersonRenameModal();
     refreshPeopleDependentViews();
     return true;
   } catch (err) {
     showToast(err.message, "error");
     return false;
-  }
-}
-
-async function submitPersonRename() {
-  const fromName = $("person-rename-source").value.trim();
-  const newName = $("person-rename-name").value.trim();
-  if (!fromName || !newName || fromName === newName) return;
-  const save = $("person-rename-save");
-  save.disabled = true;
-  save.textContent = "Saving…";
-  try {
-    const res = await fetch("/api/people/rename", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ from_name: fromName, new_name: newName }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Could not change this spelling");
-    showToast(`Changed '${fromName}' to '${newName}'. Affected minutes are ready to refresh.`, "success");
-    closePersonRenameModal();
-    loadPeople();
-    loadVoiceClusters();
-    loadMeetings();
-    loadOverview();
-    if (state.activeMeetingId) selectMeeting(state.activeMeetingId);
-  } catch (err) {
-    showToast(err.message, "error");
   } finally {
-    save.disabled = false;
-    save.textContent = "Save Spelling";
+    setPersonRenameBusy(false);
+    if (state.personRenamePreview) save.textContent = "Confirm Spelling";
   }
 }
 

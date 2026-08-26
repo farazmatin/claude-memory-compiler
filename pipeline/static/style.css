@@ -929,8 +929,8 @@ h3 {
 }
 
 .people-suggestions {
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 14px;
   margin: 8px 0 14px;
@@ -938,6 +938,44 @@ h3 {
   border: 1px solid var(--moss);
   border-radius: 7px;
   background: var(--moss-soft);
+}
+
+.merge-target-override,
+.merge-preview-panel {
+  grid-column: 1 / -1;
+}
+
+.merge-target-override {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+}
+
+.merge-target-override label {
+  grid-column: 1 / -1;
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.merge-target-override input {
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+}
+
+.merge-target-override[hidden],
+.merge-preview-panel[hidden] {
+  display: none;
+}
+
+.merge-preview-panel {
+  display: grid;
+  gap: 8px;
+  justify-items: start;
 }
 
 .people-suggestions[hidden] {

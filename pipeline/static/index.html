@@ -166,8 +166,18 @@
               <small id="people-suggestion-result"></small>
             </div>
             <div class="people-suggestion-actions">
-              <button type="button" class="btn-action btn-sm" id="people-suggestion-yes">Yes, merge</button>
+              <button type="button" class="btn-action btn-sm" id="people-suggestion-yes">Yes, review merge</button>
+              <button type="button" class="btn-outline btn-sm" id="people-suggestion-rename">Yes, but call them…</button>
               <button type="button" class="btn-outline btn-sm" id="people-suggestion-no">No, different people</button>
+            </div>
+            <div id="people-suggestion-rename-panel" class="merge-target-override" hidden>
+              <label for="people-suggestion-target">Spelling to keep</label>
+              <input type="text" id="people-suggestion-target" autocomplete="name" />
+              <button type="button" class="btn-outline btn-sm" id="people-suggestion-review">Review merge</button>
+            </div>
+            <div id="people-suggestion-preview-panel" class="merge-preview-panel" hidden>
+              <p id="people-suggestion-preview" class="merge-preview" aria-live="polite"></p>
+              <button type="button" class="btn-action btn-sm" id="people-suggestion-confirm" disabled>Confirm merge</button>
             </div>
           </section>
           <p id="people-suggestions-empty" class="empty-cell">No likely duplicate names need a decision.</p>
@@ -560,10 +570,14 @@
           <select id="person-merge-target" required>
             <option value="">Choose a spelling…</option>
           </select>
+          <div class="merge-target-override">
+            <label for="person-merge-target-custom">Or type a corrected spelling</label>
+            <input type="text" id="person-merge-target-custom" autocomplete="name" placeholder="Spelling to show everywhere" />
+          </div>
           <p id="person-merge-preview" class="merge-preview" aria-live="polite"></p>
           <div class="modal-actions">
-            <button type="button" class="btn-outline" onclick="closePersonMergeModal()">Cancel</button>
-            <button type="submit" id="person-merge-save" class="btn-action">Merge Names</button>
+            <button type="button" class="btn-outline" id="person-merge-cancel" onclick="closePersonMergeModal()">Cancel</button>
+            <button type="submit" id="person-merge-save" class="btn-action" disabled>Review Merge</button>
           </div>
         </form>
       </dialog>
@@ -579,9 +593,10 @@
           <input type="hidden" id="person-rename-source" />
           <label for="person-rename-name">Correct spelling</label>
           <input type="text" id="person-rename-name" required autocomplete="name" />
+          <p id="person-rename-preview" class="merge-preview" aria-live="polite"></p>
           <div class="modal-actions">
-            <button type="button" class="btn-outline" onclick="closePersonRenameModal()">Cancel</button>
-            <button type="submit" id="person-rename-save" class="btn-action">Save Spelling</button>
+            <button type="button" class="btn-outline" id="person-rename-cancel" onclick="closePersonRenameModal()">Cancel</button>
+            <button type="submit" id="person-rename-save" class="btn-action">Review Spelling</button>
           </div>
         </form>
       </dialog>
