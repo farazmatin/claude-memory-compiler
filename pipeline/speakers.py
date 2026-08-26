@@ -211,7 +211,7 @@ def fold_into_existing_person(conn, name: str) -> str:
     0.91) is also loose enough to conflate "Tarun" and "Varun" (0.80) or
     "Catherine" and "Katherine" (0.89) - different people. That is exactly
     the failure this function exists to prevent, so cross-spelling duplicates
-    stay a deliberate, human-reviewed `db.merge_person` call instead of an
+    stay a deliberate, preview-bound `people_merge.merge` call instead of an
     automatic one.
 
     Also declines to guess when a bare first name prefixes *several* unrelated

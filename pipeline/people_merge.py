@@ -567,21 +567,21 @@ def merge(
         target_row = conn.execute(
             "SELECT role FROM people WHERE canonical = ?", (plan.public.actual_target,)
         ).fetchone()
-        if target_row is None:
-            role = next(
-                (
-                    row["role"]
-                    for source_name in source_names
-                    if (
-                        row := conn.execute(
-                            "SELECT role FROM people WHERE canonical = ?",
-                            (source_name,),
-                        ).fetchone()
-                    )
-                    and row["role"]
-                ),
-                None,
-            )
+        role = next(
+            (
+                row["role"]
+                for source_name in source_names
+                if (
+                    row := conn.execute(
+                        "SELECT role FROM people WHERE canonical = ?",
+                        (source_name,),
+                    ).fetchone()
+                )
+                and row["role"]
+            ),
+            None,
+        )
+        if target_row is None or (not target_row["role"] and role):
             db.add_person(conn, plan.public.actual_target, role=role)
 
         for source_name in plan.absorbed_names:

@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from pipeline import asr, cli, compile_minutes, db, index, llm
+from pipeline import asr, cli, compile_minutes, db, index, llm, people_merge
 from tests.e2e_harness import (
     FakeASRBackend,
     FakeLightRAG,
@@ -448,8 +448,9 @@ def test_people_registry_normalizes_across_meetings(app):
     add_meeting(app)
     app.run("run", "--owner", "Faraz")
 
+    approved = people_merge.preview(["Ali"], "Alison Chen")
+    people_merge.merge(["Ali"], "Alison Chen", expected_digest=approved.digest)
     with db.connect() as conn:
-        db.merge_person(conn, "Ali", "Alison Chen")
         assert db.canonical_name(conn, "Ali") == "Alison Chen"
         # History was rewritten, not just future meetings.
         assert "Alison Chen" in db.get_speakers(conn, app.meetings()[0].id).values()

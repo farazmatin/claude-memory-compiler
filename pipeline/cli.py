@@ -33,7 +33,16 @@ import sys
 import traceback
 from pathlib import Path
 
-from pipeline import capture, compile_minutes, db, entities, index, ingest, speakers, voices
+from pipeline import (
+    capture,
+    compile_minutes,
+    db,
+    entities,
+    index,
+    ingest,
+    people_merge,
+    speakers,
+)
 from pipeline.config import (
     DASHBOARD_HOST,
     DASHBOARD_PORT,
@@ -774,21 +783,57 @@ def cmd_people(args: argparse.Namespace) -> int:
     disconnected entities that no query finds together.
     """
     db.init_db()
-    with db.connect() as conn:
-        if args.merge:
-            source, target = args.merge
-            rewritten = db.merge_person(conn, source, target)
-            # db.merge_person rewrites the text tables - speakers, entities,
-            # relations, commitments, decisions, aliases - but knows nothing about
-            # voiceprints. Without this the merged-away name keeps its own voice
-            # samples, so the two spellings stay two different people to voice
-            # recognition and the duplicate reappears on the next recording.
-            moved = voices.merge_people(conn, source, target)
-            print(f"Merged {source!r} into {target!r} ({rewritten} speaker row(s) rewritten).")
-            if moved:
-                print(f"  moved {moved} voice sample(s) to {target!r}")
-            return 0
+    if getattr(args, "resume_merge_rewrites", False):
+        result = people_merge.resume_pending_rewrites()
+        print(
+            "Merge rewrites: "
+            f"{result.minutes_rewritten} applied, "
+            f"{result.minutes_unchanged} unchanged, "
+            f"{result.minutes_missing} missing, "
+            f"{result.rewrite_conflicts} conflicting, "
+            f"{result.pending_rewrites} pending."
+        )
+        return 1 if result.rewrite_conflicts or result.pending_rewrites else 0
 
+    if args.merge:
+        source, target = args.merge
+        proposed = people_merge.preview([source], target)
+        print(
+            f"Merge preview: {source!r} -> {proposed.actual_target!r}\n"
+            f"  {proposed.speaker_rows} speaker row(s), "
+            f"{proposed.affected_meetings} meeting(s), "
+            f"{proposed.files_changed} file(s), "
+            f"{proposed.literal_matches} literal match(es)\n"
+            f"  missing: {len(proposed.missing_files)}, "
+            f"warnings: {len(proposed.conflicts)}\n"
+            f"Digest: {proposed.digest}"
+        )
+        if not getattr(args, "apply", False):
+            print("Nothing was changed.")
+            return 0
+        expected_digest = (getattr(args, "expected_digest", None) or "").strip()
+        if not expected_digest:
+            print("--apply requires --expected-digest from the preview.", file=sys.stderr)
+            return 2
+        try:
+            result = people_merge.merge(
+                [source], target, expected_digest=expected_digest
+            )
+        except people_merge.PreviewDriftError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(
+            f"Merged {source!r} into {result.target!r}: "
+            f"{result.speaker_rows} speaker row(s), "
+            f"{result.minutes_rewritten} minutes rewritten, "
+            f"{result.minutes_unchanged} unchanged, "
+            f"{result.minutes_missing} missing, "
+            f"{result.rewrite_conflicts} conflicting, "
+            f"{result.pending_rewrites} pending."
+        )
+        return 1 if result.rewrite_conflicts or result.pending_rewrites else 0
+
+    with db.connect() as conn:
         if args.add:
             canonical, *aliases = args.add
             db.add_person(conn, canonical, aliases=aliases)
@@ -1029,7 +1074,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_people.add_argument(
         "--merge", nargs=2, metavar=("FROM", "INTO"),
-        help="fold one person into another, rewriting existing records",
+        help="preview folding one person into another",
+    )
+    p_people.add_argument(
+        "--apply", action="store_true",
+        help="apply --merge using the exact approved preview digest",
+    )
+    p_people.add_argument(
+        "--expected-digest",
+        help="SHA-256 printed by the exact merge preview to apply",
+    )
+    p_people.add_argument(
+        "--resume-merge-rewrites", action="store_true",
+        help="resume hash-checked minutes rewrites left by an interrupted merge",
     )
     p_people.set_defaults(func=cmd_people)
 

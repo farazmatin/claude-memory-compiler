@@ -13,16 +13,17 @@ import unicodedata
 import uuid
 import webbrowser
 from collections import Counter, deque
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
-from itertools import combinations
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from pipeline import dashboard_auth, db, index, voices
+from pipeline import dashboard_auth, db, index, people_merge, voices
 from pipeline.config import (
     ANTIGRAVITY_MODEL,
     AUDIO_DIR,
@@ -221,100 +222,50 @@ def add_person(canonical: str, role: str | None = None, aliases: list[str] | Non
         db.add_person(conn, canonical=canonical, role=role, aliases=aliases)
 
 
-def merge_people(from_name: str, into: str) -> int:
-    """Merge one person/alias into another and rewrite historical records."""
+def preview_people_merge(
+    names: list[str], into: str
+) -> people_merge.MergePreview:
+    """Preview the exact impact every dashboard merge adapter will apply."""
+    db.init_db()
+    return people_merge.preview(names, into)
+
+
+def merge_people(
+    from_name: str, into: str, *, expected_digest: str
+) -> people_merge.MergeResult:
+    """Apply one preview-bound person merge through the deep module."""
     source, target = from_name.strip(), into.strip()
     if not source or not target:
         raise ValueError("Both contact names are required.")
-    if source == target:
-        return 0
     db.init_db()
-    with db.connect() as conn:
-        affected_meetings = {
-            row["meeting_id"]
-            for row in conn.execute(
-                "SELECT DISTINCT meeting_id FROM speakers WHERE name IN (?, ?)",
-                (source, target),
-            ).fetchall()
-        }
-        rewritten = int(
-            conn.execute(
-                "SELECT COUNT(*) AS total FROM speakers WHERE name = ?", (source,)
-            ).fetchone()["total"]
-        )
-        voices.merge_people(conn, source, target)
-        db.merge_person(conn, from_name=source, into=target)
-        db.queue_minutes_refresh(conn, affected_meetings)
-        return rewritten
+    return people_merge.merge(
+        [source], target, expected_digest=expected_digest
+    )
 
 
-def merge_many_people(names: list[str], into: str) -> int:
-    """Atomically fold several selected contacts into one retained spelling."""
+def merge_many_people(
+    names: list[str], into: str, *, expected_digest: str
+) -> people_merge.MergeResult:
+    """Apply one preview-bound multi-contact merge through the deep module."""
     selected = list(dict.fromkeys(str(name).strip() for name in names if str(name).strip()))
     target = into.strip()
     if len(selected) < 2:
         raise ValueError("Select at least two contact names to merge.")
-    if target not in selected:
-        raise ValueError("The spelling to keep must be one of the selected names.")
-
     db.init_db()
-    with db.connect() as conn:
-        rows = {
-            row["canonical"]: row
-            for row in conn.execute(
-                f"SELECT canonical, role FROM people WHERE canonical IN ({','.join('?' for _ in selected)})",
-                selected,
-            ).fetchall()
-        }
-        missing = [name for name in selected if name not in rows]
-        if missing:
-            raise ValueError(f"Contact not found: {', '.join(missing)}")
-
-        rewritten = 0
-        placeholders = ",".join("?" for _ in selected)
-        affected_meetings = {
-            row["meeting_id"]
-            for row in conn.execute(
-                f"SELECT DISTINCT meeting_id FROM speakers WHERE name IN ({placeholders})",
-                selected,
-            ).fetchall()
-        }
-        for source in (name for name in selected if name != target):
-            rewritten += int(
-                conn.execute(
-                    "SELECT COUNT(*) AS total FROM speakers WHERE name = ?", (source,)
-                ).fetchone()["total"]
-            )
-
-            # Voice samples must move before deleting the source person because
-            # their foreign key intentionally cascades on person deletion.
-            voices.merge_people(conn, source, target)
-            db.merge_person(conn, from_name=source, into=target)
-
-            # Keep useful role information when the chosen spelling had none.
-            target_role = rows[target]["role"]
-            if not target_role and rows[source]["role"]:
-                db.add_person(conn, target, role=rows[source]["role"])
-                rows[target] = {"canonical": target, "role": rows[source]["role"]}
-
-        db.queue_minutes_refresh(conn, affected_meetings)
-        return rewritten
+    return people_merge.merge(
+        selected, target, expected_digest=expected_digest
+    )
 
 
-def rename_person(from_name: str, new_name: str) -> int:
-    """Correct one canonical spelling without creating a second person."""
+def rename_person(
+    from_name: str, new_name: str, *, expected_digest: str
+) -> people_merge.MergeResult:
+    """Apply one preview-bound canonical spelling correction."""
     source, target = from_name.strip(), new_name.strip()
     if not source or not target:
         raise ValueError("Both the current and corrected names are required.")
-    if source == target:
-        return 0
     db.init_db()
     with db.connect() as conn:
-        source_row = conn.execute(
-            "SELECT role FROM people WHERE canonical = ?", (source,)
-        ).fetchone()
-        if not source_row:
-            raise ValueError(f"Contact '{source}' was not found.")
         existing = conn.execute(
             "SELECT 1 FROM people WHERE canonical = ?", (target,)
         ).fetchone()
@@ -322,22 +273,9 @@ def rename_person(from_name: str, new_name: str) -> int:
             raise ValueError(
                 f"'{target}' already exists. Select both names and choose 'Merge selected'."
             )
-        affected_meetings = {
-            row["meeting_id"]
-            for row in conn.execute(
-                "SELECT DISTINCT meeting_id FROM speakers WHERE name = ?", (source,)
-            ).fetchall()
-        }
-        rewritten = int(
-            conn.execute(
-                "SELECT COUNT(*) AS total FROM speakers WHERE name = ?", (source,)
-            ).fetchone()["total"]
-        )
-        db.add_person(conn, target, role=source_row["role"])
-        voices.merge_people(conn, source, target)
-        db.merge_person(conn, from_name=source, into=target)
-        db.queue_minutes_refresh(conn, affected_meetings)
-        return rewritten
+    return people_merge.merge(
+        [source], target, expected_digest=expected_digest
+    )
 
 
 def _normalized_person_name(name: str) -> str:
@@ -1619,18 +1557,38 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
+        if path == "/api/people/merge-preview":
+            try:
+                payload = self._payload()
+                raw_names = payload.get("names", [])
+                if not isinstance(raw_names, list):
+                    raise ValueError("'names' must be a list of selected contacts.")
+                names = [str(name).strip() for name in raw_names]
+                into = str(payload.get("into", "")).strip()
+                self._json(
+                    HTTPStatus.OK,
+                    asdict(preview_people_merge(names, into)),
+                )
+            except Exception as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
         if path == "/api/people/merge":
             try:
                 payload = self._payload()
                 from_name = str(payload.get("from_name", "")).strip()
                 into = str(payload.get("into", "")).strip()
+                expected_digest = str(payload.get("expected_digest", "")).strip()
                 if not from_name or not into:
                     raise ValueError("Both 'from_name' and 'into' are required.")
-                rewritten = merge_people(from_name, into)
+                result = merge_people(
+                    from_name, into, expected_digest=expected_digest
+                )
                 self._json(
                     HTTPStatus.OK,
-                    {"from_name": from_name, "into": into, "rewritten": rewritten},
+                    {"from_name": from_name, "into": into, **asdict(result)},
                 )
+            except people_merge.PreviewDriftError as exc:
+                self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
             except Exception as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
@@ -1642,16 +1600,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise ValueError("'names' must be a list of selected contacts.")
                 names = [str(name).strip() for name in raw_names]
                 into = str(payload.get("into", "")).strip()
-                rewritten = merge_many_people(names, into)
+                expected_digest = str(payload.get("expected_digest", "")).strip()
+                result = merge_many_people(
+                    names, into, expected_digest=expected_digest
+                )
                 self._json(
                     HTTPStatus.OK,
                     {
                         "names": names,
                         "into": into,
                         "merged": len(set(names)),
-                        "rewritten": rewritten,
+                        **asdict(result),
                     },
                 )
+            except people_merge.PreviewDriftError as exc:
+                self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
             except Exception as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
@@ -1660,11 +1623,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 payload = self._payload()
                 from_name = str(payload.get("from_name", "")).strip()
                 new_name = str(payload.get("new_name", "")).strip()
-                rewritten = rename_person(from_name, new_name)
+                expected_digest = str(payload.get("expected_digest", "")).strip()
+                result = rename_person(
+                    from_name, new_name, expected_digest=expected_digest
+                )
                 self._json(
                     HTTPStatus.OK,
-                    {"from_name": from_name, "new_name": new_name, "rewritten": rewritten},
+                    {"from_name": from_name, "new_name": new_name, **asdict(result)},
                 )
+            except people_merge.PreviewDriftError as exc:
+                self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
             except Exception as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return

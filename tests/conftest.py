@@ -67,7 +67,7 @@ if "httpx" not in sys.modules:
 
 import pytest
 
-from pipeline import db
+from pipeline import config, db
 from pipeline.config import ensure_dirs
 
 
@@ -95,6 +95,7 @@ def manifest(tmp_path, monkeypatch):
     """A fresh manifest database per test."""
     db_path = tmp_path / "manifest.db"
     monkeypatch.setattr(db, "DB_PATH", db_path)
+    monkeypatch.setattr(config, "DB_PATH", db_path)
     db.init_db(db_path)
     with db.connect(db_path) as conn:
         yield conn

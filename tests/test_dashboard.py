@@ -184,8 +184,9 @@ def test_people_management_and_speaker_override(manifest):
 
     # Merge person
     dashboard.add_person("Bob", role="Design")
-    rewritten = dashboard.merge_people("Alice", "Bob")
-    assert rewritten >= 1
+    approved = dashboard.preview_people_merge(["Alice"], "Bob")
+    result = dashboard.merge_people("Alice", "Bob", expected_digest=approved.digest)
+    assert result.speaker_rows >= 1
     with db.connect() as conn:
         speakers = db.get_speakers(conn, meeting_id)
         assert speakers.get("SPEAKER_00") == "Bob"
@@ -195,10 +196,12 @@ def test_merging_people_queues_completed_minutes_for_refresh(manifest):
     meeting_id = "merge-refresh"
     make_meeting(manifest, meeting_id, "2026-08-14", status=db.INDEXED)
     db.set_speaker(manifest, meeting_id, "SPEAKER_00", "Ali", "confirmed")
+    db.add_person(manifest, "Ali")
     db.add_person(manifest, "Ali Hilal")
     manifest.commit()
 
-    dashboard.merge_people("Ali", "Ali Hilal")
+    approved = dashboard.preview_people_merge(["Ali"], "Ali Hilal")
+    dashboard.merge_people("Ali", "Ali Hilal", expected_digest=approved.digest)
 
     with db.connect() as conn:
         meeting = db.get_meeting(conn, meeting_id)
@@ -206,7 +209,7 @@ def test_merging_people_queues_completed_minutes_for_refresh(manifest):
         assert db.get_speakers(conn, meeting_id)["SPEAKER_00"] == "Ali Hilal"
 
 
-def test_merge_many_people_keeps_one_spelling_and_all_history(manifest, monkeypatch):
+def test_merge_many_people_keeps_one_spelling_and_all_history(manifest):
     meeting_ids = []
     for index, name in enumerate(("Ru", "Roo", "Roe")):
         meeting_id = f"merge-many-{index}"
@@ -216,17 +219,12 @@ def test_merge_many_people_keeps_one_spelling_and_all_history(manifest, monkeypa
         db.set_speaker(manifest, meeting_id, "SPEAKER_00", name, "confirmed")
     manifest.commit()
 
-    voice_moves = []
-    monkeypatch.setattr(
-        dashboard.voices,
-        "merge_people",
-        lambda conn, source, target: voice_moves.append((source, target)) or 0,
+    approved = dashboard.preview_people_merge(["Ru", "Roo", "Roe"], "Roo")
+    result = dashboard.merge_many_people(
+        ["Ru", "Roo", "Roe"], "Roo", expected_digest=approved.digest
     )
 
-    rewritten = dashboard.merge_many_people(["Ru", "Roo", "Roe"], "Roo")
-
-    assert rewritten == 2
-    assert voice_moves == [("Ru", "Roo"), ("Roe", "Roo")]
+    assert result.speaker_rows == 2
     with db.connect() as conn:
         people = {person["canonical"]: person for person in db.list_people(conn)}
         assert set(people) == {"Roo"}
@@ -235,7 +233,9 @@ def test_merge_many_people_keeps_one_spelling_and_all_history(manifest, monkeypa
         assert db.canonical_name(conn, "Roe") == "Roo"
         for meeting_id in meeting_ids:
             assert db.get_speakers(conn, meeting_id)["SPEAKER_00"] == "Roo"
-            assert db.get_meeting(conn, meeting_id).status == db.SPEAKERS_RESOLVED
+        assert db.get_meeting(conn, meeting_ids[0]).status == db.SPEAKERS_RESOLVED
+        assert db.get_meeting(conn, meeting_ids[1]).status == db.INDEXED
+        assert db.get_meeting(conn, meeting_ids[2]).status == db.SPEAKERS_RESOLVED
 
 
 def test_merge_many_people_rejects_missing_name_before_writing(manifest):
@@ -243,8 +243,8 @@ def test_merge_many_people_rejects_missing_name_before_writing(manifest):
         db.add_person(manifest, name)
     manifest.commit()
 
-    with pytest.raises(ValueError, match="Contact not found: Roe"):
-        dashboard.merge_many_people(["Ru", "Roo", "Roe"], "Roo")
+    with pytest.raises(ValueError, match="source does not exist: 'Roe'"):
+        dashboard.preview_people_merge(["Ru", "Roo", "Roe"], "Roo")
 
     with db.connect() as conn:
         assert {person["canonical"] for person in db.list_people(conn)} == {"Ru", "Roo"}
@@ -269,7 +269,10 @@ def test_merge_many_people_handles_graph_rows_that_already_use_both_names(manife
     )
     manifest.commit()
 
-    dashboard.merge_many_people(["Ru", "Roo"], "Roo")
+    approved = dashboard.preview_people_merge(["Ru", "Roo"], "Roo")
+    dashboard.merge_many_people(
+        ["Ru", "Roo"], "Roo", expected_digest=approved.digest
+    )
 
     with db.connect() as conn:
         assert [item["name"] for item in db.get_entities(conn, meeting_id)] == ["Roo"]
@@ -319,7 +322,7 @@ def test_declining_a_similar_name_group_remembers_every_pair(manifest):
     assert dashboard.people_merge_suggestions() == []
 
 
-def test_rename_person_changes_spelling_and_queues_minutes(manifest):
+def test_rename_person_changes_spelling_through_the_deep_module(manifest):
     meeting_id = "rename-contact"
     make_meeting(manifest, meeting_id, "2026-08-14", status=db.INDEXED)
     db.add_person(manifest, "Roo", role="Designer")
@@ -336,8 +339,12 @@ def test_rename_person_changes_spelling_and_queues_minutes(manifest):
     )
     manifest.commit()
 
-    dashboard.rename_person("Roo", "Rue")
+    approved = dashboard.preview_people_merge(["Roo"], "Rue")
+    result = dashboard.rename_person(
+        "Roo", "Rue", expected_digest=approved.digest
+    )
 
+    assert result.target == "Rue"
     with db.connect() as conn:
         people = {person["canonical"]: person for person in db.list_people(conn)}
         assert "Roo" not in people
@@ -674,23 +681,30 @@ def test_decisions_list_wraps_db_query_and_topic_filter(manifest):
 
 # ── Voice snippet serving and merge completeness ──────────────────────
 
-def test_merge_people_moves_voice_samples_too(manifest, monkeypatch):
-    """db.merge_person handles the text tables and knows nothing about voiceprints.
-
-    Merging without moving them leaves the folded-away name holding its own
-    embeddings, so the duplicate identity reappears the next time that person
-    speaks and voice recognition treats the two spellings as two people.
-    """
-    calls = []
-    monkeypatch.setattr(
-        dashboard.voices,
-        "merge_people",
-        lambda conn, source, target: calls.append((source, target)) or 1,
-    )
+def test_merge_people_moves_voice_samples_through_the_deep_module(manifest):
     dashboard.add_person("Michael")
     dashboard.add_person("Mike")
-    dashboard.merge_people("Mike", "Michael")
-    assert calls == [("Mike", "Michael")], "voice samples must follow the merge"
+    with db.connect() as conn:
+        db.add_voice_sample(
+            conn,
+            canonical="Mike",
+            meeting_id=None,
+            label="SPEAKER_00",
+            embedding=b"voice",
+            dim=1,
+            model="test-model",
+            speech_sec=12.0,
+        )
+    approved = dashboard.preview_people_merge(["Mike"], "Michael")
+
+    result = dashboard.merge_people(
+        "Mike", "Michael", expected_digest=approved.digest
+    )
+
+    assert result.target == "Michael"
+    with db.connect() as conn:
+        assert db.person_samples(conn, "Mike") == []
+        assert len(db.person_samples(conn, "Michael")) == 1
 
 
 def test_merge_many_people_preserves_voice_samples_before_deleting_sources(manifest):
@@ -709,12 +723,59 @@ def test_merge_many_people_preserves_voice_samples_before_deleting_sources(manif
         )
     manifest.commit()
 
-    dashboard.merge_many_people(["Ru", "Roo", "Roe"], "Roo")
+    approved = dashboard.preview_people_merge(["Ru", "Roo", "Roe"], "Roo")
+    result = dashboard.merge_many_people(
+        ["Ru", "Roo", "Roe"], "Roo", expected_digest=approved.digest
+    )
 
+    assert result.target == "Roo"
     with db.connect() as conn:
         samples = db.person_samples(conn, "Roo")
         assert len(samples) == 2
         assert {sample["label"] for sample in samples} == {"SPEAKER_00", "SPEAKER_01"}
+
+
+def test_people_merge_http_preview_and_stale_digest_conflict(manifest):
+    from http import HTTPStatus
+
+    db.add_person(manifest, "Mike")
+    manifest.commit()
+
+    class FakeHandler(dashboard.DashboardHandler):
+        def __init__(self, path, payload):
+            self.path = path
+            self.headers = {}
+            self.bind_host = "127.0.0.1"
+            self.payload = payload
+            self.response = None
+
+        def _payload(self):
+            return self.payload
+
+        def _json(self, status, payload):
+            self.response = (status, payload)
+
+    preview_handler = FakeHandler(
+        "/api/people/merge-preview", {"names": ["Mike"], "into": "Michael"}
+    )
+    preview_handler.do_POST()
+    status, preview_payload = preview_handler.response
+    assert status == HTTPStatus.OK
+
+    db.add_person(manifest, "Mike", aliases=["Mikey"])
+    manifest.commit()
+    merge_handler = FakeHandler(
+        "/api/people/merge",
+        {
+            "from_name": "Mike",
+            "into": "Michael",
+            "expected_digest": preview_payload["digest"],
+        },
+    )
+    merge_handler.do_POST()
+
+    assert merge_handler.response[0] == HTTPStatus.CONFLICT
+    assert "preview changed" in merge_handler.response[1]["error"]
 
 
 def test_voice_snippet_requires_both_identifiers():

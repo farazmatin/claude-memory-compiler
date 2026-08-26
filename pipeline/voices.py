@@ -533,25 +533,6 @@ def unsure(conn: sqlite3.Connection, cluster_id: str) -> int:
     return len(members)
 
 
-def merge_people(conn: sqlite3.Connection, source: str, target: str) -> int:
-    """Fold one person's voice samples into another's.
-
-    A routine correction rather than an edge case: the same person gets named
-    "Mike" one week and "Michael" the next, and both accumulate voiceprints.
-    """
-    source, target = source.strip(), target.strip()
-    if not source or not target or source == target:
-        return 0
-
-    moved = db.reassign_voice_samples(conn, source, target)
-    db.add_person(conn, target, aliases=[source])
-    conn.execute(
-        "UPDATE speaker_matches SET resolved_as = ? WHERE resolved_as = ?", (target, source)
-    )
-    conn.execute("UPDATE speakers SET name = ? WHERE name = ?", (target, source))
-    return moved
-
-
 def forget(conn: sqlite3.Connection, canonical: str) -> tuple[int, int]:
     """Delete every voice sample and snippet for one person.
 

@@ -8,7 +8,7 @@ if the regex could not survive contact with the corpus it exists to read.
 
 from __future__ import annotations
 
-from pipeline import commitments, db
+from pipeline import commitments, db, people_merge
 
 from .conftest import make_meeting
 
@@ -298,11 +298,14 @@ def test_duplicate_text_within_one_document_does_not_crash(manifest):
 
 def test_merge_person_rewrites_commitments_decisions_and_questions(manifest):
     make_meeting(manifest, "m1", "2026-08-10")
+    db.add_person(manifest, "Mike")
     db.replace_commitments(manifest, "m1", [{"text": "task", "owner": "Mike"}])
     db.replace_decisions(manifest, "m1", [{"text": "decision", "decided_by": "Mike"}])
     db.replace_open_questions(manifest, "m1", [{"text": "question", "owner": "Mike"}])
 
-    db.merge_person(manifest, "Mike", "Michael")
+    manifest.commit()
+    approved = people_merge.preview(["Mike"], "Michael")
+    people_merge.merge(["Mike"], "Michael", expected_digest=approved.digest)
 
     assert db.get_decisions(manifest, "m1")[0]["decided_by"] == "Michael"
     assert db.get_open_questions(manifest, "m1")[0]["owner"] == "Michael"

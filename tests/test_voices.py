@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from pipeline import db, voices
+from pipeline import db, people_merge, voices
 from tests.conftest import make_meeting
 
 MODEL = "test-embed-v1"
@@ -337,6 +337,19 @@ def test_confirming_normalizes_through_the_people_registry(manifest):
     assert db.person_samples(manifest, "Mike") == []
 
 
+def test_stale_confirmation_cannot_resurrect_a_merged_name(manifest):
+    db.add_person(manifest, "Michael")
+    db.flatten_and_record_merge(manifest, "Mike", "Michael")
+    add_pending(manifest, "meet-a", "SPEAKER_00", vec(1.0, 0.0, 0.0))
+    voices.cluster_pending(manifest, MODEL)
+
+    voices.confirm(manifest, db.pending_clusters(manifest)[0]["id"], "Mike", model=MODEL)
+
+    assert db.get_speakers(manifest, "meet-a") == {"SPEAKER_00": "Michael"}
+    assert len(db.person_samples(manifest, "Michael")) == 1
+    assert [person["canonical"] for person in db.list_people(manifest)] == ["Michael"]
+
+
 def test_dismiss_keeps_the_embedding(manifest):
     """A dismissed fragment is sometimes a real person who barely spoke."""
     add_pending(manifest, "meet-a", "SPEAKER_00", vec(1.0, 0.0, 0.0))
@@ -361,7 +374,13 @@ def test_merging_people_moves_their_samples(manifest):
     enroll(manifest, "Mike", vec(1.0, 0.0))
     enroll(manifest, "Michael", vec(0.99, 0.02))
 
-    assert voices.merge_people(manifest, "Mike", "Michael") == 2
+    manifest.commit()
+    approved = people_merge.preview(["Mike"], "Michael")
+    result = people_merge.merge(
+        ["Mike"], "Michael", expected_digest=approved.digest
+    )
+
+    assert result.target == "Michael"
     assert db.person_samples(manifest, "Mike") == []
     assert len(db.person_samples(manifest, "Michael")) == 4
     assert db.canonical_name(manifest, "Mike") == "Michael"

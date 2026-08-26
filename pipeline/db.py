@@ -857,7 +857,9 @@ def canonical_name(conn: sqlite3.Connection, name: str | None) -> str | None:
     row = conn.execute(
         "SELECT canonical FROM person_aliases WHERE alias = ?", (name.strip().lower(),)
     ).fetchone()
-    return row["canonical"] if row else name.strip()
+    if row:
+        return row["canonical"]
+    return resolve_merged_name(conn, name) or name.strip()
 
 
 def list_people(conn: sqlite3.Connection) -> list[dict[str, object]]:
@@ -875,74 +877,6 @@ def list_people(conn: sqlite3.Connection) -> list[dict[str, object]]:
         """
     ).fetchall()
     return [dict(r) for r in rows]
-
-
-def merge_person(conn: sqlite3.Connection, from_name: str, into: str) -> int:
-    """Fold one person into another, rewriting existing rows.
-
-    For when the same human was recorded under two names before the registry knew
-    about it. Returns the number of speaker rows rewritten.
-    """
-    from_name, into = from_name.strip(), into.strip()
-    if not from_name or not into or from_name == into:
-        return 0
-
-    affected_meetings = [
-        row["meeting_id"]
-        for row in conn.execute(
-            """
-            SELECT meeting_id FROM speakers WHERE name = ?
-            UNION SELECT meeting_id FROM entities WHERE name = ?
-            UNION SELECT meeting_id FROM relations WHERE subject = ? OR object = ?
-            UNION SELECT meeting_id FROM commitments WHERE owner = ?
-            UNION SELECT meeting_id FROM decisions WHERE decided_by = ?
-            UNION SELECT meeting_id FROM open_questions WHERE owner = ?
-            """,
-            (from_name,) * 7,
-        ).fetchall()
-    ]
-
-    add_person(conn, into, aliases=[from_name])
-    cursor = conn.execute(
-        "UPDATE speakers SET name = ? WHERE name = ?", (into, from_name)
-    )
-    # Historic entities and relations must move too, or the graph keeps both
-    # nodes. Insert/delete instead of UPDATE because both spellings can already
-    # appear in one meeting and collide with these tables' primary keys.
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO entities (meeting_id, name, kind, description)
-        SELECT meeting_id, ?, kind, description FROM entities WHERE name = ?
-        """,
-        (into, from_name),
-    )
-    conn.execute("DELETE FROM entities WHERE name = ?", (from_name,))
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO relations (meeting_id, subject, predicate, object)
-        SELECT meeting_id,
-               CASE WHEN subject = ? THEN ? ELSE subject END,
-               predicate,
-               CASE WHEN object = ? THEN ? ELSE object END
-        FROM relations WHERE subject = ? OR object = ?
-        """,
-        (from_name, into, from_name, into, from_name, from_name),
-    )
-    conn.execute(
-        "DELETE FROM relations WHERE subject = ? OR object = ?", (from_name, from_name)
-    )
-    # Same reasoning for the commitment register and decision store: a merge
-    # made after a meeting was already parsed must not leave that meeting's
-    # commitments still attributed to the old spelling.
-    conn.execute("UPDATE commitments SET owner = ? WHERE owner = ?", (into, from_name))
-    conn.execute("UPDATE decisions SET decided_by = ? WHERE decided_by = ?", (into, from_name))
-    conn.execute("UPDATE open_questions SET owner = ? WHERE owner = ?", (into, from_name))
-    conn.execute(
-        "UPDATE person_aliases SET canonical = ? WHERE canonical = ?", (into, from_name)
-    )
-    conn.execute("DELETE FROM people WHERE canonical = ?", (from_name,))
-    queue_minutes_refresh(conn, affected_meetings)
-    return cursor.rowcount
 
 
 # ── Entities and relations ────────────────────────────────────────────

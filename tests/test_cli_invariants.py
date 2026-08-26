@@ -53,10 +53,12 @@ def test_transcribe_embeds_voices_before_releasing_the_audio():
     )
 
 
-def test_people_merge_moves_voiceprints_as_well_as_text_rows():
-    """db.merge_person knows nothing about voice data.
-
-    Merging without voices.merge_people leaves the folded-away name holding its own
-    embeddings, so the duplicate identity returns the next time that person speaks.
-    """
-    _statement_order(cli.cmd_people, "db.merge_person", "voices.merge_people")
+def test_people_merge_uses_the_single_preview_bound_workflow():
+    """CLI adapters must not recreate database/voice merge ordering."""
+    preview_line, merge_line = _statement_order(
+        cli.cmd_people, "people_merge.preview", "people_merge.merge"
+    )
+    assert preview_line < merge_line
+    source = inspect.getsource(cli.cmd_people)
+    assert "db.merge_person" not in source
+    assert "voices.merge_people" not in source

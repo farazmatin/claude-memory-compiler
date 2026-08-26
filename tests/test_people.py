@@ -7,9 +7,17 @@ separate node in the knowledge graph.
 
 from __future__ import annotations
 
-from pipeline import db
+import pytest
+
+from pipeline import db, people_merge
 
 from .conftest import make_meeting
+
+
+def _merge(manifest, names, target):
+    manifest.commit()
+    approved = people_merge.preview(names, target)
+    return people_merge.merge(names, target, expected_digest=approved.digest)
 
 
 def test_aliases_map_to_canonical_case_insensitively(manifest):
@@ -28,6 +36,13 @@ def test_unknown_names_pass_through_trimmed(manifest):
     """A new person is normal; silently dropping them would be worse than an
     unnormalized spelling."""
     assert db.canonical_name(manifest, "  Stranger ") == "Stranger"
+
+
+def test_canonical_name_resolves_a_hidden_merge_tombstone(manifest):
+    db.add_person(manifest, "Michael")
+    db.flatten_and_record_merge(manifest, "Mike", "Michael")
+
+    assert db.canonical_name(manifest, "  MIKE  ") == "Michael"
 
 
 def test_none_and_empty_are_preserved(manifest):
@@ -66,6 +81,7 @@ def test_list_people_counts_meetings(manifest):
 def test_merge_rewrites_history_everywhere(manifest):
     """Merging must move entities and relations too, or the graph keeps both nodes."""
     make_meeting(manifest, "m1", "2026-08-10")
+    db.add_person(manifest, "Mike")
     db.set_speaker(manifest, "m1", "SPEAKER_00", "Mike", "inferred")
     db.replace_entities(
         manifest, "m1",
@@ -73,9 +89,9 @@ def test_merge_rewrites_history_everywhere(manifest):
         [{"subject": "Mike", "predicate": "owns", "object": "Atlas"}],
     )
 
-    rewritten = db.merge_person(manifest, "Mike", "Michael")
+    result = _merge(manifest, ["Mike"], "Michael")
 
-    assert rewritten == 1
+    assert result.speaker_rows == 1
     assert db.get_speakers(manifest, "m1") == {"SPEAKER_00": "Michael"}
     assert [e["name"] for e in db.get_entities(manifest, "m1")] == ["Michael"]
     assert db.get_relations(manifest, "m1")[0]["subject"] == "Michael"
@@ -85,22 +101,26 @@ def test_merge_rewrites_history_everywhere(manifest):
 
 def test_merge_moves_relation_objects_too(manifest):
     make_meeting(manifest, "m1", "2026-08-10")
+    db.add_person(manifest, "Mike")
     db.replace_entities(
         manifest, "m1", [],
         [{"subject": "Atlas", "predicate": "owned by", "object": "Mike"}],
     )
-    db.merge_person(manifest, "Mike", "Michael")
+    _merge(manifest, ["Mike"], "Michael")
     assert db.get_relations(manifest, "m1")[0]["object"] == "Michael"
 
 
-def test_merge_into_self_is_a_noop(manifest):
+def test_merge_into_self_is_rejected_before_mutation(manifest):
     db.add_person(manifest, "Faraz")
-    assert db.merge_person(manifest, "Faraz", "Faraz") == 0
+    manifest.commit()
+    with pytest.raises(ValueError, match="would not change any source"):
+        people_merge.preview(["Faraz"], "Faraz")
+    assert [person["canonical"] for person in db.list_people(manifest)] == ["Faraz"]
 
 
 def test_merge_carries_existing_aliases_forward(manifest):
     db.add_person(manifest, "Mike", aliases=["mikey"])
-    db.merge_person(manifest, "Mike", "Michael")
+    _merge(manifest, ["Mike"], "Michael")
     assert db.canonical_name(manifest, "mikey") == "Michael"
 
 

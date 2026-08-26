@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 
-from pipeline import cli, db
+from pipeline import cli, db, people_merge
 
 from .conftest import make_meeting
 
@@ -39,6 +39,62 @@ def test_status_omits_stage_failures_section_when_there_are_none(manifest, capsy
     out = capsys.readouterr().out
 
     assert "Recent stage failures" not in out
+
+
+def test_people_merge_cli_previews_without_mutating(manifest, capsys):
+    db.add_person(manifest, "Mike")
+    manifest.commit()
+
+    assert cli.main(["people", "--merge", "Mike", "Michael"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Merge preview" in out
+    assert "Nothing was changed" in out
+    assert "Digest:" in out
+    assert [person["canonical"] for person in db.list_people(manifest)] == ["Mike"]
+
+
+def test_people_merge_cli_apply_requires_the_exact_digest(manifest, capsys):
+    db.add_person(manifest, "Mike")
+    manifest.commit()
+    approved = people_merge.preview(["Mike"], "Michael")
+
+    assert cli.main(
+        [
+            "people",
+            "--merge",
+            "Mike",
+            "Michael",
+            "--apply",
+            "--expected-digest",
+            approved.digest,
+        ]
+    ) == 0
+
+    assert "Merged 'Mike' into 'Michael'" in capsys.readouterr().out
+    assert [person["canonical"] for person in db.list_people(manifest)] == ["Michael"]
+
+
+def test_people_merge_cli_apply_without_a_digest_is_non_mutating(
+    manifest, capsys
+):
+    db.add_person(manifest, "Mike")
+    manifest.commit()
+
+    assert cli.main(
+        ["people", "--merge", "Mike", "Michael", "--apply"]
+    ) == 2
+
+    assert "requires --expected-digest" in capsys.readouterr().err
+    assert [person["canonical"] for person in db.list_people(manifest)] == ["Mike"]
+
+
+def test_people_merge_cli_can_resume_rewrite_jobs(manifest, capsys):
+    manifest.commit()
+
+    assert cli.main(["people", "--resume-merge-rewrites"]) == 0
+
+    assert "0 pending" in capsys.readouterr().out
 
 
 # ── Alerting gate: skip vs. genuine failure ─────────────────────────
