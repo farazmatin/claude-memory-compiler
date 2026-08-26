@@ -170,10 +170,20 @@ def _build_plan(
     target = conn.execute(
         "SELECT canonical FROM people WHERE canonical = ?", (requested_target,)
     ).fetchone()
+    has_merge_history = (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'merged_names'"
+        ).fetchone()
+        is not None
+    )
     if target:
         actual_target = target["canonical"]
     else:
-        actual_target = db.resolve_merged_name(conn, requested_target) or requested_target
+        actual_target = (
+            db.resolve_merged_name(conn, requested_target)
+            if has_merge_history
+            else None
+        ) or requested_target
     absorbed_names = tuple(name for name in source_names if name != actual_target)
     if not absorbed_names:
         raise ValueError("merge would not change any source")
@@ -346,19 +356,23 @@ def _build_plan(
     ]
     participant_keys = tuple(sorted({db.person_key(name) for name in participant_names}))
     key_placeholders = ", ".join("?" for _ in participant_keys)
-    tombstone_rows = [
-        dict(row)
-        for row in conn.execute(
-            f"""
-            SELECT old_key, old_spelling, canonical, merged_at
-            FROM merged_names
-            WHERE old_key IN ({key_placeholders})
-               OR canonical IN ({participant_placeholders})
-            ORDER BY old_key
-            """,
-            (*participant_keys, *participant_names),
-        )
-    ]
+    tombstone_rows = (
+        [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT old_key, old_spelling, canonical, merged_at
+                FROM merged_names
+                WHERE old_key IN ({key_placeholders})
+                   OR canonical IN ({participant_placeholders})
+                ORDER BY old_key
+                """,
+                (*participant_keys, *participant_names),
+            )
+        ]
+        if has_merge_history
+        else []
+    )
 
     payload: dict[str, object] = {
         "database_path": str(database_path.resolve()),

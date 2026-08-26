@@ -86,6 +86,20 @@ def test_preview_resolves_a_tombstoned_target(manifest, monkeypatch):
     assert result.actual_target == "Michael"
 
 
+def test_preview_supports_a_read_only_pre_migration_manifest(manifest, monkeypatch):
+    db.add_person(manifest, "Mike")
+    manifest.execute("DROP TABLE merged_names")
+    _use_manifest(manifest, monkeypatch)
+    manifest_path = Path(config.DB_PATH)
+    manifest_before = _sha256(manifest_path)
+
+    result = people_merge.preview(["Mike"], "Michael")
+
+    assert result.actual_target == "Michael"
+    assert len(result.digest) == 64
+    assert _sha256(manifest_path) == manifest_before
+
+
 def test_preview_rejects_a_missing_source(manifest, monkeypatch):
     db.add_person(manifest, "Michael")
     _use_manifest(manifest, monkeypatch)
