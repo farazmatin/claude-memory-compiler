@@ -9,7 +9,7 @@ and must never be redone. Improving the minutes template later means re-running
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +56,23 @@ CREATE INDEX IF NOT EXISTS idx_meetings_status ON meetings(status);
 -- minutes compiler reads prior related minutes to flag reversed decisions, and
 -- that context is only correct if meetings compile chronologically.
 CREATE INDEX IF NOT EXISTS idx_meetings_date ON meetings(meeting_date, meeting_time);
+
+CREATE TABLE IF NOT EXISTS minute_rewrite_jobs (
+    id             TEXT PRIMARY KEY,
+    operation_id   TEXT NOT NULL,
+    meeting_id     TEXT NOT NULL,
+    minutes_path   TEXT,
+    mappings_json  TEXT NOT NULL,
+    before_sha256  TEXT,
+    after_sha256   TEXT,
+    before_text    TEXT,
+    after_text     TEXT,
+    state          TEXT NOT NULL,  -- pending|applied|unchanged|missing|conflict
+    error          TEXT,
+    created_at     TEXT NOT NULL,
+    finished_at    TEXT,
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS speakers (
     meeting_id  TEXT NOT NULL,
@@ -118,6 +135,16 @@ CREATE TABLE IF NOT EXISTS people (
     notes       TEXT,
     created_at  TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS merged_names (
+    old_key      TEXT PRIMARY KEY,
+    old_spelling TEXT NOT NULL,
+    canonical    TEXT NOT NULL,
+    merged_at    TEXT NOT NULL,
+    FOREIGN KEY (canonical) REFERENCES people(canonical) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_merged_names_canonical ON merged_names(canonical);
 
 CREATE TABLE IF NOT EXISTS person_aliases (
     alias       TEXT PRIMARY KEY,   -- lowercased for case-insensitive matching
@@ -688,6 +715,97 @@ def known_speaker_names(conn: sqlite3.Connection, limit: int = 50) -> list[str]:
 # way it did four months ago is not a reliable strategy, and every variant it
 # invents becomes a separate node in the knowledge graph.
 
+
+def person_key(name: str) -> str:
+    """Return the stable, case-insensitive identity key for a person's name."""
+    return name.strip().lower()
+
+
+def flatten_and_record_merge(conn: sqlite3.Connection, old_spelling: str, canonical: str) -> None:
+    """Record a merge and redirect older tombstones straight to its target."""
+    old_spelling = old_spelling.strip()
+    canonical = canonical.strip()
+    old_key = person_key(old_spelling)
+    target_key = person_key(canonical)
+    if not old_key or not target_key:
+        raise ValueError("merge names must not be blank")
+    if old_key == target_key:
+        raise ValueError("a person cannot be merged into itself")
+
+    target = conn.execute(
+        "SELECT canonical FROM people WHERE canonical = ?", (canonical,)
+    ).fetchone()
+    if target is None:
+        raise ValueError(f"merge target is not a living person: {canonical!r}")
+
+    if conn.execute("SELECT 1 FROM merged_names WHERE old_key = ?", (target_key,)).fetchone():
+        raise ValueError(f"merge target is already tombstoned: {canonical!r}")
+
+    timestamp = now_iso()
+    conn.execute(
+        "UPDATE merged_names SET canonical = ?, merged_at = ? WHERE canonical = ?",
+        (canonical, timestamp, old_spelling),
+    )
+    conn.execute(
+        """
+        INSERT INTO merged_names (old_key, old_spelling, canonical, merged_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(old_key) DO UPDATE SET
+            old_spelling = excluded.old_spelling,
+            canonical = excluded.canonical,
+            merged_at = excluded.merged_at
+        """,
+        (old_key, old_spelling, canonical, timestamp),
+    )
+
+
+def resolve_merged_name(conn: sqlite3.Connection, name: str) -> str | None:
+    """Resolve a retired spelling to its living canonical target."""
+    key = person_key(name)
+    if not key:
+        return None
+
+    resolved: str | None = None
+    visited: set[str] = set()
+    while key not in visited:
+        visited.add(key)
+        row = conn.execute(
+            "SELECT canonical FROM merged_names WHERE old_key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            if resolved is None:
+                return None
+            living = conn.execute(
+                "SELECT 1 FROM people WHERE canonical = ?", (resolved,)
+            ).fetchone()
+            return resolved if living is not None else None
+        resolved = row["canonical"]
+        key = person_key(resolved)
+    return None
+
+
+def affected_meeting_ids(conn: sqlite3.Connection, names: Iterable[str]) -> set[str]:
+    """Return meetings containing any supplied name in a person-bearing field."""
+    values = tuple({name.strip() for name in names if name and name.strip()})
+    if not values:
+        return set()
+
+    placeholders = ", ".join("?" for _ in values)
+    rows = conn.execute(
+        f"""
+        SELECT meeting_id FROM speakers WHERE name IN ({placeholders})
+        UNION SELECT meeting_id FROM entities WHERE name IN ({placeholders})
+        UNION SELECT meeting_id FROM relations
+            WHERE subject IN ({placeholders}) OR object IN ({placeholders})
+        UNION SELECT meeting_id FROM commitments WHERE owner IN ({placeholders})
+        UNION SELECT meeting_id FROM decisions WHERE decided_by IN ({placeholders})
+        UNION SELECT meeting_id FROM open_questions WHERE owner IN ({placeholders})
+        """,
+        values * 7,
+    ).fetchall()
+    return {row["meeting_id"] for row in rows}
+
+
 def add_person(
     conn: sqlite3.Connection,
     canonical: str,
@@ -702,6 +820,10 @@ def add_person(
     canonical = canonical.strip()
     if not canonical:
         return
+    if conn.execute(
+        "SELECT 1 FROM merged_names WHERE old_key = ?", (person_key(canonical),)
+    ).fetchone():
+        raise ValueError(f"cannot register tombstoned person: {canonical!r}")
     ts = now_iso()
     conn.execute(
         """
