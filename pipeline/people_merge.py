@@ -127,6 +127,24 @@ def _sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _digest_rows(rows: Iterable[sqlite3.Row]) -> list[dict[str, object]]:
+    """Make exact database inputs JSON-safe without embedding voice blobs."""
+    result: list[dict[str, object]] = []
+    for row in rows:
+        item: dict[str, object] = {}
+        for key, value in dict(row).items():
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                content = bytes(value)
+                item[key] = {
+                    "bytes": len(content),
+                    "sha256": _sha256_bytes(content),
+                }
+            else:
+                item[key] = value
+        result.append(item)
+    return result
+
+
 def _build_plan(
     conn: sqlite3.Connection,
     database_path: Path,
@@ -166,11 +184,87 @@ def _build_plan(
         absorbed_names,
     ).fetchone()["count"]
 
+    repeated = absorbed_names * 3
+    source_row_queries: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+        (
+            "speakers",
+            f"SELECT * FROM speakers WHERE name IN ({placeholders}) "
+            "ORDER BY meeting_id, label",
+            absorbed_names,
+        ),
+        (
+            "speaker_matches",
+            f"""
+            SELECT * FROM speaker_matches
+            WHERE resolved_as IN ({placeholders})
+               OR best_canonical IN ({placeholders})
+               OR next_canonical IN ({placeholders})
+            ORDER BY meeting_id, label
+            """,
+            repeated,
+        ),
+        (
+            "voice_clusters",
+            f"""
+            SELECT * FROM voice_clusters
+            WHERE best_canonical IN ({placeholders})
+               OR next_canonical IN ({placeholders})
+            ORDER BY id
+            """,
+            absorbed_names * 2,
+        ),
+        (
+            "voice_samples",
+            f"SELECT * FROM voice_samples WHERE canonical IN ({placeholders}) "
+            "ORDER BY id",
+            absorbed_names,
+        ),
+        (
+            "entities",
+            f"SELECT * FROM entities WHERE name IN ({placeholders}) "
+            "ORDER BY meeting_id, name",
+            absorbed_names,
+        ),
+        (
+            "relations",
+            f"""
+            SELECT * FROM relations
+            WHERE subject IN ({placeholders}) OR object IN ({placeholders})
+            ORDER BY meeting_id, subject, predicate, object
+            """,
+            absorbed_names * 2,
+        ),
+        (
+            "commitments",
+            f"SELECT * FROM commitments WHERE owner IN ({placeholders}) ORDER BY id",
+            absorbed_names,
+        ),
+        (
+            "decisions",
+            f"SELECT * FROM decisions WHERE decided_by IN ({placeholders}) ORDER BY id",
+            absorbed_names,
+        ),
+        (
+            "open_questions",
+            f"SELECT * FROM open_questions WHERE owner IN ({placeholders}) ORDER BY id",
+            absorbed_names,
+        ),
+    )
+    source_rows = {
+        name: _digest_rows(conn.execute(sql, params))
+        for name, sql, params in source_row_queries
+    }
+
     mappings = {name: actual_target for name in absorbed_names}
     file_rewrites: list[_FileRewrite] = []
     missing_files: list[str] = []
     files_changed = 0
     literal_matches = 0
+    common_word_matches = {
+        name: 0
+        for name in absorbed_names
+        if db.person_key(name) in _COMMON_WORD_NAMES
+    }
     for meeting_id in affected_ids:
         row = conn.execute(
             "SELECT minutes_path FROM meetings WHERE id = ?", (meeting_id,)
@@ -197,6 +291,10 @@ def _build_plan(
         rewrite = plan_text(before_text, mappings)
         after_bytes = rewrite.after.encode("utf-8")
         literal_matches += rewrite.match_count
+        for source_name in common_word_matches:
+            common_word_matches[source_name] += plan_text(
+                before_text, {source_name: actual_target}
+            ).match_count
         state = "changed" if after_bytes != before_bytes else "unchanged"
         if state == "changed":
             files_changed += 1
@@ -215,9 +313,9 @@ def _build_plan(
         )
 
     conflicts = tuple(
-        f"Common-word source {name!r} matched {literal_matches} literals"
-        for name in absorbed_names
-        if db.person_key(name) in _COMMON_WORD_NAMES and literal_matches
+        f"Common-word source {name!r} matched {count} literals"
+        for name, count in common_word_matches.items()
+        if count
     )
 
     participant_names = tuple(sorted({*source_names, actual_target}))
@@ -270,6 +368,7 @@ def _build_plan(
         "absorbed_names": absorbed_names,
         "affected_meeting_ids": affected_ids,
         "mappings": mappings,
+        "source_rows": source_rows,
         "files": [file_rewrite.digest_payload() for file_rewrite in file_rewrites],
         "people": people_rows,
         "aliases": alias_rows,

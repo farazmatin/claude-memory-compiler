@@ -208,6 +208,32 @@ def test_preview_flags_common_word_matches_for_human_review(
     assert result.conflicts == ("Common-word source 'May' matched 2 literals",)
 
 
+def test_preview_counts_common_word_matches_without_other_sources(
+    manifest, monkeypatch, tmp_path
+):
+    for meeting_id, name, text in (
+        ("may", "May", "May approved."),
+        ("john", "John", "John asked John, then John approved."),
+    ):
+        minutes_path = tmp_path / f"{meeting_id}.md"
+        minutes_path.write_text(text, encoding="utf-8")
+        make_meeting(manifest, meeting_id, "2026-08-26")
+        db.set_speaker(manifest, meeting_id, "SPEAKER_00", name, "confirmed")
+        db.advance(
+            manifest,
+            meeting_id,
+            db.MINUTES_COMPILED,
+            minutes_path=str(minutes_path),
+        )
+        db.add_person(manifest, name)
+    _use_manifest(manifest, monkeypatch)
+
+    result = people_merge.preview(["May", "John"], "Review Team")
+
+    assert result.literal_matches == 4
+    assert result.conflicts == ("Common-word source 'May' matched 1 literals",)
+
+
 def test_preview_digest_changes_when_a_source_alias_changes(manifest, monkeypatch):
     db.add_person(manifest, "Mike")
     _use_manifest(manifest, monkeypatch)
@@ -218,6 +244,28 @@ def test_preview_digest_changes_when_a_source_alias_changes(manifest, monkeypatc
     after = people_merge.preview(["Mike"], "Michael")
 
     assert after.digest != before.digest
+
+
+def test_merge_rejects_source_row_drift_inside_an_already_affected_meeting(
+    manifest, monkeypatch
+):
+    make_meeting(manifest, "m1", "2026-08-26")
+    db.add_person(manifest, "Mike")
+    db.set_speaker(manifest, "m1", "SPEAKER_00", "Mike", "confirmed")
+    _use_manifest(manifest, monkeypatch)
+    approved = people_merge.preview(["Mike"], "Michael")
+
+    db.replace_commitments(
+        manifest,
+        "m1",
+        [{"text": "Ship Atlas", "owner": "Mike"}],
+    )
+    manifest.commit()
+
+    with pytest.raises(people_merge.PreviewDriftError):
+        people_merge.merge(["Mike"], "Michael", expected_digest=approved.digest)
+
+    assert [person["canonical"] for person in db.list_people(manifest)] == ["Mike"]
 
 
 def test_preview_accepts_an_existing_target_outside_the_selection(manifest, monkeypatch):
