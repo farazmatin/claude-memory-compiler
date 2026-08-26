@@ -22,6 +22,45 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _seed_rewrite_job(
+    manifest,
+    *,
+    job_id: str,
+    meeting_id: str,
+    minutes_path: Path | None,
+    before: str | None,
+    after: str | None,
+    state: str = "pending",
+):
+    def digest(text: str | None) -> str | None:
+        return (
+            hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if text is not None
+            else None
+        )
+
+    manifest.execute(
+        """
+        INSERT INTO minute_rewrite_jobs
+            (id, operation_id, meeting_id, minutes_path, mappings_json,
+             before_sha256, after_sha256, before_text, after_text,
+             state, created_at)
+        VALUES (?, 'operation', ?, ?, '{"Alice":"Bob"}', ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            meeting_id,
+            str(minutes_path) if minutes_path else None,
+            digest(before),
+            digest(after),
+            before,
+            after,
+            state,
+            config.now_iso(),
+        ),
+    )
+
+
 def test_preview_retains_a_selected_living_target(manifest, monkeypatch):
     db.add_person(manifest, "Mike", role="Engineer")
     db.add_person(manifest, "Michael", role="Lead")
@@ -231,3 +270,322 @@ def test_preview_digest_changes_when_a_minutes_file_changes(
     after = people_merge.preview(["Mike"], "Michael")
 
     assert after.digest != before.digest
+
+
+def test_merge_rejects_preview_drift_before_any_mutation(manifest, monkeypatch):
+    db.add_person(manifest, "Mike")
+    _use_manifest(manifest, monkeypatch)
+    approved = people_merge.preview(["Mike"], "Michael")
+    db.add_person(manifest, "Mike", aliases=["Mikey"])
+    manifest.commit()
+    manifest_path = Path(config.DB_PATH)
+    before = _sha256(manifest_path)
+
+    with pytest.raises(people_merge.PreviewDriftError):
+        people_merge.merge(["Mike"], "Michael", expected_digest=approved.digest)
+
+    assert _sha256(manifest_path) == before
+    assert [person["canonical"] for person in db.list_people(manifest)] == ["Mike"]
+
+
+def test_merge_creates_target_inherits_role_and_hides_the_source(
+    manifest, monkeypatch
+):
+    db.add_person(manifest, "Mike", aliases=["Mikey"], role="Engineer")
+    _use_manifest(manifest, monkeypatch)
+    approved = people_merge.preview(["Mike"], "Michael")
+
+    result = people_merge.merge(
+        ["Mike"], "Michael", expected_digest=approved.digest
+    )
+
+    assert result.target == "Michael"
+    assert db.list_people(manifest) == [
+        {"canonical": "Michael", "role": "Engineer", "aliases": "mikey", "meetings": 0}
+    ]
+    assert db.resolve_merged_name(manifest, "Mike") == "Michael"
+    assert db.canonical_name(manifest, "Mikey") == "Michael"
+    assert manifest.execute(
+        "SELECT 1 FROM person_aliases WHERE alias = 'mike'"
+    ).fetchone() is None
+
+
+def test_merge_rewrites_every_person_bearing_record_and_queues_minutes(
+    manifest, monkeypatch, tmp_path
+):
+    minutes_path = tmp_path / "minutes.md"
+    minutes_path.write_text("Alice owns Atlas.", encoding="utf-8")
+    transcript_path = tmp_path / "transcript.json"
+    transcript_path.write_bytes(b'{"speaker":"Alice"}')
+    transcript_before = _sha256(transcript_path)
+
+    make_meeting(manifest, "m1", "2026-08-26")
+    db.advance(
+        manifest,
+        "m1",
+        db.INDEXED,
+        minutes_path=str(minutes_path),
+        transcript_path=str(transcript_path),
+        lightrag_doc_id="doc-old",
+    )
+    db.add_person(manifest, "Alice", aliases=["Ally"], role="Engineer")
+    db.add_person(manifest, "Bob", role="Director")
+    db.flatten_and_record_merge(manifest, "Old Alice", "Alice")
+    db.set_speaker(manifest, "m1", "SPEAKER_00", "Alice", "confirmed")
+    db.upsert_speaker_match(
+        manifest,
+        "m1",
+        "SPEAKER_00",
+        best_canonical="Alice",
+        best_score=0.9,
+        next_canonical="Bob",
+        next_score=0.8,
+        resolved_as="Alice",
+    )
+    db.replace_clusters(
+        manifest,
+        [
+            {
+                "id": "cluster-1",
+                "size": 1,
+                "total_speech": 30.0,
+                "best_canonical": "Alice",
+                "best_score": 0.9,
+                "next_canonical": "Bob",
+                "next_score": 0.8,
+                "band": "review",
+                "members": [("m1", "SPEAKER_00")],
+            }
+        ],
+    )
+    db.add_voice_sample(
+        manifest,
+        canonical="Alice",
+        meeting_id="m1",
+        label="SPEAKER_00",
+        embedding=b"voice",
+        dim=1,
+        model="test",
+        speech_sec=30.0,
+    )
+    db.replace_entities(
+        manifest,
+        "m1",
+        [{"name": "Alice", "kind": "person"}],
+        [{"subject": "Alice", "predicate": "mentors", "object": "Alice"}],
+    )
+    db.replace_commitments(manifest, "m1", [{"text": "Ship", "owner": "Alice"}])
+    db.replace_decisions(manifest, "m1", [{"text": "Ship", "decided_by": "Alice"}])
+    db.replace_open_questions(manifest, "m1", [{"text": "Ship?", "owner": "Alice"}])
+    _use_manifest(manifest, monkeypatch)
+    approved = people_merge.preview(["Alice"], "Bob")
+
+    result = people_merge.merge(["Alice"], "Bob", expected_digest=approved.digest)
+
+    match = db.get_speaker_match(manifest, "m1", "SPEAKER_00")
+    cluster = manifest.execute("SELECT * FROM voice_clusters").fetchone()
+    job = manifest.execute("SELECT * FROM minute_rewrite_jobs").fetchone()
+    meeting = db.get_meeting(manifest, "m1")
+    assert result.speaker_rows == 1
+    assert db.get_speakers(manifest, "m1") == {"SPEAKER_00": "Bob"}
+    assert (match["resolved_as"], match["best_canonical"], match["next_canonical"]) == (
+        "Bob",
+        "Bob",
+        None,
+    )
+    assert (cluster["best_canonical"], cluster["next_canonical"]) == ("Bob", None)
+    assert [row["canonical"] for row in db.person_samples(manifest, "Bob")] == ["Bob"]
+    assert [entity["name"] for entity in db.get_entities(manifest, "m1")] == ["Bob"]
+    assert db.get_relations(manifest, "m1")[0]["subject"] == "Bob"
+    assert db.get_relations(manifest, "m1")[0]["object"] == "Bob"
+    assert db.list_commitments(manifest)[0]["owner"] == "Bob"
+    assert db.get_decisions(manifest, "m1")[0]["decided_by"] == "Bob"
+    assert db.get_open_questions(manifest, "m1")[0]["owner"] == "Bob"
+    assert db.resolve_merged_name(manifest, "Old Alice") == "Bob"
+    assert db.canonical_name(manifest, "Ally") == "Bob"
+    assert job["state"] == "applied"
+    assert job["before_text"] == "Alice owns Atlas."
+    assert job["after_text"] == "Bob owns Atlas."
+    assert meeting.status == db.MINUTES_COMPILED
+    assert meeting.lightrag_doc_id == "doc-old"
+    assert _sha256(transcript_path) == transcript_before
+
+
+def test_merge_atomically_rewrites_minutes_and_finishes_the_meeting(
+    manifest, monkeypatch, tmp_path
+):
+    minutes_path = tmp_path / "minutes.md"
+    minutes_path.write_text("Alice owns Atlas.", encoding="utf-8")
+    make_meeting(manifest, "m1", "2026-08-26")
+    db.advance(
+        manifest,
+        "m1",
+        db.INDEXED,
+        minutes_path=str(minutes_path),
+        lightrag_doc_id="doc-old",
+    )
+    db.add_person(manifest, "Alice")
+    db.set_speaker(manifest, "m1", "SPEAKER_00", "Alice", "confirmed")
+    _use_manifest(manifest, monkeypatch)
+    approved = people_merge.preview(["Alice"], "Bob")
+
+    result = people_merge.merge(["Alice"], "Bob", expected_digest=approved.digest)
+
+    job = manifest.execute("SELECT state FROM minute_rewrite_jobs").fetchone()
+    meeting = db.get_meeting(manifest, "m1")
+    assert result.minutes_rewritten == 1
+    assert result.pending_rewrites == 0
+    assert minutes_path.read_text(encoding="utf-8") == "Bob owns Atlas."
+    assert job["state"] == "applied"
+    assert meeting.status == db.MINUTES_COMPILED
+    assert meeting.lightrag_doc_id == "doc-old"
+
+
+def test_merge_marks_an_already_correct_minutes_file_unchanged(
+    manifest, monkeypatch, tmp_path
+):
+    minutes_path = tmp_path / "minutes.md"
+    minutes_path.write_text("Atlas is approved.", encoding="utf-8")
+    before = _sha256(minutes_path)
+    make_meeting(manifest, "m1", "2026-08-26")
+    db.advance(manifest, "m1", db.INDEXED, minutes_path=str(minutes_path))
+    db.add_person(manifest, "Alice")
+    db.set_speaker(manifest, "m1", "SPEAKER_00", "Alice", "confirmed")
+    _use_manifest(manifest, monkeypatch)
+    approved = people_merge.preview(["Alice"], "Bob")
+
+    result = people_merge.merge(["Alice"], "Bob", expected_digest=approved.digest)
+
+    assert result.minutes_unchanged == 1
+    assert _sha256(minutes_path) == before
+    assert manifest.execute(
+        "SELECT state FROM minute_rewrite_jobs"
+    ).fetchone()["state"] == "unchanged"
+    assert db.get_meeting(manifest, "m1").status == db.MINUTES_COMPILED
+
+
+def test_merge_reports_missing_and_null_minutes_without_claiming_completion(
+    manifest, monkeypatch, tmp_path
+):
+    for meeting_id, path in (("missing", tmp_path / "gone.md"), ("null", None)):
+        make_meeting(manifest, meeting_id, "2026-08-26")
+        db.advance(
+            manifest,
+            meeting_id,
+            db.INDEXED,
+            minutes_path=str(path) if path else None,
+            lightrag_doc_id=f"doc-{meeting_id}",
+        )
+        db.set_speaker(manifest, meeting_id, "SPEAKER_00", "Alice", "confirmed")
+    db.add_person(manifest, "Alice")
+    _use_manifest(manifest, monkeypatch)
+    approved = people_merge.preview(["Alice"], "Bob")
+
+    result = people_merge.merge(["Alice"], "Bob", expected_digest=approved.digest)
+
+    assert result.minutes_missing == 2
+    assert result.pending_rewrites == 0
+    assert {
+        row["meeting_id"]: row["state"]
+        for row in manifest.execute("SELECT meeting_id, state FROM minute_rewrite_jobs")
+    } == {"missing": "missing", "null": "missing"}
+    for meeting_id in ("missing", "null"):
+        meeting = db.get_meeting(manifest, meeting_id)
+        assert meeting.status == db.SPEAKERS_RESOLVED
+        assert meeting.lightrag_doc_id == f"doc-{meeting_id}"
+
+
+def test_resume_never_overwrites_a_minutes_file_with_an_unapproved_hash(
+    manifest, monkeypatch, tmp_path
+):
+    minutes_path = tmp_path / "minutes.md"
+    minutes_path.write_text("Owner edited this after preview.", encoding="utf-8")
+    make_meeting(manifest, "m1", "2026-08-26")
+    db.advance(manifest, "m1", db.SPEAKERS_RESOLVED, minutes_path=str(minutes_path))
+    _seed_rewrite_job(
+        manifest,
+        job_id="job-1",
+        meeting_id="m1",
+        minutes_path=minutes_path,
+        before="Alice owns Atlas.",
+        after="Bob owns Atlas.",
+    )
+    _use_manifest(manifest, monkeypatch)
+    before = _sha256(minutes_path)
+
+    result = people_merge.resume_pending_rewrites()
+
+    assert result.rewrite_conflicts == 1
+    assert _sha256(minutes_path) == before
+    assert manifest.execute(
+        "SELECT state FROM minute_rewrite_jobs WHERE id = 'job-1'"
+    ).fetchone()["state"] == "conflict"
+    assert db.get_meeting(manifest, "m1").status == db.SPEAKERS_RESOLVED
+
+
+def test_resume_recognizes_a_replacement_completed_before_the_status_update(
+    manifest, monkeypatch, tmp_path
+):
+    minutes_path = tmp_path / "minutes.md"
+    minutes_path.write_text("Bob owns Atlas.", encoding="utf-8")
+    make_meeting(manifest, "m1", "2026-08-26")
+    db.advance(
+        manifest,
+        "m1",
+        db.SPEAKERS_RESOLVED,
+        minutes_path=str(minutes_path),
+        lightrag_doc_id="doc-old",
+    )
+    _seed_rewrite_job(
+        manifest,
+        job_id="job-1",
+        meeting_id="m1",
+        minutes_path=minutes_path,
+        before="Alice owns Atlas.",
+        after="Bob owns Atlas.",
+    )
+    _use_manifest(manifest, monkeypatch)
+    monkeypatch.setattr(
+        people_merge.os,
+        "replace",
+        lambda *_: pytest.fail("an already-applied replacement must not run twice"),
+    )
+
+    first = people_merge.resume_pending_rewrites()
+    second = people_merge.resume_pending_rewrites()
+
+    assert first.minutes_rewritten == 1
+    assert second.minutes_rewritten == 0
+    assert manifest.execute(
+        "SELECT state FROM minute_rewrite_jobs WHERE id = 'job-1'"
+    ).fetchone()["state"] == "applied"
+    meeting = db.get_meeting(manifest, "m1")
+    assert meeting.status == db.MINUTES_COMPILED
+    assert meeting.lightrag_doc_id == "doc-old"
+
+
+def test_merge_reports_a_failed_atomic_replace_as_pending(
+    manifest, monkeypatch, tmp_path
+):
+    minutes_path = tmp_path / "minutes.md"
+    minutes_path.write_text("Alice owns Atlas.", encoding="utf-8")
+    make_meeting(manifest, "m1", "2026-08-26")
+    db.advance(manifest, "m1", db.INDEXED, minutes_path=str(minutes_path))
+    db.add_person(manifest, "Alice")
+    db.set_speaker(manifest, "m1", "SPEAKER_00", "Alice", "confirmed")
+    _use_manifest(manifest, monkeypatch)
+    approved = people_merge.preview(["Alice"], "Bob")
+    monkeypatch.setattr(
+        people_merge.os,
+        "replace",
+        lambda *_: (_ for _ in ()).throw(OSError("simulated interruption")),
+    )
+
+    result = people_merge.merge(["Alice"], "Bob", expected_digest=approved.digest)
+
+    assert result.pending_rewrites == 1
+    assert minutes_path.read_text(encoding="utf-8") == "Alice owns Atlas."
+    assert manifest.execute(
+        "SELECT state FROM minute_rewrite_jobs"
+    ).fetchone()["state"] == "pending"
+    assert db.get_meeting(manifest, "m1").status == db.SPEAKERS_RESOLVED
