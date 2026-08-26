@@ -347,9 +347,33 @@ Every resolved speaker name and every `person` entity normalizes through
 `db.canonical_name()`. Asking a model to spell a name the same way it did four months
 ago is not a strategy, and each variant becomes a separate graph node.
 
-`pipeline people --merge Mike Michael` folds a duplicate and rewrites history across
-`speakers`, `entities`, and **both ends of every relation** — leaving those behind
-would keep two nodes for one person.
+`pipeline.people_merge` is the only merge seam. CLI and dashboard code may request
+`preview()` and `merge()`, but must not reproduce database/voice/file ordering.
+Preview hashes the exact database and minutes impact; apply requires that digest.
+
+```powershell
+pipeline people --merge Mike Michael
+pipeline people --merge Mike Michael --apply --expected-digest <sha256>
+pipeline people --resume-merge-rewrites
+```
+
+A merge rewrites speakers, suggestions, voice samples, structured registers, and
+both ends of every relation. It then drains durable, hash-checked minutes rewrite
+jobs. A crash may leave a job pending, but never an untracked file change. Merged
+spellings become tombstoned **hidden redirects**, not visible aliases, so stale
+speaker-review cards cannot recreate the absorbed person.
+
+Historical aliases created before tombstones require a separate preview/apply:
+
+```powershell
+pipeline people --repair-merges --preview-to db/merge-control/repair.json
+pipeline people --repair-merges --apply db/merge-control/repair.json --expected-digest <sha256>
+```
+
+Repair artifacts contain private name/file evidence and belong under
+`config.DB_DIR / "merge-control"`. Generating or verifying one is read-only and
+does **not** authorize applying it to the live manifest; application needs explicit
+approval of the exact digest.
 
 Unknown names pass through unchanged: a new person appearing is normal, and dropping
 them would be worse than an unnormalized spelling.

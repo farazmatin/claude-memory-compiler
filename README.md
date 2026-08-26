@@ -154,7 +154,9 @@ pipeline query "question"         # ask the knowledge base
 pipeline query "..." --mode global   # for answers spanning many meetings
 pipeline query "..." --timing     # retrieval vs synthesis time
 pipeline people                   # the people registry
-pipeline people --merge Mike Michael   # fold a duplicate, rewriting history
+pipeline people --merge Mike Michael   # preview folding a duplicate
+pipeline people --merge Mike Michael --apply --expected-digest <sha256>
+pipeline people --resume-merge-rewrites  # finish an interrupted hash-checked rewrite
 pipeline entities                 # most-mentioned entities (graph health check)
 pipeline minutes --recompile      # rebuild after a template change, no ASR cost
 pipeline backup --to /mnt/backup  # snapshot everything irreplaceable
@@ -399,7 +401,22 @@ silently assigns work to the wrong person.
 **Names are normalized, not trusted.** A people registry maps aliases to one
 canonical spelling, because asking a model to spell a name the same way it did four
 months ago isn't a strategy — and each variant becomes a separate graph node. Curate
-it with `pipeline people`.
+it with `pipeline people`. Merges are preview-bound: first run `--merge FROM INTO`,
+inspect its digest and impact, then repeat with `--apply --expected-digest SHA256`.
+Folded spellings become hidden redirects rather than visible aliases, and compiled
+minutes are corrected deterministically without another model call.
+
+For the one-time repair of aliases created before hidden redirects existed, write a
+private preview under the database directory and apply only after approving its
+exact digest:
+
+```powershell
+pipeline people --repair-merges --preview-to db/merge-control/repair.json
+pipeline people --repair-merges --apply db/merge-control/repair.json --expected-digest <sha256>
+```
+
+The preview can contain private names and file paths. Creating it is read-only and
+does not authorize modifying the live manifest.
 
 **ASR sits behind a `Backend` protocol.** Swapping in a paid API or a GPU model
 touches one class and nothing downstream — the designed escape hatch from the CPU
