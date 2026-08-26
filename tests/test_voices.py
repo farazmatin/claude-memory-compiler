@@ -314,6 +314,18 @@ def test_confirming_marks_the_speaker_confirmed_not_inferred(manifest):
     assert row["confidence"] == "confirmed"
 
 
+def test_confirming_voice_queues_existing_minutes_for_refresh(manifest):
+    add_pending(manifest, "meet-a", "SPEAKER_00", vec(1.0, 0.0, 0.0))
+    db.advance(manifest, "meet-a", db.INDEXED, lightrag_doc_id="doc-old")
+    voices.cluster_pending(manifest, MODEL)
+
+    voices.confirm(manifest, db.pending_clusters(manifest)[0]["id"], "Ali", model=MODEL)
+
+    meeting = db.get_meeting(manifest, "meet-a")
+    assert meeting.status == db.SPEAKERS_RESOLVED
+    assert meeting.lightrag_doc_id == "doc-old"
+
+
 def test_confirming_normalizes_through_the_people_registry(manifest):
     """Otherwise 'Mike' and 'Michael' become two voiceprints of one person."""
     db.add_person(manifest, "Michael", aliases=["Mike"])

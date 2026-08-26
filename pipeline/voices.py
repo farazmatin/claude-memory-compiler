@@ -501,6 +501,7 @@ def confirm(
         # inference, so it outranks anything the transcript pass concluded.
         db.set_speaker(conn, row["meeting_id"], row["label"], canonical, "confirmed")
 
+    db.queue_minutes_refresh(conn, [row["meeting_id"] for row in members])
     conn.execute("DELETE FROM voice_clusters WHERE id = ?", (cluster_id,))
     return len(members)
 

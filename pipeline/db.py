@@ -592,6 +592,28 @@ def reset_to(conn: sqlite3.Connection, meeting_id: str, status: str) -> None:
     advance(conn, meeting_id, status)
 
 
+def queue_minutes_refresh(conn: sqlite3.Connection, meeting_ids: list[str]) -> int:
+    """Requeue completed meetings whose confirmed speaker names changed.
+
+    Keep ``lightrag_doc_id`` intact. The index stage needs the old id so it can
+    delete the stale search document before inserting regenerated minutes.
+    Meetings that have not reached minutes yet stay at their current stage.
+    """
+    ids = sorted({meeting_id for meeting_id in meeting_ids if meeting_id})
+    if not ids:
+        return 0
+    placeholders = ", ".join("?" for _ in ids)
+    cursor = conn.execute(
+        f"""
+        UPDATE meetings
+        SET status = ?, error = NULL, updated_at = ?
+        WHERE id IN ({placeholders}) AND status IN (?, ?)
+        """,
+        (SPEAKERS_RESOLVED, now_iso(), *ids, MINUTES_COMPILED, INDEXED),
+    )
+    return cursor.rowcount
+
+
 def clear_audio_path(conn: sqlite3.Connection, meeting_id: str) -> None:
     """Clear audio_path when the local recording is deleted to save space."""
     conn.execute(
@@ -743,14 +765,50 @@ def merge_person(conn: sqlite3.Connection, from_name: str, into: str) -> int:
     if not from_name or not into or from_name == into:
         return 0
 
+    affected_meetings = [
+        row["meeting_id"]
+        for row in conn.execute(
+            """
+            SELECT meeting_id FROM speakers WHERE name = ?
+            UNION SELECT meeting_id FROM entities WHERE name = ?
+            UNION SELECT meeting_id FROM relations WHERE subject = ? OR object = ?
+            UNION SELECT meeting_id FROM commitments WHERE owner = ?
+            UNION SELECT meeting_id FROM decisions WHERE decided_by = ?
+            UNION SELECT meeting_id FROM open_questions WHERE owner = ?
+            """,
+            (from_name,) * 7,
+        ).fetchall()
+    ]
+
     add_person(conn, into, aliases=[from_name])
     cursor = conn.execute(
         "UPDATE speakers SET name = ? WHERE name = ?", (into, from_name)
     )
-    # Historic entities and relations must move too, or the graph keeps both nodes.
-    conn.execute("UPDATE entities SET name = ? WHERE name = ?", (into, from_name))
-    conn.execute("UPDATE relations SET subject = ? WHERE subject = ?", (into, from_name))
-    conn.execute("UPDATE relations SET object = ? WHERE object = ?", (into, from_name))
+    # Historic entities and relations must move too, or the graph keeps both
+    # nodes. Insert/delete instead of UPDATE because both spellings can already
+    # appear in one meeting and collide with these tables' primary keys.
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO entities (meeting_id, name, kind, description)
+        SELECT meeting_id, ?, kind, description FROM entities WHERE name = ?
+        """,
+        (into, from_name),
+    )
+    conn.execute("DELETE FROM entities WHERE name = ?", (from_name,))
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO relations (meeting_id, subject, predicate, object)
+        SELECT meeting_id,
+               CASE WHEN subject = ? THEN ? ELSE subject END,
+               predicate,
+               CASE WHEN object = ? THEN ? ELSE object END
+        FROM relations WHERE subject = ? OR object = ?
+        """,
+        (from_name, into, from_name, into, from_name, from_name),
+    )
+    conn.execute(
+        "DELETE FROM relations WHERE subject = ? OR object = ?", (from_name, from_name)
+    )
     # Same reasoning for the commitment register and decision store: a merge
     # made after a meeting was already parsed must not leave that meeting's
     # commitments still attributed to the old spelling.
@@ -761,6 +819,7 @@ def merge_person(conn: sqlite3.Connection, from_name: str, into: str) -> int:
         "UPDATE person_aliases SET canonical = ? WHERE canonical = ?", (into, from_name)
     )
     conn.execute("DELETE FROM people WHERE canonical = ?", (from_name,))
+    queue_minutes_refresh(conn, affected_meetings)
     return cursor.rowcount
 
 

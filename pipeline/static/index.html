@@ -69,6 +69,9 @@
         <button type="button" id="tab-button-ledger" class="tab-btn active" data-tab="tab-ledger" role="tab" aria-selected="true" aria-controls="tab-ledger" tabindex="0">
           📖 Meeting Library
         </button>
+        <button type="button" id="tab-button-speakers" class="tab-btn" data-tab="tab-speakers" role="tab" aria-selected="false" aria-controls="tab-speakers" tabindex="-1">
+          🎙 Resolve Speakers <span id="speaker-resolution-count" class="tab-count" hidden></span>
+        </button>
         <button type="button" id="tab-button-knowledge" class="tab-btn" data-tab="tab-knowledge" role="tab" aria-selected="false" aria-controls="tab-knowledge" tabindex="-1">
           👥 People &amp; Team
         </button>
@@ -120,7 +123,75 @@
         </div>
       </section>
 
-      <!-- TAB 2: PEOPLE & TEAM REGISTRY -->
+      <!-- TAB 2: SPEAKER RESOLUTION -->
+      <section id="tab-speakers" class="tab-pane" role="tabpanel" aria-labelledby="tab-button-speakers">
+        <div class="pane-header">
+          <div>
+            <p class="eyebrow">SPEAKER CLEANUP</p>
+            <h2 id="speaker-resolution-heading" tabindex="-1">Resolve Speakers</h2>
+          </div>
+          <p class="pane-subtitle">Listen once, choose a person once, and the correction follows that voice through every matching meeting.</p>
+        </div>
+
+        <div class="speaker-resolution-status" aria-live="polite">
+          <strong id="speaker-resolution-summary">Loading speaker decisions…</strong>
+          <span>Start with recurring voices; they fix the most history first.</span>
+        </div>
+
+        <section class="section-card speaker-resolution-section">
+          <div class="speaker-section-heading">
+            <div>
+              <h3>Recurring voices</h3>
+              <p class="card-desc">The same voice was heard in multiple meetings. One confirmation applies everywhere.</p>
+            </div>
+            <button type="button" class="btn-outline btn-sm" onclick="confirmConfidentVoiceClusters()">Confirm high-confidence matches</button>
+          </div>
+          <div id="speaker-resolution-clusters" class="voice-cards-deck" aria-live="polite">
+            <p class="empty-cell">Loading recurring voices…</p>
+          </div>
+        </section>
+
+        <section class="section-card speaker-resolution-section">
+          <div class="speaker-section-heading">
+            <div>
+              <h3>Possible name duplicates</h3>
+              <p class="card-desc">If the same person was saved under similar spellings, settle it here with one answer.</p>
+            </div>
+            <button type="button" class="btn-outline btn-sm js-open-people-manager">Merge other names</button>
+          </div>
+          <section id="people-suggestions" class="people-suggestions" hidden aria-live="polite">
+            <div>
+              <strong>Possible same person</strong>
+              <p id="people-suggestion-question"></p>
+              <small id="people-suggestion-result"></small>
+            </div>
+            <div class="people-suggestion-actions">
+              <button type="button" class="btn-action btn-sm" id="people-suggestion-yes">Yes, merge</button>
+              <button type="button" class="btn-outline btn-sm" id="people-suggestion-no">No, different people</button>
+            </div>
+          </section>
+          <p id="people-suggestions-empty" class="empty-cell">No likely duplicate names need a decision.</p>
+        </section>
+
+        <section class="section-card speaker-resolution-section">
+          <div class="speaker-section-heading">
+            <div>
+              <h3>One-off unnamed speakers</h3>
+              <p class="card-desc">These voices only appear once or have no reusable voice match. Listen, then name this appearance.</p>
+            </div>
+          </div>
+          <div id="speaker-resolution-oneoffs" class="speaker-oneoff-list" aria-live="polite">
+            <p class="empty-cell">Loading unnamed speakers…</p>
+          </div>
+        </section>
+
+        <div class="speaker-refresh-box">
+          <p>Finished resolving people? Apply those corrections to past minutes and AI search.</p>
+          <button type="button" class="btn-action" onclick="runStage('speaker-refresh')">Update Corrected Minutes</button>
+        </div>
+      </section>
+
+      <!-- TAB 3: PEOPLE & TEAM REGISTRY -->
       <section id="tab-knowledge" class="tab-pane" role="tabpanel" aria-labelledby="tab-button-knowledge">
         <div class="pane-header">
           <div>
@@ -130,67 +201,53 @@
           <p class="pane-subtitle">Manage recognized contacts and nicknames so the AI accurately attributes commitments to real people.</p>
         </div>
 
-        <!-- Voice Enrollment Review Queue in People Tab -->
-        <div id="voice-review-people-section" class="section-card" style="margin-bottom: 24px; display: none;">
-          <h3 id="voice-review-heading" tabindex="-1">🎙️ Unrecognized Voices to Review</h3>
-          <p class="card-desc">Recurring voices detected across meetings that need your confirmation.</p>
-          <div id="voice-review-people-list" class="voice-cards-deck"></div>
-        </div>
-
         <div class="grid-2col">
           <!-- People Manager -->
           <div class="section-card">
-            <h3>Recognized Contacts</h3>
-            <p class="card-desc">Assign roles and nicknames to ensure clean records across meetings.</p>
-
-            <form id="form-add-person" class="inline-form">
-              <label class="field-stack" for="person-canonical">
-                <span>Full name</span>
-                <input type="text" id="person-canonical" placeholder="e.g. Christine" required />
+            <div class="contacts-heading">
+              <div>
+                <h3 id="recognized-contacts-heading" tabindex="-1">Recognized Contacts</h3>
+                <p class="card-desc">One profile per person, used across every meeting.</p>
+              </div>
+              <label class="contact-search" for="people-search">
+                <span class="sr-only">Search recognized contacts</span>
+                <input type="search" id="people-search" placeholder="Find a contact…" />
               </label>
-              <label class="field-stack" for="person-role">
-                <span>Role</span>
-                <input type="text" id="person-role" placeholder="e.g. Project Lead" />
-              </label>
-              <label class="field-stack" for="person-aliases">
-                <span>Nicknames or aliases</span>
-                <input type="text" id="person-aliases" placeholder="Comma-separated" />
-              </label>
-              <button type="submit" class="btn-action">Add / Save Person</button>
-            </form>
-
-            <div class="table-scroll">
-              <table class="data-table" id="people-table">
-                <thead>
-                  <tr>
-                    <th>Name</th>
-                    <th>Role</th>
-                    <th>Meetings</th>
-                    <th>Nicknames / Aliases</th>
-                  </tr>
-                </thead>
-                <tbody id="people-tbody">
-                  <tr><td colspan="4" class="empty-cell">Loading contacts...</td></tr>
-                </tbody>
-              </table>
             </div>
 
-            <div class="merge-box">
-              <h4>Combine Duplicate Names</h4>
-              <p class="card-desc">Folds a misspelled name or nickname into a person's primary profile and updates past records.</p>
-              <form id="form-merge-person" class="merge-form">
-                <label class="field-stack" for="merge-from">
-                  <span>Old name</span>
-                  <input type="text" id="merge-from" placeholder="e.g. Mike" required />
+            <details class="contact-add-disclosure">
+              <summary>Add a new contact</summary>
+              <form id="form-add-person" class="inline-form">
+                <label class="field-stack" for="person-canonical">
+                  <span>Full name</span>
+                  <input type="text" id="person-canonical" placeholder="e.g. Christine" required />
                 </label>
-                <span>→</span>
-                <label class="field-stack" for="merge-into">
-                  <span>Correct name</span>
-                  <input type="text" id="merge-into" placeholder="e.g. Michael" required />
+                <label class="field-stack" for="person-role">
+                  <span>Role</span>
+                  <input type="text" id="person-role" placeholder="e.g. Project Lead" />
                 </label>
-                <button type="submit" class="btn-outline">Combine Names</button>
+                <label class="field-stack" for="person-aliases">
+                  <span>Nicknames or aliases</span>
+                  <input type="text" id="person-aliases" placeholder="Comma-separated" />
+                </label>
+                <button type="submit" class="btn-action">Save Contact</button>
               </form>
+            </details>
+
+            <div id="people-list" class="people-list" aria-live="polite">
+              <p class="empty-cell">Loading contacts...</p>
             </div>
+            <div class="people-merge-toolbar" aria-live="polite">
+              <div>
+                <strong id="people-selected-count">Select names that belong to the same person</strong>
+                <small>For example: Ru, Roo, and Roe.</small>
+              </div>
+              <div class="people-merge-actions">
+                <button type="button" class="btn-text btn-sm" id="people-clear-selection" hidden>Clear</button>
+                <button type="button" class="btn-action btn-sm" id="people-merge-selected" disabled>Merge selected</button>
+              </div>
+            </div>
+            <p class="contacts-help">Select all spellings for one person, then choose <strong>Merge selected</strong>. Use <strong>Fix spelling</strong> when there is only one name to correct.</p>
 
           </div>
 
@@ -486,6 +543,96 @@
           </div>
         </details>
       </section>
+
+      <!-- Duplicate contact merge -->
+      <dialog id="person-merge-modal" class="custom-modal" aria-labelledby="person-merge-title">
+        <form method="dialog" id="person-merge-form" class="modal-card">
+          <div>
+            <p class="eyebrow">MERGE SELECTED NAMES</p>
+            <h3 id="person-merge-title">Which spelling should remain?</h3>
+            <p class="card-desc">
+              These names will become one contact. Choose the spelling you want to see everywhere.
+            </p>
+          </div>
+          <input type="hidden" id="person-merge-sources" />
+          <div id="person-merge-selected-list" class="merge-name-list" aria-label="Selected names"></div>
+          <label for="person-merge-target">Spelling to keep</label>
+          <select id="person-merge-target" required>
+            <option value="">Choose a spelling…</option>
+          </select>
+          <p id="person-merge-preview" class="merge-preview" aria-live="polite"></p>
+          <div class="modal-actions">
+            <button type="button" class="btn-outline" onclick="closePersonMergeModal()">Cancel</button>
+            <button type="submit" id="person-merge-save" class="btn-action">Merge Names</button>
+          </div>
+        </form>
+      </dialog>
+
+      <!-- Contact spelling correction -->
+      <dialog id="person-rename-modal" class="custom-modal" aria-labelledby="person-rename-title">
+        <form method="dialog" id="person-rename-form" class="modal-card">
+          <div>
+            <p class="eyebrow">FIX SPELLING</p>
+            <h3 id="person-rename-title">Change this contact's name</h3>
+            <p class="card-desc">This is the same person. Only the displayed spelling will change across their history.</p>
+          </div>
+          <input type="hidden" id="person-rename-source" />
+          <label for="person-rename-name">Correct spelling</label>
+          <input type="text" id="person-rename-name" required autocomplete="name" />
+          <div class="modal-actions">
+            <button type="button" class="btn-outline" onclick="closePersonRenameModal()">Cancel</button>
+            <button type="submit" id="person-rename-save" class="btn-action">Save Spelling</button>
+          </div>
+        </form>
+      </dialog>
+
+      <!-- Recurring voice identity picker -->
+      <dialog id="voice-name-modal" class="custom-modal" aria-labelledby="voice-name-modal-title">
+        <form method="dialog" id="voice-name-form" class="modal-card">
+          <div>
+            <p class="eyebrow">SPEAKER IDENTITY</p>
+            <h3 id="voice-name-modal-title">Who does this voice belong to?</h3>
+            <p id="voice-name-modal-sub" class="card-desc">
+              Choose someone you already know, or add a new person to your speaker list.
+            </p>
+          </div>
+          <input type="hidden" id="voice-name-cluster-id" />
+
+          <fieldset class="identity-choice">
+            <legend>Choose how to name this speaker</legend>
+            <label class="identity-option" for="voice-name-existing-mode">
+              <input type="radio" id="voice-name-existing-mode" name="voice-name-mode" value="existing" checked />
+              <span>
+                <strong>Existing speaker</strong>
+                <small>Use the same identity across every meeting.</small>
+              </span>
+            </label>
+            <div id="voice-existing-panel" class="identity-choice-panel">
+              <label for="voice-existing-person">Select a person</label>
+              <select id="voice-existing-person" required>
+                <option value="">Choose an existing speaker…</option>
+              </select>
+            </div>
+
+            <label class="identity-option" for="voice-name-new-mode">
+              <input type="radio" id="voice-name-new-mode" name="voice-name-mode" value="new" />
+              <span>
+                <strong>New speaker</strong>
+                <small>Add a person who is not in your list yet.</small>
+              </span>
+            </label>
+            <div id="voice-new-panel" class="identity-choice-panel" hidden>
+              <label for="voice-new-person-name">New speaker name</label>
+              <input type="text" id="voice-new-person-name" placeholder="e.g. Paul or Sarah" autocomplete="name" disabled />
+            </div>
+          </fieldset>
+
+          <div class="modal-actions">
+            <button type="button" class="btn-outline" onclick="closeVoiceNameModal()">Cancel</button>
+            <button type="submit" id="voice-name-save" class="btn-action">Confirm Speaker</button>
+          </div>
+        </form>
+      </dialog>
 
       <!-- Speaker Edit Modal Dialog -->
       <dialog id="speaker-modal" class="custom-modal">

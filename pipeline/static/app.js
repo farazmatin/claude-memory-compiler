@@ -6,6 +6,8 @@ let state = {
   activeMeetingId: null,
   meetings: [],
   people: [],
+  peopleSuggestions: [],
+  selectedPeople: new Set(),
   pipelineRunning: false,
   pollTimer: null,
 };
@@ -26,7 +28,6 @@ const categoryDomain = (value) => CATEGORY_DOMAINS[value] || CATEGORY_DOMAINS.Pr
 const GENERIC_SUBTYPES = new Set(["", "general", "work", "professional", "personal", "personal & household"]);
 
 const CHAT_SESSION_STORAGE_KEY = "meeting-memory-chat-session";
-const VOICE_LIBRARY_LIMIT = 3;
 
 function getChatSessionId() {
   let sessionId = localStorage.getItem(CHAT_SESSION_STORAGE_KEY);
@@ -157,13 +158,30 @@ function setupEventListeners() {
     e.preventDefault();
     submitAddPerson();
   });
-  $("form-merge-person").addEventListener("submit", (e) => {
+  $("person-merge-form").addEventListener("submit", (e) => {
     e.preventDefault();
     submitMergePerson();
   });
+  $("person-merge-target").addEventListener("change", updatePersonMergePreview);
+  $("people-search").addEventListener("input", () => renderPeopleList(state.people));
+  $("people-merge-selected").addEventListener("click", openSelectedPeopleMergeModal);
+  $("people-clear-selection").addEventListener("click", clearPeopleSelection);
+  $("person-rename-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    submitPersonRename();
+  });
+  $("people-suggestion-yes").addEventListener("click", acceptPeopleSuggestion);
+  $("people-suggestion-no").addEventListener("click", dismissPeopleSuggestion);
   $("speaker-form").addEventListener("submit", (e) => {
     e.preventDefault();
     submitSpeakerModal();
+  });
+  $("voice-name-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    submitVoiceNameModal();
+  });
+  $$('input[name="voice-name-mode"]').forEach((radio) => {
+    radio.addEventListener("change", updateVoiceNameMode);
   });
 
   // Diagnostics Drawer: stage failure history is queried on open, not on the
@@ -446,7 +464,10 @@ async function runStage(stage) {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Failed to start operation");
-    showToast(`Started audio processing (${stage})`, "success");
+    const stageMessage = stage === "speaker-refresh"
+      ? "Updating corrected minutes and AI search"
+      : `Started audio processing (${stage})`;
+    showToast(stageMessage, "success");
     checkPipelineStatus();
   } catch (err) {
     showToast(err.message, "error");
@@ -860,38 +881,87 @@ async function loadPeople() {
     if (!res.ok) return;
     const data = await res.json();
     state.people = data.people || [];
-    renderPeopleTable(state.people);
+    const currentNames = new Set(state.people.map((person) => person.canonical));
+    state.selectedPeople = new Set(
+      [...state.selectedPeople].filter((name) => currentNames.has(name)),
+    );
+    renderPeopleList(state.people);
     updateDatalistSuggestions(state.people);
+    loadPeopleSuggestions();
   } catch (err) {
     console.error("Failed to load people:", err);
   }
 }
 
-function renderPeopleTable(people) {
-  const tbody = $("people-tbody");
-  if (!tbody) return;
-  if (!people.length) {
-    tbody.innerHTML = `<tr><td colspan="4" class="empty-cell">No contacts added yet.</td></tr>`;
+function renderPeopleList(people) {
+  const list = $("people-list");
+  if (!list) return;
+  const term = ($("people-search")?.value || "").trim().toLowerCase();
+  const visible = people.filter((person) => {
+    const aliases = Array.isArray(person.aliases) ? person.aliases : [person.aliases || ""];
+    return [person.canonical, person.role || "", ...aliases]
+      .join(" ")
+      .toLowerCase()
+      .includes(term);
+  });
+  if (!visible.length) {
+    list.innerHTML = `<p class="empty-cell">${term ? "No contacts match your search." : "No contacts added yet."}</p>`;
+    updatePeopleMergeToolbar();
     return;
   }
-  tbody.innerHTML = people
+  list.innerHTML = visible
     .map(
       (p) => {
         const aliases = Array.isArray(p.aliases)
           ? p.aliases
           : String(p.aliases || "").split(",").map((alias) => alias.trim()).filter(Boolean);
         const meetingCount = p.meetings || p.meeting_count || 0;
+        const initials = p.canonical
+          .split(/\s+/)
+          .slice(0, 2)
+          .map((part) => part[0] || "")
+          .join("")
+          .toUpperCase();
         return `
-    <tr>
-      <td><strong>${escapeHtml(p.canonical)}</strong></td>
-      <td>${escapeHtml(p.role || "—")}</td>
-      <td>${meetingCount} meeting${meetingCount === 1 ? "" : "s"}</td>
-      <td>${aliases.map((a) => `<span class="chip">${escapeHtml(a)}</span>`).join(" ") || "—"}</td>
-    </tr>
+    <article class="person-row${state.selectedPeople.has(p.canonical) ? " selected" : ""}">
+      <label class="person-select" title="Select ${escapeHtml(p.canonical)} to merge">
+        <input type="checkbox" class="js-person-select" value="${escapeHtml(p.canonical)}"
+          aria-label="Select ${escapeHtml(p.canonical)} to merge" ${state.selectedPeople.has(p.canonical) ? "checked" : ""} />
+      </label>
+      <span class="person-avatar" aria-hidden="true">${escapeHtml(initials)}</span>
+      <div class="person-summary">
+        <strong>${escapeHtml(p.canonical)}</strong>
+        <span>${escapeHtml(p.role || "No role saved")} · ${meetingCount} meeting${meetingCount === 1 ? "" : "s"}</span>
+        ${aliases.length ? `<small>Also known as ${aliases.map(escapeHtml).join(", ")}</small>` : ""}
+      </div>
+      <div class="person-actions">
+        <button type="button" class="btn-text btn-sm js-rename-person" data-name="${escapeHtml(p.canonical)}">Fix spelling</button>
+      </div>
+    </article>
   `;
       }
     )
     .join("");
+  updatePeopleMergeToolbar();
+}
+
+function updatePeopleMergeToolbar() {
+  const count = state.selectedPeople.size;
+  const names = [...state.selectedPeople].sort((a, b) => a.localeCompare(b));
+  const label = $("people-selected-count");
+  const merge = $("people-merge-selected");
+  const clear = $("people-clear-selection");
+  if (!label || !merge || !clear) return;
+  label.textContent = count
+    ? `${count} name${count === 1 ? "" : "s"} selected: ${names.slice(0, 3).join(", ")}${count > 3 ? ` +${count - 3} more` : ""}`
+    : "Select names that belong to the same person";
+  merge.disabled = count < 2;
+  clear.hidden = count === 0;
+}
+
+function clearPeopleSelection() {
+  state.selectedPeople.clear();
+  renderPeopleList(state.people);
 }
 
 function updateDatalistSuggestions(people) {
@@ -900,6 +970,137 @@ function updateDatalistSuggestions(people) {
   datalist.innerHTML = people
     .map((p) => `<option value="${escapeHtml(p.canonical)}">${escapeHtml(p.role ? `${p.canonical} (${p.role})` : p.canonical)}</option>`)
     .join("");
+}
+
+async function loadPeopleSuggestions() {
+  try {
+    const res = await fetch("/api/people/suggestions");
+    if (!res.ok) return;
+    const data = await res.json();
+    state.peopleSuggestions = data.suggestions || [];
+    renderPeopleSuggestion();
+  } catch (err) {
+    console.error("Failed to load contact suggestions:", err);
+  }
+}
+
+function renderPeopleSuggestion() {
+  const panel = $("people-suggestions");
+  const empty = $("people-suggestions-empty");
+  const suggestion = state.peopleSuggestions[0];
+  if (!suggestion) {
+    panel.hidden = true;
+    if (empty) empty.hidden = false;
+    updateSpeakerResolutionSummary();
+    return;
+  }
+  if (empty) empty.hidden = true;
+  $("people-suggestion-yes").disabled = false;
+  $("people-suggestion-no").disabled = false;
+  const names = Array.isArray(suggestion.names) ? suggestion.names : [suggestion.source, suggestion.target];
+  panel.dataset.names = JSON.stringify(names);
+  panel.dataset.target = suggestion.target;
+  $("people-suggestion-question").textContent =
+    `Do these ${names.length} names describe the same person? ${names.map((name) => `“${name}”`).join(", ")}`;
+  $("people-suggestion-result").textContent =
+    `Yes keeps “${suggestion.target}” and folds the other spelling${names.length === 2 ? "" : "s"} into it.`;
+  panel.hidden = false;
+  updateSpeakerResolutionSummary();
+}
+
+function updateSpeakerResolutionSummary() {
+  const voiceTotal = (state.voiceClusters || []).length + (state.unresolvedSpeakers || []).length;
+  const nameTotal = (state.peopleSuggestions || []).length;
+  const total = voiceTotal + nameTotal;
+  const count = $("speaker-resolution-count");
+  const summary = $("speaker-resolution-summary");
+  if (count) {
+    count.textContent = total ? String(total) : "";
+    count.hidden = total === 0;
+  }
+  if (summary) {
+    const parts = [];
+    if (voiceTotal) parts.push(`${voiceTotal} voice${voiceTotal === 1 ? "" : "s"}`);
+    if (nameTotal) parts.push(`${nameTotal} possible duplicate name${nameTotal === 1 ? "" : "s"}`);
+    summary.textContent = total ? `${parts.join(" and ")} waiting` : "All current speakers are resolved.";
+  }
+  return { voiceTotal, nameTotal, total };
+}
+
+async function acceptPeopleSuggestion() {
+  const panel = $("people-suggestions");
+  $("people-suggestion-yes").disabled = true;
+  $("people-suggestion-no").disabled = true;
+  const names = JSON.parse(panel.dataset.names || "[]");
+  const merged = await mergeManyPersonProfiles(names, panel.dataset.target);
+  if (merged) {
+    state.peopleSuggestions.shift();
+    renderPeopleSuggestion();
+  } else {
+    $("people-suggestion-yes").disabled = false;
+    $("people-suggestion-no").disabled = false;
+  }
+}
+
+async function dismissPeopleSuggestion() {
+  const panel = $("people-suggestions");
+  try {
+    const res = await fetch("/api/people/suggestions/dismiss", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ names: JSON.parse(panel.dataset.names || "[]") }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Could not dismiss this suggestion");
+    state.peopleSuggestions.shift();
+    renderPeopleSuggestion();
+  } catch (err) {
+    showToast(err.message, "error");
+  }
+}
+
+function openSelectedPeopleMergeModal() {
+  const selected = [...state.selectedPeople].sort((a, b) => a.localeCompare(b));
+  if (selected.length < 2) return;
+  $("person-merge-sources").value = JSON.stringify(selected);
+  $("person-merge-selected-list").innerHTML = selected
+    .map((name) => `<span>${escapeHtml(name)}</span>`)
+    .join("");
+  $("person-merge-target").innerHTML = [
+    '<option value="">Choose a spelling…</option>',
+    ...selected.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`),
+  ].join("");
+  $("person-merge-preview").textContent = "Nothing changes until you confirm.";
+  $("person-merge-save").disabled = false;
+  $("person-merge-modal").showModal();
+  setTimeout(() => $("person-merge-target").focus(), 50);
+}
+
+function updatePersonMergePreview() {
+  const selected = JSON.parse($("person-merge-sources").value || "[]");
+  const target = $("person-merge-target").value;
+  const aliases = selected.filter((name) => name !== target);
+  $("person-merge-preview").textContent = target
+    ? `Keep ${target}. ${aliases.join(", ")} ${aliases.length === 1 ? "becomes an alias" : "become aliases"}, and all meeting history moves to ${target}.`
+    : "Nothing changes until you confirm.";
+}
+
+function closePersonMergeModal() {
+  $("person-merge-modal").close();
+}
+
+function openPersonRenameModal(name) {
+  $("person-rename-source").value = name;
+  $("person-rename-name").value = name;
+  $("person-rename-modal").showModal();
+  setTimeout(() => {
+    $("person-rename-name").focus();
+    $("person-rename-name").select();
+  }, 50);
+}
+
+function closePersonRenameModal() {
+  $("person-rename-modal").close();
 }
 
 async function submitAddPerson() {
@@ -919,6 +1120,7 @@ async function submitAddPerson() {
     $("person-canonical").value = "";
     $("person-role").value = "";
     $("person-aliases").value = "";
+    $("form-add-person").closest("details").open = false;
     loadPeople();
     loadOverview();
   } catch (err) {
@@ -927,9 +1129,53 @@ async function submitAddPerson() {
 }
 
 async function submitMergePerson() {
-  const fromName = $("merge-from").value.trim();
-  const into = $("merge-into").value.trim();
-  if (!fromName || !into) return;
+  const names = JSON.parse($("person-merge-sources").value || "[]");
+  const into = $("person-merge-target").value.trim();
+  if (names.length < 2 || !into) return;
+  const save = $("person-merge-save");
+  save.disabled = true;
+  save.textContent = "Merging…";
+  try {
+    const data = await mergeManyPersonProfiles(names, into);
+    if (!data) return;
+    closePersonMergeModal();
+    showToast(
+      `Merged ${data.merged} names into '${into}'. All speaker history was kept; affected minutes are ready to refresh.`,
+      "success",
+    );
+  } finally {
+    save.disabled = false;
+    save.textContent = "Merge Names";
+  }
+}
+
+async function mergeManyPersonProfiles(names, into) {
+  try {
+    const res = await fetch("/api/people/merge-many", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ names, into }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Failed to combine names");
+    state.selectedPeople.clear();
+    refreshPeopleDependentViews();
+    return data;
+  } catch (err) {
+    showToast(err.message, "error");
+    return null;
+  }
+}
+
+function refreshPeopleDependentViews() {
+  loadPeople();
+  loadVoiceClusters();
+  loadMeetings();
+  loadOverview();
+  if (state.activeMeetingId) selectMeeting(state.activeMeetingId);
+}
+
+async function mergePersonProfiles(fromName, into) {
   try {
     const res = await fetch("/api/people/merge", {
       method: "POST",
@@ -938,14 +1184,45 @@ async function submitMergePerson() {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Failed to combine names");
-    showToast(`Combined '${fromName}' into '${into}' (${data.rewritten} records updated)`, "success");
-    $("merge-from").value = "";
-    $("merge-into").value = "";
+    showToast(
+      `Merged '${fromName}' into '${into}'. ${data.rewritten} speaker record${data.rewritten === 1 ? "" : "s"} updated; affected minutes are ready to refresh.`,
+      "success",
+    );
+    refreshPeopleDependentViews();
+    return true;
+  } catch (err) {
+    showToast(err.message, "error");
+    return false;
+  }
+}
+
+async function submitPersonRename() {
+  const fromName = $("person-rename-source").value.trim();
+  const newName = $("person-rename-name").value.trim();
+  if (!fromName || !newName || fromName === newName) return;
+  const save = $("person-rename-save");
+  save.disabled = true;
+  save.textContent = "Saving…";
+  try {
+    const res = await fetch("/api/people/rename", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ from_name: fromName, new_name: newName }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Could not change this spelling");
+    showToast(`Changed '${fromName}' to '${newName}'. Affected minutes are ready to refresh.`, "success");
+    closePersonRenameModal();
     loadPeople();
+    loadVoiceClusters();
+    loadMeetings();
     loadOverview();
     if (state.activeMeetingId) selectMeeting(state.activeMeetingId);
   } catch (err) {
     showToast(err.message, "error");
+  } finally {
+    save.disabled = false;
+    save.textContent = "Save Spelling";
   }
 }
 
@@ -1012,8 +1289,30 @@ async function submitSpeakerModal() {
     showToast(`Saved speaker: ${label} → ${name}`, "success");
     closeSpeakerModal();
     selectMeeting(meetingId);
+    loadVoiceClusters();
+    loadMeetings();
     loadPeople();
     loadOverview();
+  } catch (err) {
+    showToast(err.message, "error");
+  }
+}
+
+async function confirmOneOffSpeaker(meetingId, label, name) {
+  if (!meetingId || !label || !name) return;
+  try {
+    const res = await fetch(`/api/meetings/${meetingId}/speakers`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label, name, confidence: "confirmed" }),
+    });
+    if (!res.ok) throw new Error("Failed to assign this speaker");
+    showToast(`Assigned ${label} as ${name}.`, "success");
+    loadVoiceClusters();
+    loadMeetings();
+    loadPeople();
+    loadOverview();
+    if (state.activeMeetingId === meetingId) selectMeeting(meetingId);
   } catch (err) {
     showToast(err.message, "error");
   }
@@ -1179,27 +1478,32 @@ function formatSeconds(sec) {
   return `${m}m ${s}s`;
 }
 
-// ── Zero-Touch Voice Identification Cards (PR #4) ────────────────────
+// ── Speaker resolution queue ─────────────────────────────────────────
 async function loadVoiceClusters() {
   try {
-    const res = await fetch("/api/voices/clusters");
+    const res = await fetch("/api/speakers/queue");
     if (!res.ok) return;
     const data = await res.json();
     state.voiceClusters = data.clusters || [];
+    state.unresolvedSpeakers = data.one_offs || [];
     renderVoiceCards(state.voiceClusters);
   } catch (err) {
-    console.error("Failed to load voice clusters:", err);
+    console.error("Failed to load speaker resolution queue:", err);
   }
 }
 
 function renderVoiceCards(clusters) {
+  stopClusterPlayback();
   const banner = $("voice-review-banner");
-  const peopleSection = $("voice-review-people-section");
-  const peopleList = $("voice-review-people-list");
+  const clusterList = $("speaker-resolution-clusters");
+  const oneOffs = state.unresolvedSpeakers || [];
+  const oneOffList = $("speaker-resolution-oneoffs");
+  const { total } = updateSpeakerResolutionSummary();
 
-  if (!clusters || !clusters.length) {
+  if (!total) {
     if (banner) banner.style.display = "none";
-    if (peopleSection) peopleSection.style.display = "none";
+    if (clusterList) clusterList.innerHTML = '<p class="empty-cell">No recurring voices need a decision.</p>';
+    if (oneOffList) oneOffList.innerHTML = '<p class="empty-cell">No one-off unnamed speakers.</p>';
     return;
   }
 
@@ -1231,7 +1535,7 @@ function renderVoiceCards(clusters) {
       // unlabelled "listen" makes a short speaker look broken instead of short.
       const clipSeconds = c.clip_seconds || 0;
       const listenBtn = clipSeconds
-        ? `<button type="button" class="btn-outline btn-sm js-voice-listen" data-cluster="${escapeHtml(c.id)}">▶ Listen (${clipSeconds}s)</button>`
+        ? `<button type="button" class="btn-outline btn-sm js-voice-listen" data-cluster="${escapeHtml(c.id)}" aria-expanded="false">▶ Listen (${clipSeconds}s)</button>`
         : `<span class="voice-noclip" title="The source audio was deleted after transcription, so no clip was retained.">No audio retained</span>`;
 
       return `
@@ -1251,44 +1555,81 @@ function renderVoiceCards(clusters) {
               ${(c.members || []).slice(0, 3).map((m) => `<span class="voice-member-chip">📅 ${escapeHtml(m.meeting_date || "Past Meeting")}: ${escapeHtml(m.meeting_title || "Recording")} (${m.label})</span>`).join("")}
             </div>
           </div>
+          <div class="voice-player js-voice-player" hidden>
+            <div class="voice-player-heading">
+              <strong>Voice sample</strong>
+              <span class="js-voice-clip-status" aria-live="polite">Ready</span>
+            </div>
+            <audio class="js-voice-audio" controls preload="none"></audio>
+            <div class="voice-player-nav">
+              <button type="button" class="btn-text btn-sm js-voice-previous" aria-label="Play previous voice clip">← Previous clip</button>
+              <button type="button" class="btn-text btn-sm js-voice-next" aria-label="Play next voice clip">Next clip →</button>
+            </div>
+          </div>
           <div class="voice-card-actions">
             ${listenBtn}
             ${confirmBtn}
             ${transcriptSuggestion}
-            <button type="button" class="btn-outline btn-sm js-voice-custom" data-cluster="${escapeHtml(c.id)}">✎ Name Someone Else</button>
-            <button type="button" class="btn-text btn-sm js-voice-dismiss" data-cluster="${escapeHtml(c.id)}">✗ Dismiss Noise</button>
+            <button type="button" class="btn-outline btn-sm js-voice-custom" data-cluster="${escapeHtml(c.id)}">Choose or add speaker</button>
+            <button type="button" class="btn-text btn-sm js-voice-dismiss" data-cluster="${escapeHtml(c.id)}">Not a person / noise</button>
           </div>
         </div>
       `;
     });
   const cardsHtml = cards.join("");
-  const libraryCardsHtml = cards.slice(0, VOICE_LIBRARY_LIMIT).join("");
-  const reviewAllButton = clusters.length > VOICE_LIBRARY_LIMIT
-    ? `<button type="button" class="btn-outline btn-sm js-review-all-voices" aria-controls="voice-review-people-section">Review all ${clusters.length} voices in People &amp; Team →</button>`
-    : "";
 
   if (banner) {
     banner.innerHTML = `
       <div class="voice-banner-inner">
         <div class="voice-banner-header">
-          <h3>🎙️ Speaker Identity Review (${clusters.length} recurring voices)</h3>
-          <p>Showing the ${Math.min(clusters.length, VOICE_LIBRARY_LIMIT)} highest-impact voices. Confirming one updates every matching meeting.</p>
-          <button type="button" class="btn-outline btn-sm" onclick="confirmConfidentVoiceClusters()">✓ Confirm High-Confidence Matches</button>
-          ${reviewAllButton}
+          <h3>🎙️ ${total} speaker decision${total === 1 ? "" : "s"} waiting</h3>
+          <p>Open the dedicated resolver to listen, choose a person, and clean up similar names in one place.</p>
+          <button type="button" class="btn-action btn-sm js-open-speaker-resolver">Resolve speakers</button>
         </div>
-        <div class="voice-cards-scroll">${libraryCardsHtml}</div>
       </div>
     `;
     banner.style.display = "block";
   }
 
-  if (peopleSection && peopleList) {
-    peopleList.innerHTML = cardsHtml;
-    peopleSection.style.display = "block";
+  if (clusterList) {
+    clusterList.innerHTML = cardsHtml || '<p class="empty-cell">No recurring voices need a decision.</p>';
+  }
+  if (oneOffList) {
+    oneOffList.innerHTML = renderOneOffSpeakerCards(oneOffs);
   }
 }
 
+function renderOneOffSpeakerCards(oneOffs) {
+  if (!oneOffs.length) return '<p class="empty-cell">No one-off unnamed speakers.</p>';
+  return oneOffs.map((speaker) => {
+    const voiceMatch = speaker.best_canonical && (speaker.best_score || 0) >= 0.7
+      ? `<button type="button" class="btn-action btn-sm js-oneoff-confirm" data-meeting="${escapeHtml(speaker.meeting_id)}" data-label="${escapeHtml(speaker.label)}" data-name="${escapeHtml(speaker.best_canonical)}">Use ${escapeHtml(speaker.best_canonical)}</button>`
+      : "";
+    const transcriptMatch = speaker.llm_suggestion && speaker.llm_suggestion !== speaker.best_canonical
+      ? `<button type="button" class="btn-outline btn-sm js-oneoff-confirm" data-meeting="${escapeHtml(speaker.meeting_id)}" data-label="${escapeHtml(speaker.label)}" data-name="${escapeHtml(speaker.llm_suggestion)}">Use ${escapeHtml(speaker.llm_suggestion)}</button>`
+      : "";
+    return `
+      <article class="speaker-oneoff-card">
+        <div>
+          <strong>${escapeHtml(speaker.meeting_title || "Meeting")}</strong>
+          <p>${escapeHtml(speaker.meeting_date || "Past meeting")} · ${escapeHtml(speaker.label)}${speaker.speech_sec ? ` · ${formatDuration(speaker.speech_sec)} of speech` : ""}</p>
+        </div>
+        <div class="speaker-oneoff-actions">
+          <button type="button" class="btn-outline btn-sm js-oneoff-review" data-meeting="${escapeHtml(speaker.meeting_id)}" data-label="${escapeHtml(speaker.label)}">Listen &amp; choose name</button>
+          ${voiceMatch}
+          ${transcriptMatch}
+        </div>
+      </article>
+    `;
+  }).join("");
+}
+
 document.addEventListener("click", (event) => {
+  const personRow = event.target.closest(".person-row");
+  if (personRow && !event.target.closest("button, input, label, a")) {
+    personRow.querySelector(".js-person-select")?.click();
+    return;
+  }
   const button = event.target.closest(".js-meeting-transcript");
   if (button) {
     toggleTranscript(button.dataset.meeting);
@@ -1297,7 +1638,21 @@ document.addEventListener("click", (event) => {
   const speaker = event.target.closest(".js-speaker-chip");
   if (speaker) {
     openSpeakerModal(speaker.dataset.meeting, speaker.dataset.label, speaker.dataset.name);
+    return;
   }
+  const rename = event.target.closest(".js-rename-person");
+  if (rename) {
+    openPersonRenameModal(rename.dataset.name);
+  }
+});
+
+document.addEventListener("change", (event) => {
+  const checkbox = event.target.closest(".js-person-select");
+  if (!checkbox) return;
+  if (checkbox.checked) state.selectedPeople.add(checkbox.value);
+  else state.selectedPeople.delete(checkbox.value);
+  checkbox.closest(".person-row")?.classList.toggle("selected", checkbox.checked);
+  updatePeopleMergeToolbar();
 });
 
 // Voice-card actions are bound here, not with inline onclick handlers.
@@ -1313,16 +1668,33 @@ document.addEventListener("click", (event) => {
 //
 // Delegated from document so it survives every re-render of the card list.
 document.addEventListener("click", (event) => {
-  const reviewAll = event.target.closest(".js-review-all-voices");
-  if (reviewAll) {
+  const openResolver = event.target.closest(".js-open-speaker-resolver");
+  if (openResolver) {
+    const speakersTab = $("tab-button-speakers");
+    activateTab(speakersTab);
+    requestAnimationFrame(() => $("speaker-resolution-heading")?.focus());
+    return;
+  }
+  const openPeople = event.target.closest(".js-open-people-manager");
+  if (openPeople) {
     const peopleTab = $("tab-button-knowledge");
     activateTab(peopleTab);
-    requestAnimationFrame(() => $("voice-review-heading")?.focus());
+    requestAnimationFrame(() => $("recognized-contacts-heading")?.focus());
     return;
   }
   const listen = event.target.closest(".js-voice-listen");
   if (listen) {
-    playClusterClips(listen.dataset.cluster);
+    playClusterClips(listen.dataset.cluster, listen);
+    return;
+  }
+  const previous = event.target.closest(".js-voice-previous");
+  if (previous) {
+    moveClusterClip(-1, previous);
+    return;
+  }
+  const next = event.target.closest(".js-voice-next");
+  if (next) {
+    moveClusterClip(1, next);
     return;
   }
   const confirm = event.target.closest(".js-voice-confirm");
@@ -1336,7 +1708,16 @@ document.addEventListener("click", (event) => {
     return;
   }
   const custom = event.target.closest(".js-voice-custom");
-  if (custom) promptCustomVoiceName(custom.dataset.cluster);
+  if (custom) openVoiceNameModal(custom.dataset.cluster);
+  const oneOffReview = event.target.closest(".js-oneoff-review");
+  if (oneOffReview) {
+    openSpeakerModal(oneOffReview.dataset.meeting, oneOffReview.dataset.label, "");
+    return;
+  }
+  const oneOffConfirm = event.target.closest(".js-oneoff-confirm");
+  if (oneOffConfirm) {
+    confirmOneOffSpeaker(oneOffConfirm.dataset.meeting, oneOffConfirm.dataset.label, oneOffConfirm.dataset.name);
+  }
 });
 
 // Play every retained clip for a cluster back to back.
@@ -1348,10 +1729,17 @@ document.addEventListener("click", (event) => {
 // retained audio allows - the source recording is long gone.
 let clusterPlayer = null;
 
-function playClusterClips(clusterId) {
-  const cluster = (state.voiceClusters || []).find((c) => c.id === clusterId);
-  if (!cluster) return;
+function stopClusterPlayback() {
+  if (!clusterPlayer) return;
+  clusterPlayer.audio.pause();
+  clusterPlayer.audio.onended = null;
+  clusterPlayer.audio.onerror = null;
+  clusterPlayer.trigger?.setAttribute("aria-expanded", "false");
+  clusterPlayer.panel.hidden = true;
+  clusterPlayer = null;
+}
 
+function clusterClipQueue(cluster) {
   const queue = [];
   for (const member of cluster.members || []) {
     for (let i = 0; i < (member.snippet_count || 0); i += 1) {
@@ -1361,33 +1749,79 @@ function playClusterClips(clusterId) {
       );
     }
   }
+  return queue;
+}
+
+function showClusterClip(index, autoplay = true) {
+  if (!clusterPlayer) return;
+  const { audio, queue, status, previous, next } = clusterPlayer;
+  clusterPlayer.index = Math.max(0, Math.min(index, queue.length - 1));
+  const displayIndex = clusterPlayer.index + 1;
+  status.textContent = `Clip ${displayIndex} of ${queue.length}`;
+  previous.disabled = clusterPlayer.index === 0;
+  next.disabled = clusterPlayer.index === queue.length - 1;
+  audio.src = queue[clusterPlayer.index];
+  audio.load();
+  if (autoplay) {
+    audio.play().catch(() => {
+      status.textContent = `Clip ${displayIndex} of ${queue.length} · Press play to start`;
+    });
+  }
+}
+
+function playClusterClips(clusterId, trigger) {
+  const cluster = (state.voiceClusters || []).find((c) => c.id === clusterId);
+  if (!cluster) return;
+
+  const queue = clusterClipQueue(cluster);
   if (!queue.length) {
     showToast("No clip was retained for this voice.", "error");
     return;
   }
 
+  const card = trigger.closest(".voice-card");
+  const panel = card?.querySelector(".js-voice-player");
+  const audio = panel?.querySelector(".js-voice-audio");
+  if (!panel || !audio) return;
+
   // Stop whatever was playing first. Two cards playing at once is worse than
   // useless for telling two voices apart.
-  if (clusterPlayer) {
-    clusterPlayer.pause();
-    clusterPlayer.onended = null;
-    clusterPlayer.onerror = null;
-  }
-  clusterPlayer = new Audio();
-  let at = 0;
-  const advance = () => {
-    if (at >= queue.length) {
-      clusterPlayer = null;
-      return;
-    }
-    clusterPlayer.src = queue[at];
-    at += 1;
-    clusterPlayer.play().catch(() => {});
+  stopClusterPlayback();
+  panel.hidden = false;
+  trigger.setAttribute("aria-expanded", "true");
+  clusterPlayer = {
+    audio,
+    queue,
+    index: 0,
+    panel,
+    trigger,
+    status: panel.querySelector(".js-voice-clip-status"),
+    previous: panel.querySelector(".js-voice-previous"),
+    next: panel.querySelector(".js-voice-next"),
   };
-  clusterPlayer.onended = advance;
+  audio.onended = () => {
+    if (!clusterPlayer || clusterPlayer.audio !== audio) return;
+    if (clusterPlayer.index < clusterPlayer.queue.length - 1) {
+      showClusterClip(clusterPlayer.index + 1);
+    } else {
+      clusterPlayer.status.textContent = `Finished · ${clusterPlayer.queue.length} clip${clusterPlayer.queue.length === 1 ? "" : "s"}`;
+    }
+  };
   // A missing file must not stall the queue - skip to the next clip.
-  clusterPlayer.onerror = advance;
-  advance();
+  audio.onerror = () => {
+    if (!clusterPlayer || clusterPlayer.audio !== audio) return;
+    if (clusterPlayer.index < clusterPlayer.queue.length - 1) {
+      showClusterClip(clusterPlayer.index + 1);
+    } else {
+      clusterPlayer.status.textContent = "Voice sample unavailable";
+    }
+  };
+  showClusterClip(0);
+}
+
+function moveClusterClip(offset, control) {
+  if (!clusterPlayer || !clusterPlayer.panel.contains(control)) return;
+  showClusterClip(clusterPlayer.index + offset);
 }
 
 async function confirmConfidentVoiceClusters() {
@@ -1436,12 +1870,17 @@ async function confirmVoiceCluster(clusterId, canonical) {
     loadPeople();
     loadOverview();
     if (state.activeMeetingId) selectMeeting(state.activeMeetingId);
+    return true;
   } catch (err) {
     showToast(err.message, "error");
+    return false;
   }
 }
 
 async function dismissVoiceCluster(clusterId) {
+  if (!window.confirm(
+    "Mark this voice as noise or crosstalk? It will leave speaker review without being assigned to a person. No audio, transcript, or minutes will be deleted.",
+  )) return;
   try {
     const res = await fetch("/api/voices/dismiss", {
       method: "POST",
@@ -1449,16 +1888,69 @@ async function dismissVoiceCluster(clusterId) {
       body: JSON.stringify({ cluster_id: clusterId }),
     });
     if (!res.ok) throw new Error("Failed to dismiss cluster");
-    showToast("Dismissed speaker fragment as noise.", "info");
+    showToast("Marked this fragment as non-speaker noise. No meeting content was deleted.", "info");
     loadVoiceClusters();
   } catch (err) {
     showToast(err.message, "error");
   }
 }
 
-function promptCustomVoiceName(clusterId) {
-  const name = prompt("Enter the real contact name for this voice:");
-  if (name && name.trim()) confirmVoiceCluster(clusterId, name.trim());
+function openVoiceNameModal(clusterId) {
+  const cluster = (state.voiceClusters || []).find((c) => c.id === clusterId);
+  if (!cluster) return;
+
+  $("voice-name-cluster-id").value = clusterId;
+  $("voice-new-person-name").value = "";
+  const people = [...(state.people || [])].sort((a, b) => a.canonical.localeCompare(b.canonical));
+  $("voice-existing-person").innerHTML = [
+    '<option value="">Choose an existing speaker…</option>',
+    ...people.map((person) => {
+      const detail = person.role ? ` — ${person.role}` : "";
+      return `<option value="${escapeHtml(person.canonical)}">${escapeHtml(person.canonical + detail)}</option>`;
+    }),
+  ].join("");
+
+  const useExisting = people.length > 0;
+  $("voice-name-existing-mode").checked = useExisting;
+  $("voice-name-existing-mode").disabled = !useExisting;
+  $("voice-name-new-mode").checked = !useExisting;
+  $("voice-name-modal-sub").textContent =
+    `This voice appears in ${cluster.size} meeting${cluster.size === 1 ? "" : "s"}. ` +
+    "Your choice will update every matching meeting.";
+  updateVoiceNameMode();
+  $("voice-name-modal").showModal();
+  setTimeout(() => (useExisting ? $("voice-existing-person") : $("voice-new-person-name")).focus(), 50);
+}
+
+function updateVoiceNameMode() {
+  const useExisting = $("voice-name-existing-mode").checked;
+  $("voice-existing-panel").hidden = !useExisting;
+  $("voice-new-panel").hidden = useExisting;
+  $("voice-existing-person").disabled = !useExisting;
+  $("voice-existing-person").required = useExisting;
+  $("voice-new-person-name").disabled = useExisting;
+  $("voice-new-person-name").required = !useExisting;
+}
+
+function closeVoiceNameModal() {
+  $("voice-name-modal").close();
+}
+
+async function submitVoiceNameModal() {
+  const useExisting = $("voice-name-existing-mode").checked;
+  const name = (useExisting ? $("voice-existing-person").value : $("voice-new-person-name").value).trim();
+  if (!name) return;
+
+  const save = $("voice-name-save");
+  save.disabled = true;
+  save.textContent = "Saving…";
+  const saved = await confirmVoiceCluster($("voice-name-cluster-id").value, name);
+  save.disabled = false;
+  save.textContent = "Confirm Speaker";
+  if (saved) {
+    stopClusterPlayback();
+    closeVoiceNameModal();
+  }
 }
 
 // ── Decision Timeline Evolution ──────────────────────────────────────

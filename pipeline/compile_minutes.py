@@ -52,12 +52,15 @@ def estimate_tokens(text: str) -> int:
     return len(text) // CHARS_PER_TOKEN
 
 
-def slugify(text: str) -> str:
-    """Filename-safe slug."""
+def slugify(text: str, max_len: int = 80) -> str:
+    """Filename-safe slug, capped to prevent Windows MAX_PATH violations."""
     text = text.lower().strip()
     text = re.sub(r"[^\w\s-]", "", text)
     text = re.sub(r"[\s_]+", "-", text)
-    return re.sub(r"-+", "-", text).strip("-")
+    slug = re.sub(r"-+", "-", text).strip("-")
+    if len(slug) > max_len:
+        slug = slug[:max_len].rstrip("-")
+    return slug
 
 
 def minutes_path(meeting: db.Meeting, title: str | None = None) -> Path:

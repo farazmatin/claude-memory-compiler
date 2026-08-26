@@ -115,6 +115,17 @@ def test_lightrag_doc_id_roundtrips(manifest):
     assert db.get_meeting(manifest, "m1").lightrag_doc_id == "doc-abc123"
 
 
+def test_minutes_refresh_requeues_completed_meeting_and_keeps_old_index_id(manifest):
+    make_meeting(manifest, "m1", "2026-08-10")
+    db.advance(manifest, "m1", db.INDEXED, lightrag_doc_id="doc-old")
+
+    assert db.queue_minutes_refresh(manifest, ["m1", "m1"]) == 1
+
+    meeting = db.get_meeting(manifest, "m1")
+    assert meeting.status == db.SPEAKERS_RESOLVED
+    assert meeting.lightrag_doc_id == "doc-old"
+
+
 # ── Stage-run failure visibility ────────────────────────────────────
 
 def test_recent_stage_failures_reports_failed_runs_with_meeting_context(manifest):

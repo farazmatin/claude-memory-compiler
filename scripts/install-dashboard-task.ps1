@@ -17,7 +17,7 @@ if (-not (Test-Path -LiteralPath $python)) {
 
 $action = New-ScheduledTaskAction `
     -Execute $python `
-    -Argument "-m pipeline.cli dashboard --host 127.0.0.1 --port $Port" `
+    -Argument "-m pipeline.cli dashboard --port $Port" `
     -WorkingDirectory $projectRoot
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew

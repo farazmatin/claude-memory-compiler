@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
+
 from pipeline import dashboard, db
 
 from .conftest import make_meeting
@@ -189,6 +191,162 @@ def test_people_management_and_speaker_override(manifest):
         assert speakers.get("SPEAKER_00") == "Bob"
 
 
+def test_merging_people_queues_completed_minutes_for_refresh(manifest):
+    meeting_id = "merge-refresh"
+    make_meeting(manifest, meeting_id, "2026-08-14", status=db.INDEXED)
+    db.set_speaker(manifest, meeting_id, "SPEAKER_00", "Ali", "confirmed")
+    db.add_person(manifest, "Ali Hilal")
+    manifest.commit()
+
+    dashboard.merge_people("Ali", "Ali Hilal")
+
+    with db.connect() as conn:
+        meeting = db.get_meeting(conn, meeting_id)
+        assert meeting.status == db.SPEAKERS_RESOLVED
+        assert db.get_speakers(conn, meeting_id)["SPEAKER_00"] == "Ali Hilal"
+
+
+def test_merge_many_people_keeps_one_spelling_and_all_history(manifest, monkeypatch):
+    meeting_ids = []
+    for index, name in enumerate(("Ru", "Roo", "Roe")):
+        meeting_id = f"merge-many-{index}"
+        meeting_ids.append(meeting_id)
+        make_meeting(manifest, meeting_id, "2026-08-14", status=db.INDEXED)
+        db.add_person(manifest, name, role="Designer" if name == "Ru" else None)
+        db.set_speaker(manifest, meeting_id, "SPEAKER_00", name, "confirmed")
+    manifest.commit()
+
+    voice_moves = []
+    monkeypatch.setattr(
+        dashboard.voices,
+        "merge_people",
+        lambda conn, source, target: voice_moves.append((source, target)) or 0,
+    )
+
+    rewritten = dashboard.merge_many_people(["Ru", "Roo", "Roe"], "Roo")
+
+    assert rewritten == 2
+    assert voice_moves == [("Ru", "Roo"), ("Roe", "Roo")]
+    with db.connect() as conn:
+        people = {person["canonical"]: person for person in db.list_people(conn)}
+        assert set(people) == {"Roo"}
+        assert people["Roo"]["role"] == "Designer"
+        assert db.canonical_name(conn, "Ru") == "Roo"
+        assert db.canonical_name(conn, "Roe") == "Roo"
+        for meeting_id in meeting_ids:
+            assert db.get_speakers(conn, meeting_id)["SPEAKER_00"] == "Roo"
+            assert db.get_meeting(conn, meeting_id).status == db.SPEAKERS_RESOLVED
+
+
+def test_merge_many_people_rejects_missing_name_before_writing(manifest):
+    for name in ("Ru", "Roo"):
+        db.add_person(manifest, name)
+    manifest.commit()
+
+    with pytest.raises(ValueError, match="Contact not found: Roe"):
+        dashboard.merge_many_people(["Ru", "Roo", "Roe"], "Roo")
+
+    with db.connect() as conn:
+        assert {person["canonical"] for person in db.list_people(conn)} == {"Ru", "Roo"}
+
+
+def test_merge_many_people_handles_graph_rows_that_already_use_both_names(manifest):
+    meeting_id = "merge-graph-collision"
+    make_meeting(manifest, meeting_id, "2026-08-14", status=db.INDEXED)
+    for name in ("Ru", "Roo"):
+        db.add_person(manifest, name)
+    db.replace_entities(
+        manifest,
+        meeting_id,
+        [
+            {"name": "Ru", "kind": "person", "description": "Short spelling"},
+            {"name": "Roo", "kind": "person", "description": "Kept spelling"},
+        ],
+        [
+            {"subject": "Ru", "predicate": "works with", "object": "Roo"},
+            {"subject": "Roo", "predicate": "works with", "object": "Roo"},
+        ],
+    )
+    manifest.commit()
+
+    dashboard.merge_many_people(["Ru", "Roo"], "Roo")
+
+    with db.connect() as conn:
+        assert [item["name"] for item in db.get_entities(conn, meeting_id)] == ["Roo"]
+        assert db.get_relations(conn, meeting_id) == [
+            {
+                "subject": "Roo",
+                "predicate": "works with",
+                "object": "Roo",
+            }
+        ]
+        assert db.get_meeting(conn, meeting_id).status == db.SPEAKERS_RESOLVED
+
+
+def test_manual_speaker_correction_queues_completed_minutes_for_refresh(manifest):
+    meeting_id = "manual-refresh"
+    make_meeting(manifest, meeting_id, "2026-08-14", status=db.INDEXED)
+    manifest.commit()
+
+    dashboard.set_meeting_speaker(meeting_id, "SPEAKER_00", "Ali Hilal")
+
+    with db.connect() as conn:
+        assert db.get_meeting(conn, meeting_id).status == db.SPEAKERS_RESOLVED
+
+
+def test_similar_contact_names_are_suggested_and_no_is_remembered(manifest):
+    for name in ("Ru", "Roo", "Roe", "Ruth"):
+        db.add_person(manifest, name)
+    manifest.commit()
+
+    suggestions = dashboard.people_merge_suggestions()
+    groups = {frozenset(item["names"]) for item in suggestions}
+    assert frozenset(("Ru", "Roo", "Roe")) in groups
+    assert all("Ruth" not in group for group in groups)
+
+    dashboard.dismiss_people_suggestion("Ru", "Roo")
+    remaining = dashboard.people_merge_suggestions()
+    assert all(not {"Ru", "Roo"} <= set(item["names"]) for item in remaining)
+
+
+def test_declining_a_similar_name_group_remembers_every_pair(manifest):
+    for name in ("Ru", "Roo", "Roe"):
+        db.add_person(manifest, name)
+    manifest.commit()
+
+    dashboard.dismiss_people_suggestion_group(["Ru", "Roo", "Roe"])
+
+    assert dashboard.people_merge_suggestions() == []
+
+
+def test_rename_person_changes_spelling_and_queues_minutes(manifest):
+    meeting_id = "rename-contact"
+    make_meeting(manifest, meeting_id, "2026-08-14", status=db.INDEXED)
+    db.add_person(manifest, "Roo", role="Designer")
+    db.set_speaker(manifest, meeting_id, "SPEAKER_00", "Roo", "confirmed")
+    db.add_voice_sample(
+        manifest,
+        canonical="Roo",
+        meeting_id=meeting_id,
+        label="SPEAKER_00",
+        embedding=b"voice",
+        dim=1,
+        model="test-model",
+        speech_sec=10.0,
+    )
+    manifest.commit()
+
+    dashboard.rename_person("Roo", "Rue")
+
+    with db.connect() as conn:
+        people = {person["canonical"]: person for person in db.list_people(conn)}
+        assert "Roo" not in people
+        assert people["Rue"]["role"] == "Designer"
+        assert db.get_speakers(conn, meeting_id)["SPEAKER_00"] == "Rue"
+        assert len(db.person_samples(conn, "Rue")) == 1
+        assert db.get_meeting(conn, meeting_id).status == db.SPEAKERS_RESOLVED
+
+
 def test_people_api_normalizes_aliases_for_the_frontend(manifest, monkeypatch):
     monkeypatch.setattr(
         db,
@@ -211,6 +369,21 @@ def test_pipeline_status_and_trigger():
     status = dashboard.get_pipeline_status()
     assert "running" in status
     assert "logs" in status
+
+
+def test_speaker_refresh_stage_runs_minutes_then_index(manifest, monkeypatch):
+    from pipeline import cli
+
+    make_meeting(manifest, "refresh-me", "2026-08-14", status=db.SPEAKERS_RESOLVED)
+    manifest.commit()
+    calls = []
+    monkeypatch.setattr(cli, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(cli, "cmd_minutes", lambda args: calls.append("minutes") or 0)
+    monkeypatch.setattr(cli, "cmd_index", lambda args: calls.append("index") or 0)
+
+    dashboard._run_pipeline_worker("speaker-refresh", None)
+
+    assert calls == ["minutes", "index"]
 
 
 def test_minutes_outside_archive_are_not_exposed(manifest, tmp_path, monkeypatch):
@@ -520,6 +693,30 @@ def test_merge_people_moves_voice_samples_too(manifest, monkeypatch):
     assert calls == [("Mike", "Michael")], "voice samples must follow the merge"
 
 
+def test_merge_many_people_preserves_voice_samples_before_deleting_sources(manifest):
+    for name in ("Ru", "Roo", "Roe"):
+        db.add_person(manifest, name)
+    for index, name in enumerate(("Ru", "Roe")):
+        db.add_voice_sample(
+            manifest,
+            canonical=name,
+            meeting_id=None,
+            label=f"SPEAKER_0{index}",
+            embedding=b"voice",
+            dim=1,
+            model="test-model",
+            speech_sec=12.0,
+        )
+    manifest.commit()
+
+    dashboard.merge_many_people(["Ru", "Roo", "Roe"], "Roo")
+
+    with db.connect() as conn:
+        samples = db.person_samples(conn, "Roo")
+        assert len(samples) == 2
+        assert {sample["label"] for sample in samples} == {"SPEAKER_00", "SPEAKER_01"}
+
+
 def test_voice_snippet_requires_both_identifiers():
     """A missing label would otherwise match an arbitrary row."""
     import json as _json
@@ -588,6 +785,40 @@ def test_cluster_members_expose_clip_count_and_inferred_name(manifest, monkeypat
     member = clusters[0]["members"][0]
     assert member["snippet_count"] == 2
     assert member["llm_name"] == "Ruth"
+
+
+def test_speaker_resolution_queue_keeps_one_off_labels_visible(manifest, monkeypatch):
+    """No-embedding labels still need a way back to a human decision."""
+    meeting_id = "speaker-one-off"
+    make_meeting(manifest, meeting_id, "2026-08-12", title_hint="Client review")
+    db.set_speaker(manifest, meeting_id, "SPEAKER_03", None, "unknown")
+    db.upsert_speaker_match(
+        manifest,
+        meeting_id=meeting_id,
+        label="SPEAKER_03",
+        state="pending",
+        speech_sec=31.0,
+        llm_name="Ali",
+    )
+    manifest.commit()
+    monkeypatch.setattr(dashboard, "get_voice_clusters", lambda: [{"id": "recurring"}])
+
+    queue = dashboard.speaker_resolution_queue()
+
+    assert queue["clusters"] == [{"id": "recurring"}]
+    assert queue["one_offs"] == [
+        {
+            "meeting_id": meeting_id,
+            "label": "SPEAKER_03",
+            "meeting_title": "Client review",
+            "meeting_date": "2026-08-12",
+            "speech_sec": 31.0,
+            "snippet_count": 0,
+            "best_canonical": None,
+            "best_score": None,
+            "llm_suggestion": "Ali",
+        }
+    ]
 
 
 def test_cluster_offers_the_transcript_name_as_a_second_suggestion(manifest, monkeypatch):

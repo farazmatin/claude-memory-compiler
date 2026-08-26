@@ -18,10 +18,13 @@ if (-not (Test-Path -LiteralPath $python)) {
 
 function Test-DashboardAvailable {
     try {
-        $response = Invoke-WebRequest -Uri "$address/api/overview" -UseBasicParsing -TimeoutSec 1
-        return $response.StatusCode -eq 200
+        $response = Invoke-WebRequest -Uri "$address/style.css" -UseBasicParsing -TimeoutSec 1
+        return $response.StatusCode -eq 200 -or $response.StatusCode -eq 401
     }
     catch {
+        if ($_.Exception.Response -and ($_.Exception.Response.StatusCode.value__ -in 200, 401)) {
+            return $true
+        }
         return $false
     }
 }
@@ -30,7 +33,7 @@ if (-not (Test-DashboardAvailable)) {
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
     $process = Start-Process `
         -FilePath $python `
-        -ArgumentList "-m", "pipeline.cli", "dashboard", "--host", "127.0.0.1", "--port", $Port `
+        -ArgumentList "-m", "pipeline.cli", "dashboard", "--port", $Port `
         -WorkingDirectory $projectRoot `
         -WindowStyle Hidden `
         -RedirectStandardOutput $standardOutput `

@@ -9,10 +9,13 @@ import mimetypes
 import re
 import subprocess
 import threading
+import unicodedata
 import uuid
 import webbrowser
 from collections import Counter, deque
 from datetime import datetime, timedelta
+from difflib import SequenceMatcher
+from itertools import combinations
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -43,6 +46,7 @@ from pipeline.titles import clean_meeting_title
 
 STATIC_DIR = Path(__file__).with_name("static")
 MAX_QUERY_CHARS = 4_000
+PEOPLE_SUGGESTIONS_DISMISSED = "people.merge_suggestions.dismissed"
 VALID_QUERY_MODES = {"hybrid", "global", "local", "naive", "mix"}
 
 # ── Pipeline background runner state ──────────────────────────────────
@@ -142,6 +146,20 @@ def _run_pipeline_worker(stage: str, limit: int | None) -> None:
                 rc = cli.cmd_minutes(
                     argparse.Namespace(limit=limit, recompile=True, traceback=False, force=False)
                 )
+            elif stage == "speaker-refresh":
+                with db.connect() as conn:
+                    queued = db.pending(conn, db.SPEAKERS_RESOLVED, limit)
+                if not queued:
+                    print("No speaker-corrected minutes are waiting to refresh.")
+                    rc = 0
+                else:
+                    rc = cli.cmd_minutes(
+                        argparse.Namespace(
+                            limit=limit, recompile=False, traceback=False, force=False
+                        )
+                    )
+                    if rc == 0:
+                        rc = cli.cmd_index(argparse.Namespace(limit=limit))
             else:
                 raise ValueError(f"Unknown pipeline stage: {stage}")
             success = rc == 0
@@ -205,11 +223,258 @@ def add_person(canonical: str, role: str | None = None, aliases: list[str] | Non
 
 def merge_people(from_name: str, into: str) -> int:
     """Merge one person/alias into another and rewrite historical records."""
+    source, target = from_name.strip(), into.strip()
+    if not source or not target:
+        raise ValueError("Both contact names are required.")
+    if source == target:
+        return 0
     db.init_db()
     with db.connect() as conn:
-        rewritten = db.merge_person(conn, from_name=from_name, into=into)
-        voices.merge_people(conn, from_name, into)
+        affected_meetings = {
+            row["meeting_id"]
+            for row in conn.execute(
+                "SELECT DISTINCT meeting_id FROM speakers WHERE name IN (?, ?)",
+                (source, target),
+            ).fetchall()
+        }
+        rewritten = int(
+            conn.execute(
+                "SELECT COUNT(*) AS total FROM speakers WHERE name = ?", (source,)
+            ).fetchone()["total"]
+        )
+        voices.merge_people(conn, source, target)
+        db.merge_person(conn, from_name=source, into=target)
+        db.queue_minutes_refresh(conn, affected_meetings)
         return rewritten
+
+
+def merge_many_people(names: list[str], into: str) -> int:
+    """Atomically fold several selected contacts into one retained spelling."""
+    selected = list(dict.fromkeys(str(name).strip() for name in names if str(name).strip()))
+    target = into.strip()
+    if len(selected) < 2:
+        raise ValueError("Select at least two contact names to merge.")
+    if target not in selected:
+        raise ValueError("The spelling to keep must be one of the selected names.")
+
+    db.init_db()
+    with db.connect() as conn:
+        rows = {
+            row["canonical"]: row
+            for row in conn.execute(
+                f"SELECT canonical, role FROM people WHERE canonical IN ({','.join('?' for _ in selected)})",
+                selected,
+            ).fetchall()
+        }
+        missing = [name for name in selected if name not in rows]
+        if missing:
+            raise ValueError(f"Contact not found: {', '.join(missing)}")
+
+        rewritten = 0
+        placeholders = ",".join("?" for _ in selected)
+        affected_meetings = {
+            row["meeting_id"]
+            for row in conn.execute(
+                f"SELECT DISTINCT meeting_id FROM speakers WHERE name IN ({placeholders})",
+                selected,
+            ).fetchall()
+        }
+        for source in (name for name in selected if name != target):
+            rewritten += int(
+                conn.execute(
+                    "SELECT COUNT(*) AS total FROM speakers WHERE name = ?", (source,)
+                ).fetchone()["total"]
+            )
+
+            # Voice samples must move before deleting the source person because
+            # their foreign key intentionally cascades on person deletion.
+            voices.merge_people(conn, source, target)
+            db.merge_person(conn, from_name=source, into=target)
+
+            # Keep useful role information when the chosen spelling had none.
+            target_role = rows[target]["role"]
+            if not target_role and rows[source]["role"]:
+                db.add_person(conn, target, role=rows[source]["role"])
+                rows[target] = {"canonical": target, "role": rows[source]["role"]}
+
+        db.queue_minutes_refresh(conn, affected_meetings)
+        return rewritten
+
+
+def rename_person(from_name: str, new_name: str) -> int:
+    """Correct one canonical spelling without creating a second person."""
+    source, target = from_name.strip(), new_name.strip()
+    if not source or not target:
+        raise ValueError("Both the current and corrected names are required.")
+    if source == target:
+        return 0
+    db.init_db()
+    with db.connect() as conn:
+        source_row = conn.execute(
+            "SELECT role FROM people WHERE canonical = ?", (source,)
+        ).fetchone()
+        if not source_row:
+            raise ValueError(f"Contact '{source}' was not found.")
+        existing = conn.execute(
+            "SELECT 1 FROM people WHERE canonical = ?", (target,)
+        ).fetchone()
+        if existing:
+            raise ValueError(
+                f"'{target}' already exists. Select both names and choose 'Merge selected'."
+            )
+        affected_meetings = {
+            row["meeting_id"]
+            for row in conn.execute(
+                "SELECT DISTINCT meeting_id FROM speakers WHERE name = ?", (source,)
+            ).fetchall()
+        }
+        rewritten = int(
+            conn.execute(
+                "SELECT COUNT(*) AS total FROM speakers WHERE name = ?", (source,)
+            ).fetchone()["total"]
+        )
+        db.add_person(conn, target, role=source_row["role"])
+        voices.merge_people(conn, source, target)
+        db.merge_person(conn, from_name=source, into=target)
+        db.queue_minutes_refresh(conn, affected_meetings)
+        return rewritten
+
+
+def _normalized_person_name(name: str) -> str:
+    plain = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    return " ".join(re.findall(r"[a-z0-9]+", plain.lower()))
+
+
+def _vowel_fold(name: str) -> str:
+    folded = re.sub(r"[aeiouy]+", "a", name)
+    return re.sub(r"(.)\1+", r"\1", folded)
+
+
+def _person_name_similarity(first: str, second: str) -> float:
+    left, right = _normalized_person_name(first), _normalized_person_name(second)
+    if not left or not right or left == right:
+        return 0.0
+    left_tokens, right_tokens = set(left.split()), set(right.split())
+    if left_tokens <= right_tokens or right_tokens <= left_tokens:
+        return 0.96
+    literal = SequenceMatcher(None, left, right).ratio()
+    phonetic = SequenceMatcher(None, _vowel_fold(left), _vowel_fold(right)).ratio()
+    return max(literal, phonetic * 0.94)
+
+
+def _suggestion_key(first: str, second: str) -> str:
+    return "|".join(sorted((_normalized_person_name(first), _normalized_person_name(second))))
+
+
+def people_merge_suggestions(limit: int = 12) -> list[dict[str, Any]]:
+    """Suggest conservative, one-click groups of likely duplicate contacts."""
+    records = people()
+    db.init_db()
+    with db.connect() as conn:
+        try:
+            dismissed = set(json.loads(db.get_setting(conn, PEOPLE_SUGGESTIONS_DISMISSED) or "[]"))
+        except (TypeError, ValueError):
+            dismissed = set()
+
+    records_by_name = {str(person["canonical"]): person for person in records}
+    candidate_pairs: dict[tuple[str, str], float] = {}
+    for position, first in enumerate(records):
+        for second in records[position + 1 :]:
+            first_name, second_name = str(first["canonical"]), str(second["canonical"])
+            score = _person_name_similarity(first_name, second_name)
+            key = _suggestion_key(first_name, second_name)
+            if score < 0.82 or key in dismissed:
+                continue
+            candidate_pairs[tuple(sorted((first_name, second_name)))] = score
+
+    def choose_target(names: list[str]) -> str:
+        return max(
+            names,
+            key=lambda name: (
+                len(name.split()),
+                int(records_by_name[name].get("meetings") or 0),
+                len(name),
+            ),
+        )
+
+    # A group is offered only when every name in it strongly matches every
+    # other name. This prevents a "No" to one pair from being bypassed through
+    # an indirect, transitive match.
+    neighbours: dict[str, set[str]] = {name: set() for name in records_by_name}
+    for first_name, second_name in candidate_pairs:
+        neighbours[first_name].add(second_name)
+        neighbours[second_name].add(first_name)
+    grouped_pairs: set[tuple[str, str]] = set()
+    suggestions = []
+    seen: set[str] = set()
+    for start in sorted(neighbours):
+        if start in seen or not neighbours[start]:
+            continue
+        component, stack = set(), [start]
+        while stack:
+            name = stack.pop()
+            if name in component:
+                continue
+            component.add(name)
+            stack.extend(neighbours[name] - component)
+        seen.update(component)
+        names = sorted(component)
+        pairs = [tuple(sorted(pair)) for pair in combinations(names, 2)]
+        if len(names) > 2 and all(pair in candidate_pairs for pair in pairs):
+            target = choose_target(names)
+            suggestions.append(
+                {
+                    "names": names,
+                    "target": target,
+                    "score": round(min(candidate_pairs[pair] for pair in pairs), 2),
+                }
+            )
+            grouped_pairs.update(pairs)
+
+    for (first_name, second_name), score in candidate_pairs.items():
+        if (first_name, second_name) in grouped_pairs:
+            continue
+        names = [first_name, second_name]
+        suggestions.append(
+            {
+                "names": names,
+                "target": choose_target(names),
+                "score": round(score, 2),
+            }
+        )
+    suggestions.sort(key=lambda item: (-float(item["score"]), -len(item["names"]), str(item["names"][0])))
+    return suggestions[:limit]
+
+
+def dismiss_people_suggestion(first: str, second: str) -> None:
+    """Remember that a proposed pair is two different people."""
+    key = _suggestion_key(first, second)
+    if not key or key == "|":
+        raise ValueError("Two contact names are required.")
+    db.init_db()
+    with db.connect() as conn:
+        try:
+            dismissed = set(json.loads(db.get_setting(conn, PEOPLE_SUGGESTIONS_DISMISSED) or "[]"))
+        except (TypeError, ValueError):
+            dismissed = set()
+        dismissed.add(key)
+        db.set_setting(conn, PEOPLE_SUGGESTIONS_DISMISSED, json.dumps(sorted(dismissed)))
+
+
+def dismiss_people_suggestion_group(names: list[str]) -> None:
+    """Remember that no two names in a declined suggested group should merge."""
+    selected = list(dict.fromkeys(str(name).strip() for name in names if str(name).strip()))
+    if len(selected) < 2:
+        raise ValueError("At least two contact names are required.")
+    db.init_db()
+    with db.connect() as conn:
+        try:
+            dismissed = set(json.loads(db.get_setting(conn, PEOPLE_SUGGESTIONS_DISMISSED) or "[]"))
+        except (TypeError, ValueError):
+            dismissed = set()
+        for first, second in combinations(selected, 2):
+            dismissed.add(_suggestion_key(first, second))
+        db.set_setting(conn, PEOPLE_SUGGESTIONS_DISMISSED, json.dumps(sorted(dismissed)))
 
 
 def set_meeting_speaker(
@@ -228,6 +493,7 @@ def set_meeting_speaker(
         )
         if cleaned:
             db.add_person(conn, canonical=cleaned)
+        db.queue_minutes_refresh(conn, [meeting_id])
 
 
 def get_voice_clusters() -> list[dict[str, Any]]:
@@ -287,6 +553,62 @@ def get_voice_clusters() -> list[dict[str, Any]]:
                 "members": members,
             })
         return result
+
+
+def speaker_resolution_queue(limit: int = 100) -> dict[str, Any]:
+    """Return every identity decision the owner can make from one dashboard view.
+
+    Embedded labels are grouped into recurring voice clusters first: one answer
+    then fixes every occurrence. Labels without enough retained voice evidence
+    stay as one-off decisions rather than vanishing from the review workflow.
+    """
+    clusters = get_voice_clusters()
+    db.init_db()
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.meeting_id, s.label, m.source_name, m.title_hint, m.minutes_path,
+                   m.meeting_date, sm.speech_sec, sm.snippet_paths, sm.best_canonical,
+                   sm.best_score, sm.llm_name
+            FROM speakers s
+            JOIN meetings m ON m.id = s.meeting_id
+            LEFT JOIN speaker_matches sm
+              ON sm.meeting_id = s.meeting_id AND sm.label = s.label
+            WHERE s.name IS NULL
+              AND (sm.state IS NULL OR sm.state = 'pending')
+              AND (sm.cluster_id IS NULL OR sm.cluster_id = '')
+            ORDER BY COALESCE(sm.speech_sec, 0) DESC, m.meeting_date DESC, s.label
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    one_offs = []
+    for row in rows:
+        try:
+            snippets = json.loads(row["snippet_paths"] or "[]")
+        except (TypeError, ValueError):
+            snippets = []
+        one_offs.append(
+            {
+                "meeting_id": row["meeting_id"],
+                "label": row["label"],
+                "meeting_title": clean_meeting_title(
+                    row["source_name"], row["title_hint"], row["minutes_path"]
+                ),
+                "meeting_date": row["meeting_date"],
+                "speech_sec": float(row["speech_sec"] or 0),
+                "snippet_count": len(snippets) if isinstance(snippets, list) else 0,
+                "best_canonical": row["best_canonical"],
+                "best_score": (
+                    round(float(row["best_score"]), 2)
+                    if row["best_score"] is not None
+                    else None
+                ),
+                "llm_suggestion": row["llm_name"],
+            }
+        )
+    return {"clusters": clusters, "one_offs": one_offs}
 
 
 def confirm_voice_cluster(cluster_id: str, canonical: str) -> int:
@@ -1012,6 +1334,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/people":
             self._json(HTTPStatus.OK, {"people": people()})
             return
+        if path == "/api/people/suggestions":
+            self._json(HTTPStatus.OK, {"suggestions": people_merge_suggestions()})
+            return
         if path == "/api/meetings":
             search = parse_qs(parsed.query).get("search", [""])[0]
             self._json(HTTPStatus.OK, {"meetings": meetings(search)})
@@ -1026,6 +1351,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/voices/clusters":
             self._json(HTTPStatus.OK, {"clusters": get_voice_clusters()})
+            return
+        if path == "/api/speakers/queue":
+            self._json(HTTPStatus.OK, speaker_resolution_queue())
             return
         if path == "/api/timeline":
             topic = parse_qs(parsed.query).get("topic", [""])[0]
@@ -1303,6 +1631,57 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     HTTPStatus.OK,
                     {"from_name": from_name, "into": into, "rewritten": rewritten},
                 )
+            except Exception as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        if path == "/api/people/merge-many":
+            try:
+                payload = self._payload()
+                raw_names = payload.get("names", [])
+                if not isinstance(raw_names, list):
+                    raise ValueError("'names' must be a list of selected contacts.")
+                names = [str(name).strip() for name in raw_names]
+                into = str(payload.get("into", "")).strip()
+                rewritten = merge_many_people(names, into)
+                self._json(
+                    HTTPStatus.OK,
+                    {
+                        "names": names,
+                        "into": into,
+                        "merged": len(set(names)),
+                        "rewritten": rewritten,
+                    },
+                )
+            except Exception as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        if path == "/api/people/rename":
+            try:
+                payload = self._payload()
+                from_name = str(payload.get("from_name", "")).strip()
+                new_name = str(payload.get("new_name", "")).strip()
+                rewritten = rename_person(from_name, new_name)
+                self._json(
+                    HTTPStatus.OK,
+                    {"from_name": from_name, "new_name": new_name, "rewritten": rewritten},
+                )
+            except Exception as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        if path == "/api/people/suggestions/dismiss":
+            try:
+                payload = self._payload()
+                names = payload.get("names")
+                if isinstance(names, list):
+                    dismiss_people_suggestion_group(names)
+                    self._json(HTTPStatus.OK, {"dismissed": True})
+                    return
+                first = str(payload.get("first", "")).strip()
+                second = str(payload.get("second", "")).strip()
+                if not first or not second:
+                    raise ValueError("Two contact names are required.")
+                dismiss_people_suggestion(first, second)
+                self._json(HTTPStatus.OK, {"dismissed": True})
             except Exception as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
