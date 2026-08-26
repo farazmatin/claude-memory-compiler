@@ -94,10 +94,34 @@ the pattern already used by the voice-name modal (choose existing / add new).
 - `next_canonical`: `source` → `target`
 
 `voices.confirm()` gains a guard against resurrecting a dead name: when the
-requested canonical is absent from `people` but resolves through
-`person_aliases`, it confirms the alias's current canonical instead. This closes
-the treadmill independently of section B's rewrite, so a stale card cached in a
+requested canonical is absent from `people` but is recorded as a merged-away
+spelling, it confirms the person who absorbed it instead. This closes the
+treadmill independently of section B's rewrite, so a stale card cached in a
 browser tab cannot undo a merge either.
+
+**The guard needs a tombstone, not an alias.** An earlier draft resolved the
+name through `person_aliases`, which section C deletes — the two sections
+cancelled out. A new table carries the mapping instead:
+
+```sql
+CREATE TABLE IF NOT EXISTS merged_names (
+    old_spelling TEXT PRIMARY KEY,   -- exactly as it was, not lowercased
+    canonical    TEXT NOT NULL,      -- who absorbed it, at merge time
+    merged_at    TEXT NOT NULL,
+    FOREIGN KEY (canonical) REFERENCES people(canonical) ON DELETE CASCADE
+);
+```
+
+It is written on every merge and read only by this guard and by
+`--repair-merges`. Nothing renders it, so premerged spellings still appear
+nowhere in the UI — the owner's requirement is about what is visible, and a
+tombstone is not. It also answers "what did I fold into this person?" without
+putting the old spellings back on screen.
+
+A merge whose target is itself later merged leaves a tombstone pointing at a
+name that no longer exists. The guard therefore follows the chain, with a visited
+set so a cycle cannot loop, and falls through to refusing the confirm if the
+chain ends nowhere.
 
 A one-time repair covers rows created before this change: for every
 `best_canonical` / `next_canonical` in both tables that is not in `people`,
@@ -147,12 +171,32 @@ counts are separate because they mean different things to the caller: `missing`
 is the only one that leaves work outstanding, and a bare integer could not say
 so — see the status-handling note below.
 
-**Matching.** Word-boundary substitution that also handles possessives, so
-`Faraz's` becomes `Faraz Mateen's`. `\b` alone is insufficient: the pattern must
-not fire inside a longer word, which is the failure that would turn **Ruth**
-into *Ru Farrellth* when merging `Ru`. The guard is a lookaround on word
-characters and apostrophes rather than `\b`, for the same reason `ingest.py`
-avoids `\b` — a bare `\b` does not fire beside every character that matters here.
+**Matching.** `\b` plus `re.escape`, case-sensitive, which already handles both
+of the obvious cases: `Faraz's` becomes `Faraz Mateen's` because `z`/`'` is a
+boundary, and `Ruth` survives merging `Ru` because `u`/`t` is not. An earlier
+draft of this spec claimed `\b` was insufficient and named the `Ruth` case as the
+hazard; that was wrong, and the reasoning is corrected here because the real
+hazard is different and worse.
+
+**The real hazard is doubling.** When the new name begins with the old one —
+exactly the `Faraz` → `Faraz Mateen` case that prompted this work — a document
+that already says "Faraz Mateen" contains a `\bFaraz\b` match at the start of the
+correct name, and substituting it yields **"Faraz Mateen Mateen"**. Because
+minutes for different meetings resolved at different times, the same document can
+hold both spellings, so this is the common case rather than a corner.
+
+The guard is a negative lookahead for the remainder of the new name, applied only
+when `new` starts with `old`:
+
+```python
+suffix = new[len(old):] if new.lower().startswith(old.lower()) else ""
+tail = f"(?!{re.escape(suffix)})" if suffix else ""
+pattern = re.compile(rf"\b{re.escape(old)}\b{tail}")
+```
+
+For `old="Faraz"`, `new="Faraz Mateen"` this is `\bFaraz\b(?! Mateen)`: it skips
+the already-correct occurrences and rewrites only the bare ones. It also makes
+the rewrite idempotent, which is what lets `--repair-merges` be safe to re-run.
 
 **Scope.** Only files named by `meetings.minutes_path`. Transcripts are the
 immutable source and are never touched; the whole repeatable-compile property
@@ -194,15 +238,19 @@ it removes.
 
 ```
 1. collect affected meeting ids
-2. rewrite matcher suggestions        (B)  needs person_aliases intact
-3. move voice samples, speakers, resolved_as   (exists)
-4. rewrite entities, relations, commitments,
+2. record the tombstone               (B)  before the alias goes
+3. rewrite matcher suggestions        (B)
+4. move voice samples, speakers, resolved_as   (exists)
+5. rewrite entities, relations, commitments,
    decisions, open_questions          (exists)
-5. rewrite minutes markdown           (D)
-6. delete the source's alias row      (C)  last
-7. delete the source person           (exists)
-8. leave the meeting at minutes_compiled for re-index, not recompile
+6. rewrite minutes markdown           (D)
+7. delete the source's alias row      (C)  last
+8. delete the source person           (exists)
+9. leave the meeting at minutes_compiled for re-index, not recompile
 ```
+
+The tombstone is written before anything is destroyed, so a failure anywhere
+after it leaves a recoverable record of what was intended.
 
 All of it runs inside the single existing transaction per merge, so a failure
 part-way leaves neither half-merged rows nor a rewritten file paired with an
@@ -224,9 +272,15 @@ TDD throughout. Each item below is a failing test before it is code.
 **B — no ghosts**
 - after a merge, no `speaker_matches` or `voice_clusters` row names the source in
   `best_canonical` or `next_canonical`
-- `confirm()` on a merged-away name that resolves through an alias confirms the
-  current canonical and does not recreate the old person
-- the repair maps a resolvable ghost through aliases and NULLs an unresolvable one
+- a merge writes a `merged_names` row for the source spelling
+- `confirm()` on a merged-away name confirms the absorbing person and does **not**
+  recreate the old one
+- `confirm()` follows a two-hop chain (A merged into B, B merged into C) to C
+- `confirm()` refuses rather than looping when tombstones form a cycle
+- `confirm()` still creates a genuinely new person when the name is unknown to
+  both `people` and `merged_names`
+- the repair maps a resolvable ghost through the tombstone and NULLs an
+  unresolvable one
 
 **C — aliases deleted**
 - a merge leaves no `person_aliases` row for the source spelling
@@ -235,9 +289,13 @@ TDD throughout. Each item below is a failing test before it is code.
 
 **D — minutes rewritten**
 - the old name is replaced in the minutes file
-- a possessive is rewritten correctly
+- a possessive is rewritten correctly (`Faraz's` → `Faraz Mateen's`)
 - **a longer word containing the old name is left alone** (`Ruth` survives
   merging `Ru`)
+- **an already-correct occurrence is not doubled** (a document holding both
+  "Faraz" and "Faraz Mateen" ends with two "Faraz Mateen", never a
+  "Faraz Mateen Mateen")
+- rewriting the same file twice changes it only the first time
 - the transcript file is byte-identical afterwards
 - status ends at `minutes_compiled` with `lightrag_doc_id` intact
 - a meeting whose minutes file is absent stays queued for recompile and is counted
