@@ -8,6 +8,7 @@ directly against a manifest fixture instead of a full pipeline pass.
 from __future__ import annotations
 
 import argparse
+import json
 
 from pipeline import cli, db, people_merge
 
@@ -95,6 +96,42 @@ def test_people_merge_cli_can_resume_rewrite_jobs(manifest, capsys):
     assert cli.main(["people", "--resume-merge-rewrites"]) == 0
 
     assert "0 pending" in capsys.readouterr().out
+
+
+def test_people_merge_repair_cli_previews_then_applies_exact_artifact(
+    manifest, capsys, tmp_path
+):
+    db.add_person(manifest, "Michael", aliases=["Mike"])
+    manifest.commit()
+    preview_path = tmp_path / "merge-repair.json"
+
+    assert cli.main(
+        [
+            "people",
+            "--repair-merges",
+            "--preview-to",
+            str(preview_path),
+        ]
+    ) == 0
+    preview_output = capsys.readouterr().out
+    artifact = json.loads(preview_path.read_text(encoding="utf-8"))
+    assert "Nothing was changed" in preview_output
+    assert db.canonical_name(manifest, "Mike") == "Michael"
+    assert db.resolve_merged_name(manifest, "Mike") is None
+
+    assert cli.main(
+        [
+            "people",
+            "--repair-merges",
+            "--apply",
+            str(preview_path),
+            "--expected-digest",
+            artifact["digest"],
+        ]
+    ) == 0
+
+    assert "1 alias(es) retired" in capsys.readouterr().out
+    assert db.resolve_merged_name(manifest, "Mike") == "Michael"
 
 
 # ── Alerting gate: skip vs. genuine failure ─────────────────────────

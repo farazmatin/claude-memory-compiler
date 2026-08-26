@@ -783,6 +783,75 @@ def cmd_people(args: argparse.Namespace) -> int:
     disconnected entities that no query finds together.
     """
     db.init_db()
+    if getattr(args, "repair_merges", False):
+        apply_value = getattr(args, "apply", False)
+        expected_digest = (getattr(args, "expected_digest", None) or "").strip()
+        if isinstance(apply_value, str):
+            if not expected_digest:
+                print(
+                    "--repair-merges --apply requires --expected-digest.",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                result = people_merge.apply_legacy_repair(
+                    Path(apply_value), expected_digest=expected_digest
+                )
+            except (ValueError, people_merge.PreviewDriftError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            print(
+                f"Legacy merge repair {result.digest}: "
+                f"{result.aliases_deleted} alias(es) retired, "
+                f"{result.suggestions_rewritten} suggestion(s) rewritten, "
+                f"{result.suggestions_cleared} cleared, "
+                f"{result.minutes_rewritten} minutes rewritten, "
+                f"{result.minutes_unchanged} unchanged, "
+                f"{result.minutes_missing} missing, "
+                f"{result.rewrite_conflicts} conflicting, "
+                f"{result.pending_rewrites} pending."
+            )
+            if result.already_applied:
+                print("This exact repair was already applied; only resumable jobs were checked.")
+            return 1 if result.rewrite_conflicts or result.pending_rewrites else 0
+
+        if apply_value is True:
+            print(
+                "--repair-merges --apply requires the preview artifact path.",
+                file=sys.stderr,
+            )
+            return 2
+        preview_to = getattr(args, "preview_to", None)
+        if not preview_to:
+            print(
+                "--repair-merges preview requires --preview-to PATH.",
+                file=sys.stderr,
+            )
+            return 2
+        proposed = people_merge.preview_legacy_repair(
+            excluded_aliases=getattr(args, "exclude_alias", ()) or ()
+        )
+        written = people_merge.write_legacy_repair_preview(
+            proposed, Path(preview_to)
+        )
+        print("Legacy merge repair preview:")
+        for alias, target in proposed.mappings:
+            print(f"  {alias!r} -> {target!r}")
+        print(
+            f"  {len(proposed.mappings)} candidate alias(es), "
+            f"{len(proposed.excluded_aliases)} excluded, "
+            f"{len(proposed.suggestion_updates)} suggestion rewrite(s), "
+            f"{len(proposed.proposed_clears)} proposed clear(s), "
+            f"{proposed.files_changed} file(s), "
+            f"{proposed.literal_matches} literal match(es), "
+            f"{len(proposed.missing_files)} missing, "
+            f"{len(proposed.conflicts)} warning(s).\n"
+            f"Preview: {written}\n"
+            f"Digest: {proposed.digest}"
+        )
+        print("Nothing was changed.")
+        return 0
+
     if getattr(args, "resume_merge_rewrites", False):
         result = people_merge.resume_pending_rewrites()
         print(
@@ -808,9 +877,15 @@ def cmd_people(args: argparse.Namespace) -> int:
             f"warnings: {len(proposed.conflicts)}\n"
             f"Digest: {proposed.digest}"
         )
-        if not getattr(args, "apply", False):
+        apply_value = getattr(args, "apply", False)
+        if not apply_value:
             print("Nothing was changed.")
             return 0
+        if isinstance(apply_value, str):
+            print(
+                "ordinary --merge uses --apply without a path.", file=sys.stderr
+            )
+            return 2
         expected_digest = (getattr(args, "expected_digest", None) or "").strip()
         if not expected_digest:
             print("--apply requires --expected-digest from the preview.", file=sys.stderr)
@@ -1077,8 +1152,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="preview folding one person into another",
     )
     p_people.add_argument(
-        "--apply", action="store_true",
-        help="apply --merge using the exact approved preview digest",
+        "--apply", nargs="?", const=True, metavar="PREVIEW_PATH",
+        help="apply --merge, or apply a legacy repair preview artifact path",
     )
     p_people.add_argument(
         "--expected-digest",
@@ -1087,6 +1162,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_people.add_argument(
         "--resume-merge-rewrites", action="store_true",
         help="resume hash-checked minutes rewrites left by an interrupted merge",
+    )
+    p_people.add_argument(
+        "--repair-merges", action="store_true",
+        help="preview or apply the one-time digest-bound legacy merge repair",
+    )
+    p_people.add_argument(
+        "--preview-to",
+        help="private JSON path for a non-mutating legacy repair preview",
+    )
+    p_people.add_argument(
+        "--exclude-alias", action="append", default=[],
+        help="exclude one legacy alias key from the repair preview (repeatable)",
     )
     p_people.set_defaults(func=cmd_people)
 
