@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 import pytest
@@ -651,3 +652,40 @@ def test_merge_reports_a_failed_atomic_replace_as_pending(
         "SELECT state FROM minute_rewrite_jobs"
     ).fetchone()["state"] == "pending"
     assert db.get_meeting(manifest, "m1").status == db.SPEAKERS_RESOLVED
+
+
+def test_atomic_replace_keeps_its_temporary_inside_the_windows_path_limit(
+    tmp_path, monkeypatch
+):
+    """A long minutes name must not push the temporary past MAX_PATH.
+
+    Real minutes filenames run to roughly 175 characters. Embedding that name
+    in the temporary alongside a 64-character job id took the path over the
+    Windows limit of 260, and Windows reports that as a bare "no such file",
+    so every long-named rewrite stalled as pending with no visible cause.
+    """
+    # Size the name so the file itself is legal but the old temporary, which
+    # appended a 64-character job id to it, would not have been.
+    stem_length = max(40, 250 - len(str(tmp_path)) - len(".md") - 1)
+    target = tmp_path / f"{'a' * stem_length}.md"
+    target.write_text("Alice owns Atlas.", encoding="utf-8")
+    job_id = "b" * 64
+    assert len(str(target.with_name(f".{target.name}.{job_id}.rewrite.tmp"))) > 260
+
+    seen: list[str] = []
+    real_replace = os.replace
+
+    def record(source, destination):
+        seen.append(str(source))
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(people_merge.os, "replace", record)
+
+    people_merge._atomic_replace(target, job_id, "Bob owns Atlas.")
+
+    assert target.read_text(encoding="utf-8") == "Bob owns Atlas."
+    assert len(seen) == 1
+    # The temporary is named for the job, not the file, so its length is
+    # bounded by the directory regardless of how long the minutes name is.
+    assert len(seen[0]) < len(str(tmp_path)) + 100
+    assert not [p for p in tmp_path.iterdir() if p.name.endswith(".rewrite.tmp")]

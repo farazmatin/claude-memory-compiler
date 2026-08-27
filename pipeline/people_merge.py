@@ -955,7 +955,14 @@ def _enqueue_rewrite_jobs(conn: sqlite3.Connection, plan: _MergePlan) -> None:
 
 
 def _atomic_replace(path: Path, job_id: str, content: str) -> None:
-    temporary = path.with_name(f".{path.name}.{job_id}.rewrite.tmp")
+    # Named for the job, not the file. A minutes name already runs to ~175
+    # characters, so embedding it here took the temporary past the Windows
+    # MAX_PATH limit of 260 on the longest meetings. Windows surfaces that as a
+    # bare "no such file", which reads like a missing minutes file rather than a
+    # path that was never legal, and the rewrite stalls as pending forever. The
+    # job id is unique and fixed-width, so the temporary stays bounded by its
+    # directory. It remains a sibling of the target, which os.replace requires.
+    temporary = path.with_name(f".{job_id}.rewrite.tmp")
     try:
         with temporary.open("wb") as handle:
             handle.write(content.encode("utf-8"))
