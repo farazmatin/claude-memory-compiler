@@ -10,7 +10,7 @@ deliberate constraint and it shapes the design:
 
 Providers are tried in priority order and fall through on failure, so a quota
 limit or a transient CLI error on the preferred provider does not stall the
-nightly batch.
+operator-started pipeline run.
 
 Prompts reach the CLIs on **stdin**, never as argv. A one-hour transcript is tens
 of thousands of tokens and would risk ARG_MAX as a command-line argument.
@@ -431,7 +431,7 @@ def complete(prompt: str, order: list[str] | None = None) -> str:
     """Send a prompt to the first provider that succeeds.
 
     Falls through on any failure - a quota limit or CLI hiccup on the preferred
-    provider must not stall a nightly batch that has already paid for
+    provider must not stall an operator-started run that has already paid for
     transcription.
     """
     global last_provider

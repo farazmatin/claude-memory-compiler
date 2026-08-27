@@ -231,7 +231,7 @@ CREATE TABLE IF NOT EXISTS open_questions (
 
 -- Inbox files already seen, keyed by identity rather than content. Lets ingest
 -- skip hashing a file it has already hashed: the inbox is never emptied (it is a
--- synced folder), so by year five a nightly run would otherwise re-read ~165 GB
+-- synced folder), so by year five a routine run would otherwise re-read ~165 GB
 -- just to rediscover known duplicates.
 CREATE TABLE IF NOT EXISTS seen_files (
     path        TEXT PRIMARY KEY,
@@ -304,7 +304,7 @@ CREATE TABLE IF NOT EXISTS speaker_matches (
 CREATE INDEX IF NOT EXISTS idx_speaker_matches_state ON speaker_matches(state);
 CREATE INDEX IF NOT EXISTS idx_speaker_matches_cluster ON speaker_matches(cluster_id);
 
--- Rebuilt nightly. One row per group of pending labels believed to be the same
+-- Rebuilt on demand. One row per group of pending labels believed to be the same
 -- person, and the unit the owner is actually asked about: a voice appearing in
 -- twelve meetings is one question, not twelve.
 CREATE TABLE IF NOT EXISTS voice_clusters (
@@ -1409,7 +1409,7 @@ def cluster_labels(conn: sqlite3.Connection, cluster_id: str) -> list[sqlite3.Ro
 
 
 def replace_clusters(conn: sqlite3.Connection, clusters: list[dict[str, object]]) -> None:
-    """Rebuild voice_clusters wholesale. Idempotent, so it is safe nightly."""
+    """Rebuild voice_clusters wholesale. Idempotent and safe on demand."""
     ts = now_iso()
     conn.execute("DELETE FROM voice_clusters")
     conn.execute("UPDATE speaker_matches SET cluster_id = NULL WHERE state = 'pending'")

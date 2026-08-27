@@ -17,28 +17,16 @@ recompilation, but never fed to the RAG index.
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
-import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Protocol
 
 from pipeline.config import (
-    ASR_BACKEND,
-    ASR_BATCH_SIZE,
-    ASR_COMPUTE_TYPE,
-    ASR_DEVICE,
-    ASR_LANGUAGE,
-    ASR_MODEL,
-    ENABLE_DIARIZATION,
     GLOSSARY_FILE,
-    HF_TOKEN,
     IMPLAUSIBLE_SPEAKER_COUNT,
     INITIAL_PROMPT_TOKEN_BUDGET,
-    MAX_SPEAKERS,
-    MIN_SPEAKERS,
     REPLICATE_API_TOKEN,
     TARGET_SAMPLE_RATE,
     TRANSCRIPTS_DIR,
@@ -75,7 +63,7 @@ class Transcript:
     def diarization_warning(self) -> str | None:
         """A warning when the speaker count looks like over-segmentation.
 
-        A high count is usually pyannote splitting one noisy speaker rather than a
+        A high count is usually the hosted diarizer splitting one noisy speaker rather than a
         real crowd, and it makes every downstream name unreliable. Surfaced rather
         than corrected: the fix is a bound or a better microphone, not a guess.
         """
@@ -129,10 +117,9 @@ class Transcript:
 
 
 class Backend(Protocol):
-    """Swappable ASR implementation.
+    """Remote ASR implementation contract.
 
-    The CPU constraint makes this the designed escape hatch: a paid ASR API or a
-    GPU model can replace WhisperX without any downstream stage noticing.
+    The product always uses the configured Replicate provider.
     """
 
     name: str
@@ -221,137 +208,9 @@ def build_initial_prompt(terms: list[str] | None = None) -> str:
     return prefix + ", ".join(kept) + "." if kept else ""
 
 
-# ── WhisperX backend ──────────────────────────────────────────────────
 
-class WhisperXBackend:
-    """WhisperX: faster-whisper for ASR, wav2vec2 for alignment, pyannote for
-    diarization, merged into one speaker-attributed transcript.
-
-    Defaults to large-v3-turbo rather than large-v3 because this runs on CPU:
-    large-v3 costs roughly 60-120 minutes per audio hour, which does not fit a
-    nightly batch of five meetings once diarization is added on top.
-    """
-
-    def __init__(
-        self,
-        model_name: str = ASR_MODEL,
-        device: str = ASR_DEVICE,
-        compute_type: str = ASR_COMPUTE_TYPE,
-        batch_size: int = ASR_BATCH_SIZE,
-        language: str = ASR_LANGUAGE,
-        diarize: bool = ENABLE_DIARIZATION,
-        min_speakers: int | None = MIN_SPEAKERS,
-        max_speakers: int | None = MAX_SPEAKERS,
-    ) -> None:
-        self.model_name = model_name
-        self.device = device
-        self.compute_type = compute_type
-        self.batch_size = batch_size
-        self.language = language
-        self.diarize = diarize
-        self.min_speakers = min_speakers
-        self.max_speakers = max_speakers
-        self.name = f"whisperx:{model_name}"
-
-    def transcribe(self, audio_path: Path, meeting_id: str, initial_prompt: str) -> Transcript:
-        # Imported lazily: whisperx pulls in torch and CUDA libraries, and the
-        # manifest/minutes/index stages must remain usable without them.
-        import whisperx  # type: ignore[import-not-found]
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            wav = normalize_audio(audio_path, Path(tmpdir) / "audio.wav")
-            audio = whisperx.load_audio(str(wav))
-            duration = len(audio) / TARGET_SAMPLE_RATE
-
-            asr_options = {"initial_prompt": initial_prompt} if initial_prompt else None
-            model = whisperx.load_model(
-                self.model_name,
-                self.device,
-                compute_type=self.compute_type,
-                language=self.language,
-                asr_options=asr_options,
-                # CPU inference is thread-bound; the default of 4 leaves most of
-                # an always-on server idle.
-                threads=os.cpu_count() or 4,
-            )
-            result = model.transcribe(audio, batch_size=self.batch_size)
-            language = result.get("language", self.language)
-
-            # Alignment: refines Whisper's coarse segment times into per-word
-            # timestamps, which is what lets minutes cite `#t=1432`.
-            try:
-                align_model, metadata = whisperx.load_align_model(
-                    language_code=language, device=self.device
-                )
-                result = whisperx.align(
-                    result["segments"], align_model, metadata, audio, self.device
-                )
-            except (ValueError, KeyError) as exc:
-                # No alignment model for this language. Segment-level times still
-                # work; word-level anchors just get coarser.
-                print(f"    alignment skipped: {exc}")
-
-            if self.diarize:
-                result = self._diarize(whisperx, audio, result)
-
-        return Transcript(
-            meeting_id=meeting_id,
-            model=self.name,
-            language=language,
-            duration_sec=duration,
-            segments=_segments_from_whisperx(result),
-        )
-
-    def _diarize(self, whisperx, audio, result: dict) -> dict:
-        """Attach speaker labels. Non-fatal: a transcript without speakers is
-        still worth keeping, and stage 3 will leave labels unresolved rather
-        than inventing owners for action items."""
-        if not HF_TOKEN:
-            print(
-                "    diarization skipped: no HF_TOKEN. pyannote is gated - set a "
-                "HuggingFace read token and accept the terms for "
-                "pyannote/speaker-diarization-3.1 and pyannote/segmentation-3.0."
-            )
-            return result
-
-        try:
-            from whisperx.diarize import DiarizationPipeline  # type: ignore
-
-            try:
-                pipeline = DiarizationPipeline(token=HF_TOKEN, device=self.device)
-            except TypeError:
-                # Older whisperx used use_auth_token= for the same argument.
-                pipeline = DiarizationPipeline(use_auth_token=HF_TOKEN, device=self.device)
-
-            # Bounds help materially when the meeting shape is known: pyannote
-            # over-segments a noisy 1:1 into three or four speakers, and
-            # under-counts large meetings with overlapping speech.
-            kwargs: dict[str, int] = {}
-            if self.min_speakers:
-                kwargs["min_speakers"] = self.min_speakers
-            if self.max_speakers:
-                kwargs["max_speakers"] = self.max_speakers
-            try:
-                diarize_segments = pipeline(audio, **kwargs)
-            except TypeError:
-                # Older pipelines do not accept the bounds; proceed without them
-                # rather than losing diarization entirely.
-                if kwargs:
-                    print("    speaker bounds unsupported by this pyannote version")
-                diarize_segments = pipeline(audio)
-
-            assign = getattr(whisperx, "assign_word_speakers", None)
-            if assign is None:
-                from whisperx.diarize import assign_word_speakers as assign  # type: ignore
-            return assign(diarize_segments, result)
-
-        except Exception as exc:
-            print(f"    diarization failed ({type(exc).__name__}: {exc})")
-            return result
-
-
-def _segments_from_whisperx(result: dict) -> list[Segment]:
-    """Convert whisperx output into our model, tolerating missing fields.
+def _segments_from_provider_output(result: dict) -> list[Segment]:
+    """Convert remote-provider output into our model, tolerating missing fields.
 
     Alignment can leave individual words without timestamps, and un-aligned runs
     can leave segments without them too, so every numeric field is treated as
@@ -473,21 +332,10 @@ def save_transcript(transcript: Transcript, speaker_names: dict[str, str] | None
 
 
 def default_backend() -> Backend:
-    """Select the active ASR backend.
-
-    Replicate is the default. Local WhisperX is selected only by an explicit
-    MMC_ASR_BACKEND=whisperx opt-in; a missing token never changes providers.
-    """
-    if ASR_BACKEND == "whisperx":
-        return WhisperXBackend()
-    if ASR_BACKEND not in {"replicate", "auto"}:
-        raise RuntimeError(
-            f"unknown MMC_ASR_BACKEND={ASR_BACKEND!r}; use 'replicate' or 'whisperx'"
-        )
+    """Return the required remote Replicate transcription backend."""
     if not REPLICATE_API_TOKEN:
         raise RuntimeError(
-            "REPLICATE_API_TOKEN is required for transcription. Set it in .env; "
-            "local WhisperX is never selected implicitly."
+            "REPLICATE_API_TOKEN is required for transcription."
         )
     from pipeline.replicate_asr import ReplicateBackend
 

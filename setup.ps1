@@ -145,7 +145,7 @@ if (Test-Path ".env") {
 } else {
     Copy-Item ".env.example" ".env"
 
-    # Generate the two secrets that can be auto-generated. HF_TOKEN cannot be.
+    # Generate the secrets that can be auto-generated.
     $envContent = Get-Content ".env" -Raw
     $genSecret = { python -c "import secrets; print(secrets.token_urlsafe(32))" }
 
@@ -174,8 +174,7 @@ if ($envText -notmatch "(?m)^MMC_OWNER_NAME=") {
 # ── 3. Python dependencies ────────────────────────────────────────────
 
 Write-Step "Installing Python dependencies"
-Write-Warn "the ASR extra pulls torch - this can take several minutes"
-uv sync --extra asr --extra dev
+uv sync --extra dev
 Write-Ok "dependencies installed"
 
 # ── 4. Services ───────────────────────────────────────────────────────
@@ -220,17 +219,7 @@ if ($doctorExit -eq 0) {
     Write-Host "Setup complete.`n" -ForegroundColor Green
 } else {
     Write-Host "Setup done, but preflight found problems.`n" -ForegroundColor Yellow
-    Write-Host "Almost always this is the HuggingFace token. Two steps:`n"
-    Write-Host "  1. Create a " -NoNewline
-    Write-Host "read" -ForegroundColor White -NoNewline
-    Write-Host " token:"
-    Write-Host "     https://huggingface.co/settings/tokens" -ForegroundColor DarkGray
-    Write-Host ""
-    Write-Host "  2. Accept BOTH licences (the token alone is not enough):"
-    Write-Host "     https://hf.co/pyannote/speaker-diarization-3.1" -ForegroundColor DarkGray
-    Write-Host "     https://hf.co/pyannote/segmentation-3.0" -ForegroundColor DarkGray
-    Write-Host ""
-    Write-Host "  3. Paste the token into .env as HF_TOKEN=hf_..."
+    Write-Host "Configure REPLICATE_API_TOKEN in .env for remote transcription."
     Write-Host ""
     Write-Host "Then re-run: " -NoNewline
     Write-Host "uv run pipeline doctor" -ForegroundColor White
@@ -240,7 +229,7 @@ if ($doctorExit -eq 0) {
 Write-Host "Your first meeting:`n" -ForegroundColor White
 Write-Host "  Copy-Item ~\some-recording.m4a inbox\"
 Write-Host "  uv run pipeline run`n"
-Write-Host "Expect ~30-50 min for a one-hour recording on CPU. Then:`n"
+Write-Host "Remote transcription time depends on the configured Replicate model. Then:`n"
 Write-Host "  Get-Content minutes\*.md                         # read what it wrote"
 Write-Host "  uv run pipeline query `"what did we decide?`"`n"
 Write-Host "Full guide: docs\USER_GUIDE.md`n" -ForegroundColor White

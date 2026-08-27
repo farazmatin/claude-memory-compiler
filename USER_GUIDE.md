@@ -1,216 +1,87 @@
-# User Guide: Automatic Meeting Capture
+# User Guide: Meeting Capture
 
-This system records meetings on your Pixel, stores the original audio privately
-in Google Drive, and compiles the recording into searchable minutes during the
-scheduled run. The scheduled path must use remote/subscription services only;
-it must not load a local model of any kind.
-It does not delete or alter anything in Google Drive.
+Record meetings on your Pixel, keep the original audio private in Google Drive,
+and process recordings when you choose.
 
-## Your normal routine
+## Normal routine
 
-1. Open **Easy Voice Recorder Pro** and record with the Pixel's built-in microphone.
+1. Record with Easy Voice Recorder Pro.
 2. Stop the recording when the meeting ends.
-3. Nothing else is required: the app uploads the finished audio to Drive, and the
-   computer collects and processes it during the scheduled run when the nightly
-   policy gate is compliant.
+3. Confirm the completed audio file appears in your private Drive folder.
+4. On the computer, start processing when ready.
 
-The first time you set it up, complete the sections below.
+## Drive folders
 
-## 1. Set up Drive folders
+Create private Drive folders:
 
-Create two private folders in your personal Google Drive:
+- Easy Voice Recorder for new recordings.
+- backfill-approved for a deliberate historical import.
 
-- `Easy Voice Recorder` — all new Easy Voice Recorder Pro recordings.
-- `backfill-approved` — a temporary one-time folder for historical Pixel Recorder files.
+Copy each folder ID from the URL and keep both folders private.
 
-Open each folder in a browser and copy the part of its URL after `/folders/`.
-Those strings are the two folder IDs used below. Do not share either folder.
+## Authorize the computer
 
-## 2. Easy Voice Recorder Pro settings
+1. Create a Google Cloud Desktop OAuth client with Drive API enabled.
+2. Save its client JSON outside the repository.
+3. Set the permanent user settings:
 
-Install **Easy Voice Recorder Pro** from Google Play. Its Pro feature set includes
-automatic upload of new recordings to Google Drive. [Google Play listing](https://play.google.com/store/apps/details?id=com.coffeebeanventures.easyvoicerecorder)
+    [Environment]::SetEnvironmentVariable("MMC_DRIVE_FUTURE_FOLDER_ID", "future-folder-id", "User")
+    [Environment]::SetEnvironmentVariable("MMC_DRIVE_BACKFILL_FOLDER_ID", "backfill-folder-id", "User")
+    [Environment]::SetEnvironmentVariable("MMC_DRIVE_CREDENTIALS", "$env:LOCALAPPDATA\MeetingMinutesCompiler\drive-client.json", "User")
 
-In the app:
+4. In a new PowerShell window:
 
-1. Open **Settings** and select the **Meeting** preset, or use the equivalent
-   recording settings screen.
-2. Set the format to **MP4/AAC**. It balances clear speech and small files; the
-   pipeline accepts it directly.
-3. In the Pro cloud/automatic-upload setting, connect the same Google account
-   that owns `Easy Voice Recorder`.
-4. Select `Easy Voice Recorder` as the destination and enable **automatic upload
-   for new recordings**.
-5. Set upload to Wi-Fi when available. The app retries later if a meeting ends
-   away from Wi-Fi; the computer picks it up on the next nightly run.
-6. Make one 20-second test recording. Confirm the resulting audio file appears in
-   `Easy Voice Recorder` before relying on automation.
+    uv sync --extra dev
+    uv run pipeline init
+    uv run pipeline auth-drive
 
-App labels can vary slightly by version. The required outcome is one completed
-MP4/AAC file per recording in `Easy Voice Recorder`, uploaded without using the
-Pixel Recorder share menu.
+The browser grants read-only Drive access. Keep the client and token files
+outside the repository.
 
-## 3. Authorize the computer
+## Process recordings
 
-1. In Google Cloud Console, create a project, enable **Google Drive API**, and
-   create an **OAuth client ID** of type **Desktop app**.
-2. Download the client JSON and save it outside this repository, for example:
-   `%LOCALAPPDATA%\MeetingMinutesCompiler\drive-client.json`.
-3. In PowerShell, set the permanent user settings. Replace the two folder IDs:
+Configure REPLICATE_API_TOKEN in .env. Then check capture without mutation:
 
-```powershell
-[Environment]::SetEnvironmentVariable("MMC_DRIVE_FUTURE_FOLDER_ID", "future-folder-id", "User")
-[Environment]::SetEnvironmentVariable("MMC_DRIVE_BACKFILL_FOLDER_ID", "backfill-folder-id", "User")
-[Environment]::SetEnvironmentVariable(
-  "MMC_DRIVE_CREDENTIALS",
-  "$env:LOCALAPPDATA\MeetingMinutesCompiler\drive-client.json",
-  "User"
-)
-```
+    uv run pipeline capture --dry-run
 
-4. Open a new PowerShell window in this project and run:
+If the check reports authorization failure, run pipeline auth-drive and complete
+browser sign-in. When the preview is correct, process the ready recordings:
 
-```powershell
-uv sync
-uv run pipeline init
-uv run pipeline auth-drive
-```
+    uv run pipeline run --owner "Your Name"
+    uv run pipeline status
 
-The browser sign-in grants read-only Drive access. The refresh token stays outside
-the repository at `%LOCALAPPDATA%\MeetingMinutesCompiler\drive-token.json`.
+Replicate performs transcription remotely. Codex, Claude, and Antigravity
+subscription CLIs compile meeting meaning after transcription.
 
-## 4. Import existing Pixel Recorder audio
+## Historical import
 
-Pixel Recorder backup lives at `recorder.google.com`; Google documents audio-file
-export as a deliberate share action. [Pixel Recorder sharing](https://support.google.com/pixelphone/answer/16267696?hl=en)
+Place only approved historical audio in backfill-approved. Preview and process:
 
-On the Pixel, select only recordings dated **June 9, 2026 or later** and export
-their audio files to `backfill-approved`. Do not export older recordings.
+    uv run pipeline capture --dry-run
+    uv run pipeline run --owner "Your Name"
+    uv run pipeline capture --complete-backfill
 
-Run:
+Resolve ambiguous historical filenames with an ISO date before processing. Do not
+complete the backfill until the approved set is fully processed.
 
-```powershell
-uv run pipeline capture --dry-run
-uv run pipeline run --owner "Your Name"
-uv run pipeline capture --complete-backfill
-```
+## Review
 
-The dry run must show pre-June 9 files as excluded and date-less backfill files
-as ambiguous. Resolve ambiguous files by renaming them with an ISO date such as
-`2026-06-09T1100_customer-review.m4a`, then upload again. Only run
-`--complete-backfill` after the approved batch is fully processed.
+Open the local dashboard:
 
-## 5. End-to-end functional test
+    .\scripts\open-dashboard.ps1 -Port 8765
 
-Use a new 20-second test recording with a unique name, such as
-`2026-08-12T1100_capture-test`.
-
-Before the full test, make sure the configured remote ASR and graph-storage
-services are available:
-
-```powershell
-uv sync --extra asr
-docker compose up -d
-```
-
-1. Record and stop it in Easy Voice Recorder Pro.
-2. Confirm the audio appears in `Easy Voice Recorder` in Drive.
-3. On the computer, preview without changing local files:
-
-```powershell
-uv run pipeline capture --dry-run
-```
-
-4. Collect and process it:
-
-```powershell
-uv run pipeline capture
-uv run pipeline ingest
-uv run pipeline transcribe --limit 1
-uv run pipeline speakers --owner "Your Name" --limit 1
-uv run pipeline minutes --limit 1
-uv run pipeline graph-sync
-uv run pipeline status
-```
-
-For speaker labels, identity resolution, manual overrides, and new-guest
-handling, see [SPEAKER_GUIDE.md](SPEAKER_GUIDE.md).
-
-Success means: Drive still has the original recording; `pipeline status` shows
-the meeting advanced through the stages; `transcripts/` and `minutes/` contain
-the artifacts; and the local `audio/` copy is removed after transcription. If
-transcription is retried later, the system downloads the unchanged Drive source
-again.
-
-## 6. Automate the overnight run
-
-Install the Windows scheduled task once:
-
-```powershell
-.\scripts\install-nightly-task.ps1 -Owner "Your Name"
-```
-
-It runs at 1:00 a.m., starts after a missed time when the PC is available, and
-does not start a second run while the first is still active. Check progress with:
-
-```powershell
-uv run pipeline status
-uv run pipeline capture --dry-run
-```
-
-The dry run checks Drive authorization without changing local files. If it
-reports an expired or unauthorized token, run `uv run pipeline auth-drive` and
-complete the browser sign-in. Inspect the Scheduled Task's last result as well:
-a configured task is not proof that capture ran. Do not schedule a full pipeline
-run while it can invoke the legacy local pyannote/torch voice-enrollment path;
-the product policy permits no local model (including speaker embedding,
-diarization, or ASR) overnight.
-
-## 7. Review minutes and search the archive
-
-Open the local Meeting Memory dashboard after a run:
-
-```powershell
-.\scripts\open-dashboard.ps1
-```
-
-The browser shows every meeting, its compiled minutes, a link back to the
-original private Drive audio, and any speaker-review signal. Enter a question
-such as “What did we decide about the Drive capture approach?” to traverse the
-derived meeting graph and bounded compiled-minute context used by `pipeline query`.
-
-The launcher keeps the dashboard running in the background, so closing the
-PowerShell window does not close the browser page. To start it automatically
-after every Windows sign-in, install the one-time user-level sign-in setup:
-
-```powershell
-.\scripts\install-dashboard-task.ps1
-```
-
-It uses a Scheduled Task when Windows permits it and otherwise installs a Startup
-shortcut for the current user. Neither option requires administrator access.
-
-The dashboard is authenticated, loopback-only, and defaults to
-`http://127.0.0.1:8765`. It does not upload or delete recordings. It does offer
-explicit speaker-review actions backed by the pipeline; use those rather than
-editing generated minutes or records directly. If the default port is in use,
-choose another unused loopback port:
-
-```powershell
-.\scripts\open-dashboard.ps1 -Port 8767
-```
-
-If a meeting says **Speaker review** or **No diarization**, the minutes are still
-available, but ownership should be checked before relying on assigned actions.
-Follow [SPEAKER_GUIDE.md](SPEAKER_GUIDE.md) for the one-time identity and new
-speaker process.
+The authenticated loopback dashboard shows compiled minutes, Drive links,
+speaker-review work, and bounded context search. Use dashboard actions for
+speaker correction; do not edit generated minutes directly.
 
 ## Troubleshooting
 
-- **Drive is not authorized:** run `uv run pipeline auth-drive` again.
-- **No Drive files found:** verify the folder ID, correct Google account, and that
-  Easy Voice Recorder Pro uploaded an audio file rather than only a share link.
-- **Backfill file is ambiguous:** rename it with an ISO timestamp and upload it
-  again; the system deliberately will not guess a historical date.
-- **Drive source changed:** upload the changed recording as a new file. The system
-  refuses to re-transcribe different bytes under the old meeting record.
+- Drive authorization error: run pipeline auth-drive.
+- No Drive files: verify folder ID, Google account, and completed upload.
+- Replicate configuration error: configure REPLICATE_API_TOKEN, then run
+  pipeline doctor.
+- Missing speaker attribution: use the speaker-review workflow before relying
+  on an assigned action.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for repository responsibilities
+and the Product Manager context boundary.

@@ -20,8 +20,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 # Load .env before any os.environ.get below reads a default. python-dotenv was
 # already a declared dependency but nothing called it, so .env configured only
 # docker compose and never the pipeline: MMC_LIGHTRAG_API_KEY stayed empty and
-# requests went out unauthenticated, and HF_TOKEN stayed empty so diarization
-# silently produced no speakers. Real environment variables still win, which is
+# requests went out unauthenticated. Real environment variables still win, which is
 # what a server deployment needs.
 load_dotenv(ROOT_DIR / ".env", override=False)
 
@@ -62,21 +61,11 @@ AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".opus", ".
 TIMEZONE = os.environ.get("MMC_TIMEZONE", "America/Toronto")
 TZ = ZoneInfo(TIMEZONE)
 
-# ── ASR ───────────────────────────────────────────────────────────────
-# large-v3-turbo, not large-v3. On CPU, large-v3 costs ~60-120 min per audio
-# hour; with diarization on top that is ~9 h/day for 5 meetings, which does not
-# fit an overnight batch. Turbo is ~4-8x faster for a modest accuracy cost on
-# English. Override to "large-v3" if this ever runs on a GPU.
-ASR_MODEL = os.environ.get("MMC_ASR_MODEL", "large-v3-turbo")
-ASR_DEVICE = os.environ.get("MMC_ASR_DEVICE", "cpu")
-ASR_COMPUTE_TYPE = os.environ.get("MMC_ASR_COMPUTE_TYPE", "int8")
+# ── Remote transcription ──────────────────────────────────────────────
+# Replicate is the only supported ASR backend. There is intentionally no local
+# device, model, compute-type, or fallback configuration.
 ASR_BATCH_SIZE = int(os.environ.get("MMC_ASR_BATCH_SIZE", "8"))
 ASR_LANGUAGE = os.environ.get("MMC_ASR_LANGUAGE", "en")
-
-# ASR backend selection: Replicate is the default. Local WhisperX is available
-# only through the explicit "whisperx" opt-in; a missing cloud token must never
-# silently start a local model.
-ASR_BACKEND = os.environ.get("MMC_ASR_BACKEND", "replicate").lower().strip()
 
 # Replicate serverless GPU configuration
 REPLICATE_API_TOKEN = (
@@ -127,9 +116,9 @@ VOICE_MIN_ENROLL_MEETINGS = int(os.environ.get("MMC_VOICE_MIN_ENROLL_MEETINGS", 
 # auto-match threshold: a contaminated cluster enrolls a poisoned voiceprint from
 # a single confirmation, which is the most damaging wrong answer available.
 VOICE_CLUSTER_THRESHOLD = float(os.environ.get("MMC_VOICE_CLUSTER", "0.72"))
-# Embeddings from different models are not comparable. Matching filters on this,
-# and changing it means re-enrollment rather than nonsense similarities.
-VOICE_MODEL = os.environ.get("MMC_VOICE_MODEL", "pyannote/wespeaker-voxceleb-resnet34-LM")
+# Existing vector records are retained for audit only. New enrollment is retired,
+# so the active namespace deliberately contains no locally generated vectors.
+VOICE_VECTOR_NAMESPACE = os.environ.get("MMC_VOICE_VECTOR_NAMESPACE", "historical")
 
 # Retained voice clips, so speakers stay labellable by ear after the source audio
 # is deleted. ~30 KB per speaker against 2-4 MB per audio-hour.
@@ -162,9 +151,9 @@ def _optional_int(name: str) -> int | None:
         return None
 
 
-# Speaker count bounds passed to pyannote. Unset means "let it decide", which is
-# right for a mixed calendar. Setting them helps materially when you know the
-# shape: pyannote over-segments a two-person 1:1 into three or four speakers when
+# Speaker count bounds passed to the hosted diarizer. Unset means "let it decide",
+# which is right for a mixed calendar. Setting them helps materially when you know
+# the shape: a hosted diarizer can over-segment a two-person 1:1 into three or four speakers when
 # audio is noisy, and under-counts a large meeting with overlapping speech.
 # Diarization accuracy is the main lever on whether action items get correct
 # owners, so a known bound is worth supplying.
@@ -174,16 +163,13 @@ MAX_SPEAKERS = _optional_int("MMC_MAX_SPEAKERS")
 # Above this, warn: the count is more likely over-segmentation than a real crowd,
 # and speaker names will be unreliable.
 IMPLAUSIBLE_SPEAKER_COUNT = int(os.environ.get("MMC_IMPLAUSIBLE_SPEAKERS", "8"))
-# pyannote models are gated: needs a HF read token AND manual acceptance of the
-# terms for pyannote/speaker-diarization-3.1 and pyannote/segmentation-3.0.
-# This fails at runtime, not at install time.
-HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+# Passed only to the remote ASR provider when its selected hosted model requires
+# it. It is never used to load a model in this process.
+REMOTE_ASR_HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
 
 
 # ── LLM providers ─────────────────────────────────────────────────────
-# Priority order, highest first. Tried in sequence, falling through on failure,
-# so a quota limit on the preferred provider does not stall a nightly batch that
-# has already paid for transcription.
+# Priority order, highest first. Tried in sequence on an operator-started run.
 #
 # All providers are subscription-backed rather than metered APIs. They author
 # minutes, entities, relations, and answers. LightRAG is graph storage and
@@ -223,9 +209,10 @@ LLM_TIMEOUT_SEC = float(os.environ.get("MMC_LLM_TIMEOUT", "900"))
 OWNER_NAME = os.environ.get("MMC_OWNER_NAME", "")
 
 # ── Alerting ──────────────────────────────────────────────────────────
-# Command invoked when the nightly batch fails, with the summary on stdin and
-# {subject} substituted. A command rather than built-in email/webhook support:
-# whatever the server already has beats a second notification stack.
+# Command invoked when an operator-started pipeline run fails, with the summary
+# on stdin and {subject} substituted. A command rather than built-in
+# email/webhook support: whatever the server already has beats a second
+# notification stack.
 #   MMC_ALERT_COMMAND=curl -s -d @- https://ntfy.sh/my-topic
 #   MMC_ALERT_COMMAND=mail -s "{subject}" me@example.com
 ALERT_COMMAND = os.environ.get("MMC_ALERT_COMMAND", "")

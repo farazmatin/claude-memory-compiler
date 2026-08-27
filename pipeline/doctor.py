@@ -19,23 +19,17 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import sys
 from dataclasses import dataclass
 
 from pipeline import db
 from pipeline.config import (
-    ASR_BACKEND,
-    ASR_DEVICE,
-    ASR_MODEL,
     AUDIO_DIR,
     DASHBOARD_HOST,
     DB_PATH,
     DRIVE_CREDENTIALS_FILE,
     DRIVE_SCOPES,
     DRIVE_TOKEN_FILE,
-    ENABLE_DIARIZATION,
     GLOSSARY_FILE,
-    HF_TOKEN,
     INBOX_DIR,
     LIGHTRAG_API_KEY,
     LIGHTRAG_URL,
@@ -44,7 +38,6 @@ from pipeline.config import (
     REPLICATE_API_TOKEN,
     REPLICATE_MODEL,
     TRANSCRIPTS_DIR,
-    VOICE_MIN_ENROLL_MEETINGS,
 )
 
 OK = "ok"
@@ -86,139 +79,60 @@ def check_ffmpeg() -> list[Check]:
 
 
 def check_asr() -> list[Check]:
-    """ASR backend, with local execution available only by explicit opt-in."""
+    """Required remote Replicate ASR backend."""
     checks = []
-
-    use_replicate = ASR_BACKEND != "whisperx"
-
-    if use_replicate:
-        if not REPLICATE_API_TOKEN:
-            return [
-                Check(
-                    "asr backend",
-                    FAIL,
-                    "REPLICATE_API_TOKEN is unset; local ASR will not start implicitly",
-                    "add REPLICATE_API_TOKEN=r8_... to .env",
-                )
-            ]
-        # Verify Replicate token and account reachability
-        try:
-            import httpx
-
-            resp = httpx.get(
-                "https://api.replicate.com/v1/account",
-                headers={"Authorization": f"Bearer {REPLICATE_API_TOKEN}"},
-                timeout=10.0,
+    if not REPLICATE_API_TOKEN:
+        return [
+            Check(
+                "asr backend",
+                FAIL,
+                "REPLICATE_API_TOKEN is unset; no transcription backend is available",
+                "add REPLICATE_API_TOKEN=r8_... to .env",
             )
-            if resp.status_code == 200:
-                username = resp.json().get("username", "authenticated")
-                checks.append(
-                    Check(
-                        "asr backend",
-                        OK,
-                        f"Replicate GPU ({REPLICATE_MODEL}) — account: @{username} (~1-2m/meeting)",
-                    )
-                )
-            else:
-                checks.append(
-                    Check(
-                        "asr backend",
-                        FAIL,
-                        f"Replicate auth error ({resp.status_code}): {resp.text[:60]}",
-                        "check REPLICATE_API_TOKEN at replicate.com/account/api-tokens",
-                    )
-                )
-        except Exception as exc:
+        ]
+    try:
+        import httpx
+
+        resp = httpx.get(
+            "https://api.replicate.com/v1/account",
+            headers={"Authorization": f"Bearer {REPLICATE_API_TOKEN}"},
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            username = resp.json().get("username", "authenticated")
             checks.append(
                 Check(
                     "asr backend",
-                    WARN,
-                    f"Replicate token set; connectivity check failed ({exc})",
-                    "verify internet access to api.replicate.com",
+                    OK,
+                    f"Replicate ({REPLICATE_MODEL}) — account: @{username}",
                 )
             )
-        return checks
-
-    # Local WhisperX check
-    try:
-        import whisperx  # noqa: F401
-
-        checks.append(Check("whisperx", OK, "importable"))
-    except ImportError as exc:
-        return [
-            Check(
-                "whisperx",
-                FAIL,
-                f"not importable: {exc}",
-                "uv sync --extra asr OR set REPLICATE_API_TOKEN in .env",
+        else:
+            checks.append(
+                Check(
+                    "asr backend",
+                    FAIL,
+                    f"Replicate auth error ({resp.status_code}): {resp.text[:60]}",
+                    "check REPLICATE_API_TOKEN at replicate.com/account/api-tokens",
+                )
             )
-        ]
-
-    if ASR_DEVICE == "cpu" and ASR_MODEL == "large-v3":
+    except Exception as exc:
         checks.append(
             Check(
-                "asr model",
+                "asr backend",
                 WARN,
-                "large-v3 on CPU costs ~1.5-2.5 h per meeting with diarization; "
-                "five a day will not fit a night",
-                "unset MMC_ASR_MODEL to use large-v3-turbo, or configure REPLICATE_API_TOKEN",
+                f"Replicate token set; connectivity check failed ({exc})",
+                "verify internet access to api.replicate.com",
             )
         )
-    else:
-        checks.append(Check("asr model", OK, f"{ASR_MODEL} on {ASR_DEVICE} (local CPU)"))
     return checks
 
 
 def check_diarization() -> list[Check]:
-    """pyannote is gated: a token AND manual acceptance of two model licences.
-
-    This is the single most common silent degradation - without it you get
-    transcripts with no speaker attribution, which means action items with no
-    owners, and the only signal is a printed warning mid-batch.
-    """
-    use_replicate = ASR_BACKEND != "whisperx"
-    if use_replicate:
-        return [
-            Check(
-                "diarization",
-                OK,
-                "handled serverless on Replicate GPU (pyannote embedded in model)",
-            )
-        ]
-
-    if not ENABLE_DIARIZATION:
-        return [Check("diarization", WARN, "disabled - action items will have no owners")]
-    if not HF_TOKEN:
-        return [
-            Check(
-                "diarization",
-                FAIL,
-                "HF_TOKEN unset - diarization will be skipped silently",
-                "set HF_TOKEN and accept the terms for "
-                "pyannote/speaker-diarization-3.1 and pyannote/segmentation-3.0",
-            )
-        ]
-
-    # A token proves nothing about licence acceptance, which is the part people
-    # miss. Try to actually load the gated config.
-    try:
-        from huggingface_hub import HfApi
-
-        HfApi().model_info("pyannote/speaker-diarization-3.1", token=HF_TOKEN)
-        return [Check("diarization", OK, "token valid, gated model reachable")]
-    except ImportError:
-        return [
-            Check("diarization", WARN, "HF_TOKEN set; cannot verify gated access here")
-        ]
-    except Exception as exc:
-        return [
-            Check(
-                "diarization",
-                FAIL,
-                f"gated model not reachable: {type(exc).__name__}",
-                "accept the licence at hf.co/pyannote/speaker-diarization-3.1",
-            )
-        ]
+    """Diarization is supplied by the configured remote ASR service."""
+    if not REPLICATE_API_TOKEN:
+        return [Check("diarization", WARN, "unavailable until Replicate is configured")]
+    return [Check("diarization", OK, "supplied remotely with transcription")]
 
 
 def check_providers() -> list[Check]:
@@ -405,7 +319,7 @@ def check_postgres() -> list[Check]:
 
     Without it, LightRAG silently falls back to file-based storage which does
     not hold thousands of documents. This is the most common undetected failure
-    after HF_TOKEN: everything appears to work, but the index lives in
+    after a configuration error: everything appears to work, but the graph store lives in
     throwaway JSON files instead of the durable pgvector tables.
     """
     if not shutil.which("docker"):
@@ -430,10 +344,9 @@ def check_postgres() -> list[Check]:
 
 
 def check_drive() -> list[Check]:
-    """Google Drive OAuth credentials for nightly audio capture.
+    """Google Drive OAuth credentials for on-demand audio capture.
 
-    Drive capture is optional - the pipeline works with local inbox drops - but
-    the nightly unattended mode depends on it.
+    Drive capture is optional; the pipeline also accepts local inbox drops.
     """
     checks = []
     if DRIVE_CREDENTIALS_FILE.exists():
@@ -494,46 +407,6 @@ def check_drive() -> list[Check]:
     return checks
 
 
-def check_nightly_task() -> list[Check]:
-    """Windows Scheduled Task for unattended nightly runs.
-
-    Only checked on Windows; other platforms use cron, which is out of scope.
-    """
-    if sys.platform != "win32":
-        return []  # Not applicable on non-Windows
-
-    task_name = "Meeting Minutes Compiler - Nightly"
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             f'Get-ScheduledTask -TaskName "{task_name}" -ErrorAction Stop '
-             f'| Select-Object -ExpandProperty State'],
-            capture_output=True, text=True, timeout=10, check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return [Check("nightly task", WARN, f"could not check: {type(exc).__name__}")]
-
-    if result.returncode != 0:
-        return [
-            Check(
-                "nightly task", WARN,
-                "not installed - pipeline will not run automatically",
-                'run: .\\scripts\\install-nightly-task.ps1 -Owner "Your Name"',
-            )
-        ]
-
-    state = result.stdout.strip()
-    if state == "Ready":
-        return [Check("nightly task", OK, "scheduled and ready")]
-    return [
-        Check(
-            "nightly task", WARN,
-            f"exists but state is '{state}'",
-            "check Task Scheduler for errors",
-        )
-    ]
-
-
 def check_dashboard_auth() -> list[Check]:
     """The dashboard's exposure matches its credentials."""
     from pipeline import dashboard_auth
@@ -560,11 +433,7 @@ def check_dashboard_auth() -> list[Check]:
 
 
 def check_alerting() -> list[Check]:
-    """A nightly failure has to reach a human somehow.
-
-    Without this the only signal is a non-zero exit code and `pipeline status` -
-    which is exactly how 99 failed transcribe runs went unnoticed.
-    """
+    """Optional notification for failures in an operator-started run."""
     from pipeline import alert
 
     command = getattr(alert, "ALERT_COMMAND", "") or ""
@@ -573,12 +442,11 @@ def check_alerting() -> list[Check]:
             Check(
                 "alerting",
                 WARN,
-                "MMC_ALERT_COMMAND unset - a failed nightly batch notifies nobody",
+                "MMC_ALERT_COMMAND unset - failures are reported only to the initiating operator",
                 'set MMC_ALERT_COMMAND in .env, e.g. curl -s -d @- https://ntfy.sh/your-topic',
             )
         ]
-    # A malformed command should surface here, not at 3am when it is also
-    # swallowing the failure it was meant to report.
+    # A malformed command should surface here, before it can hide a failure.
     try:
         parts = alert.split_command(command)
     except Exception as exc:
@@ -595,67 +463,10 @@ def check_alerting() -> list[Check]:
     return [Check("alerting", OK, f"via {parts[0]}")]
 
 
-def check_voice_enrollment() -> list[Check]:
-    """Whether voice recognition can actually accumulate voiceprints."""
-    checks: list[Check] = []
-    try:
-        import pyannote.audio  # noqa: F401
-    except Exception as exc:
-        return [
-            Check(
-                "voice enrollment",
-                WARN,
-                f"pyannote not importable ({type(exc).__name__}) - no voiceprints will be built",
-                "uv sync --extra asr",
-            )
-        ]
-    if not HF_TOKEN:
-        checks.append(
-            Check(
-                "voice enrollment",
-                WARN,
-                "HF_TOKEN unset - the speaker-embedding model is gated",
-                "set HF_TOKEN and accept the model licence",
-            )
-        )
-        return checks
-
-    with db.connect() as conn:
-        samples = conn.execute("SELECT COUNT(*) FROM voice_samples").fetchone()[0]
-        enrolled = conn.execute(
-            "SELECT COUNT(*) FROM ("
-            "  SELECT canonical FROM voice_samples GROUP BY canonical"
-            "  HAVING COUNT(DISTINCT meeting_id) >= ?"
-            ")",
-            (VOICE_MIN_ENROLL_MEETINGS,),
-        ).fetchone()[0]
-        pending = conn.execute(
-            "SELECT COUNT(*) FROM speaker_matches WHERE state = 'pending'"
-        ).fetchone()[0]
-
-    if not samples:
-        checks.append(
-            Check(
-                "voice enrollment",
-                WARN,
-                "no voiceprints yet - speakers stay unnamed across meetings",
-                "pipeline voices",
-            )
-        )
-    else:
-        detail = (
-            f"{samples} sample(s); {enrolled} person(s) past the "
-            f"{VOICE_MIN_ENROLL_MEETINGS}-meeting auto-match threshold; {pending} pending"
-        )
-        checks.append(Check("voice enrollment", OK, detail))
-    return checks
-
-
 ALL_CHECKS = (
     check_ffmpeg,
     check_asr,
     check_diarization,
-    check_voice_enrollment,
     check_providers,
     check_dashboard_auth,
     check_alerting,
@@ -665,7 +476,6 @@ ALL_CHECKS = (
     check_storage,
     check_manifest,
     check_glossary,
-    check_nightly_task,
 )
 
 

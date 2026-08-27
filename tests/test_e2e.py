@@ -289,8 +289,7 @@ def test_reindex_is_abandoned_when_the_stale_copy_survives(app):
 
 
 def test_batch_failure_exits_nonzero_and_alerts(app, tmp_path, monkeypatch):
-    """A nightly cron must not report success after a failure, and on a headless
-    server the exit code alone reaches nobody."""
+    """A pipeline run must not report success after a failure."""
     add_meeting(app)
     app.asr_backend.fail = True
 

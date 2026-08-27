@@ -51,8 +51,8 @@ from pipeline.config import (
     VOICE_MARGIN,
     VOICE_MIN_ENROLL_MEETINGS,
     VOICE_MIN_SPEECH_SEC,
-    VOICE_MODEL,
     VOICE_REVIEW,
+    VOICE_VECTOR_NAMESPACE,
 )
 
 BAND_AUTO = "auto"
@@ -172,7 +172,7 @@ def cosine(a, b) -> float:
 
 # ── Voiceprints ───────────────────────────────────────────────────────
 
-def voiceprint(conn: sqlite3.Connection, canonical: str, model: str = VOICE_MODEL):
+def voiceprint(conn: sqlite3.Connection, canonical: str, model: str = VOICE_VECTOR_NAMESPACE):
     """A person's voiceprint: the duration-weighted mean of their samples.
 
     Weighted by speech duration because a thirty-second sample is better evidence
@@ -195,7 +195,7 @@ def voiceprint(conn: sqlite3.Connection, canonical: str, model: str = VOICE_MODE
     return normalize(weighted)
 
 
-def enrolled(conn: sqlite3.Connection, model: str = VOICE_MODEL) -> dict[str, object]:
+def enrolled(conn: sqlite3.Connection, model: str = VOICE_VECTOR_NAMESPACE) -> dict[str, object]:
     """Every enrolled person's voiceprint, keyed by canonical name."""
     prints: dict[str, object] = {}
     for name in db.enrolled_names(conn, model):
@@ -270,7 +270,7 @@ def score_match(
     vector = unpack(row["embedding"], row["dim"])
     result = match(vector, prints)
     enroll_meetings = (
-        db.sample_meeting_count(conn, result.best, row["model"] or VOICE_MODEL)
+        db.sample_meeting_count(conn, result.best, row["model"] or VOICE_VECTOR_NAMESPACE)
         if result.best
         else 0
     )
@@ -285,10 +285,10 @@ def score_match(
     return result, decided
 
 
-def rematch_pending(conn: sqlite3.Connection, model: str = VOICE_MODEL) -> int:
+def rematch_pending(conn: sqlite3.Connection, model: str = VOICE_VECTOR_NAMESPACE) -> int:
     """Re-score every pending label against the current voiceprints.
 
-    Run nightly. This is the job that makes effort compound downward: each label
+    Run on demand. This is the job that makes effort compound downward: each label
     the owner supplies improves the voiceprints, which resolves adjacent unknowns
     without ever being asked, which shrinks tomorrow's queue.
 
@@ -318,7 +318,7 @@ def rematch_pending(conn: sqlite3.Connection, model: str = VOICE_MODEL) -> int:
 
 # ── Clustering ────────────────────────────────────────────────────────
 
-def cluster_pending(conn: sqlite3.Connection, model: str = VOICE_MODEL) -> int:
+def cluster_pending(conn: sqlite3.Connection, model: str = VOICE_VECTOR_NAMESPACE) -> int:
     """Group pending labels believed to be the same person.
 
     The unit of work has to be a voice, not a meeting. Grouping by meeting asks
@@ -455,7 +455,7 @@ def confirm(
     cluster_id: str,
     canonical: str,
     *,
-    model: str = VOICE_MODEL,
+    model: str = VOICE_VECTOR_NAMESPACE,
 ) -> int:
     """Name every label in a cluster, enrolling each as a voice sample.
 

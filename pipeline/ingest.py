@@ -236,7 +236,7 @@ def run(inbox: Path | None = None, verbose: bool = True) -> dict[str, int]:
                 stat = path.stat()
 
                 # Skip files already processed, without reading them. The inbox is
-                # a synced folder that is never emptied, so by year five a nightly
+                # a synced folder that is never emptied, so by year five a routine
                 # run would otherwise re-hash ~165 GB to rediscover known files.
                 if db.file_unchanged(conn, str(path), stat.st_size, int(stat.st_mtime)):
                     counts["skipped"] += 1

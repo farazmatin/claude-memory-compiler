@@ -196,20 +196,10 @@ def test_replicate_transcribe_end_to_end(mock_audio: Path, monkeypatch):
 def test_default_backend_selection(monkeypatch):
     from pipeline import asr
 
-    # Case 1: REPLICATE_API_TOKEN set + legacy ASR_BACKEND=auto -> ReplicateBackend
     monkeypatch.setattr(asr, "REPLICATE_API_TOKEN", "r8_some_token")
-    monkeypatch.setattr(asr, "ASR_BACKEND", "auto")
-    b1 = asr.default_backend()
-    assert b1.__class__.__name__ == "ReplicateBackend"
+    backend = asr.default_backend()
+    assert backend.__class__.__name__ == "ReplicateBackend"
 
-    # Case 2: a missing token never silently selects a local model.
     monkeypatch.setattr(asr, "REPLICATE_API_TOKEN", "")
-    monkeypatch.setattr(asr, "ASR_BACKEND", "auto")
-    with pytest.raises(RuntimeError, match="never selected implicitly"):
+    with pytest.raises(RuntimeError, match="REPLICATE_API_TOKEN is required"):
         asr.default_backend()
-
-    # Case 3: ASR_BACKEND=whisperx explicit -> WhisperXBackend
-    monkeypatch.setattr(asr, "REPLICATE_API_TOKEN", "r8_some_token")
-    monkeypatch.setattr(asr, "ASR_BACKEND", "whisperx")
-    b3 = asr.default_backend()
-    assert b3.__class__.__name__ == "WhisperXBackend"

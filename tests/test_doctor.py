@@ -1,8 +1,7 @@
 """Preflight checks.
 
-These verify the checker reports accurately, including that it fails loudly on the
-conditions that would otherwise degrade silently — a missing HF token being the
-worst of them, because it costs every action item its owner.
+These verify the checker reports accurately for remote transcription and the
+remaining service dependencies.
 """
 
 from __future__ import annotations
@@ -29,52 +28,25 @@ def test_a_broken_check_is_reported_not_fatal(monkeypatch):
     assert any(c.name.startswith("dir ") for c in checks), "other checks still ran"
 
 
-def test_missing_hf_token_fails_loudly(monkeypatch):
-    """The most common silent degradation: no diarization means no action item
-    owners, and the only signal is a printed warning mid-batch."""
+def test_missing_replicate_token_fails_loudly(monkeypatch):
     monkeypatch.setattr(doctor, "REPLICATE_API_TOKEN", "")
-    monkeypatch.setattr(doctor, "ASR_BACKEND", "whisperx")
-    monkeypatch.setattr(doctor, "HF_TOKEN", None)
-    monkeypatch.setattr(doctor, "ENABLE_DIARIZATION", True)
-
-    checks = doctor.check_diarization()
+    checks = doctor.check_asr()
     assert checks[0].status == doctor.FAIL
-    assert "silently" in checks[0].detail
-    assert "speaker-diarization-3.1" in checks[0].fix
+    assert "REPLICATE_API_TOKEN" in checks[0].detail
 
 
-def test_disabled_diarization_warns_about_owners(monkeypatch):
+def test_diarization_waits_for_replicate(monkeypatch):
     monkeypatch.setattr(doctor, "REPLICATE_API_TOKEN", "")
-    monkeypatch.setattr(doctor, "ASR_BACKEND", "whisperx")
-    monkeypatch.setattr(doctor, "ENABLE_DIARIZATION", False)
     checks = doctor.check_diarization()
     assert checks[0].status == doctor.WARN
-    assert "owners" in checks[0].detail
-
-
-def test_large_v3_on_cpu_is_flagged(monkeypatch):
-    """Choosing large-v3 on CPU quietly makes the nightly batch impossible."""
-    monkeypatch.setattr(doctor, "REPLICATE_API_TOKEN", "")
-    monkeypatch.setattr(doctor, "ASR_BACKEND", "whisperx")
-    monkeypatch.setattr(doctor, "ASR_DEVICE", "cpu")
-    monkeypatch.setattr(doctor, "ASR_MODEL", "large-v3")
-
-    checks = doctor.check_asr()
-    warnings = [c for c in checks if c.status == doctor.WARN]
-    # Only reachable when whisperx imports; skip the assertion otherwise.
-    try:
-        import whisperx  # noqa: F401
-    except ImportError:
-        return
-    assert warnings and "will not fit a night" in warnings[0].detail
+    assert "Replicate" in checks[0].detail
 
 
 def test_replicate_diarization_check(monkeypatch):
     monkeypatch.setattr(doctor, "REPLICATE_API_TOKEN", "r8_fake")
-    monkeypatch.setattr(doctor, "ASR_BACKEND", "replicate")
     checks = doctor.check_diarization()
     assert checks[0].status == doctor.OK
-    assert "Replicate GPU" in checks[0].detail
+    assert "remotely" in checks[0].detail
 
 
 def test_no_providers_is_a_failure(monkeypatch):

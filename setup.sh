@@ -92,7 +92,7 @@ if [ -f .env ]; then
     ok ".env already exists - leaving it alone"
 else
     cp .env.example .env
-    # Fill in the two secrets that can be generated. HF_TOKEN cannot be.
+    # Fill in the secrets that can be generated.
     python3 - <<'PY'
 import pathlib, secrets
 env = pathlib.Path(".env")
@@ -119,8 +119,7 @@ fi
 # ── 3. Python dependencies ────────────────────────────────────────────
 
 step "Installing Python dependencies"
-warn "the ASR extra pulls torch - this can take several minutes"
-uv sync --extra asr --extra dev
+uv sync --extra dev
 ok "dependencies installed"
 
 # ── 4. Services ───────────────────────────────────────────────────────
@@ -151,20 +150,14 @@ if [ "$DOCTOR" -eq 0 ]; then
     printf '%sSetup complete.%s\n\n' "$GREEN$BOLD" "$RESET"
 else
     printf '%sSetup done, but preflight found problems.%s\n\n' "$YELLOW$BOLD" "$RESET"
-    printf 'Almost always this is the HuggingFace token. Two steps:\n\n'
-    printf '  1. Put a %sread%s token in .env as HF_TOKEN\n' "$BOLD" "$RESET"
-    printf '     %shttps://huggingface.co/settings/tokens%s\n\n' "$DIM" "$RESET"
-    printf '  2. Accept BOTH licences (the token alone is not enough):\n'
-    printf '     %shttps://hf.co/pyannote/speaker-diarization-3.1%s\n' "$DIM" "$RESET"
-    printf '     %shttps://hf.co/pyannote/segmentation-3.0%s\n\n' "$DIM" "$RESET"
-    printf 'Without it you get transcripts with no speaker names, which means\n'
-    printf 'action items with nobody assigned. Then re-run: %suv run pipeline doctor%s\n\n' "$BOLD" "$RESET"
+    printf 'Configure REPLICATE_API_TOKEN in .env for remote transcription.\n'
+    printf 'Then re-run: %suv run pipeline doctor%s\n\n' "$BOLD" "$RESET"
 fi
 
 printf '%sYour first meeting:%s\n\n' "$BOLD" "$RESET"
 printf '  cp ~/some-recording.m4a inbox/\n'
 printf '  uv run pipeline run\n\n'
-printf 'Expect ~30-50 min for a one-hour recording on CPU. Then:\n\n'
+printf 'Remote transcription time depends on the configured Replicate model. Then:\n\n'
 printf '  less minutes/*.md                       # read what it wrote\n'
 printf '  uv run pipeline query "what did we decide?"\n\n'
 printf 'Full guide: %sdocs/USER_GUIDE.md%s\n\n' "$BOLD" "$RESET"

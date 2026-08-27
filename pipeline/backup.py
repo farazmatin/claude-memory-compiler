@@ -91,7 +91,7 @@ def _sync_tree(source: Path, dest: Path, report: BackupReport, label: str) -> No
     """Copy new or changed files from `source` into `dest`.
 
     Incremental by size and mtime rather than content hash: at hundreds of
-    gigabytes of audio, re-hashing everything nightly would cost more than the
+    gigabytes of audio, re-hashing everything on every run would cost more than the
     backup itself. Nothing is ever deleted from the destination - this is a
     backup, and a file vanishing from the source is exactly when the copy matters.
     """

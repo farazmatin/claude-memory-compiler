@@ -145,7 +145,7 @@ def test_run_can_skip_audio(tmp_path, monkeypatch):
 
 
 def test_second_run_is_incremental(tmp_path, monkeypatch):
-    """Re-hashing hundreds of gigabytes nightly would cost more than the backup."""
+    """Re-hashing hundreds of gigabytes on every run would cost more than the backup."""
     transcripts = tmp_path / "transcripts"
     transcripts.mkdir()
     (transcripts / "a.json").write_text("{}", encoding="utf-8")

@@ -873,7 +873,7 @@ def overview() -> dict[str, Any]:
         },
         "engine": {
             "asr_backend": "Replicate Serverless GPU (Cloud)",
-            "asr_model": "victor-upmeet/whisperx (Whisper large-v3 + Pyannote)",
+            "asr_model": "configured Replicate remote transcription model",
             "asr_speed": "~1-2 min per meeting",
             "minutes_model": ANTIGRAVITY_MODEL or GEMINI_MODEL or "gemini-3.7-flash",
         },

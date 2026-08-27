@@ -1,8 +1,7 @@
-"""Stage 2 ASR Backend: Replicate serverless GPU (WhisperX + Pyannote).
+"""Stage 2 ASR Backend: Replicate serverless GPU.
 
-Runs the exact same open-source stack as local WhisperX (whisper-large-v3 +
-wav2vec2 alignment + pyannote diarization), but executed on a serverless GPU
-in the cloud in ~1-2 minutes per meeting.
+Runs transcription, alignment, and diarization remotely. This repository never
+loads ASR, alignment, diarization, or speaker-embedding weights locally.
 
 Uploads normalized audio to Replicate's files API, submits a prediction
 job to victor-upmeet/whisperx, polls to completion, and maps the output JSON
@@ -22,15 +21,15 @@ import httpx
 
 from pipeline.asr import (
     Transcript,
-    _segments_from_whisperx,
+    _segments_from_provider_output,
 )
 from pipeline.config import (
     ASR_BATCH_SIZE,
     ASR_LANGUAGE,
     ENABLE_DIARIZATION,
-    HF_TOKEN,
     MAX_SPEAKERS,
     MIN_SPEAKERS,
+    REMOTE_ASR_HF_TOKEN,
     REPLICATE_API_TOKEN,
     REPLICATE_MODEL,
     REPLICATE_POLL_INTERVAL_SEC,
@@ -187,8 +186,8 @@ class ReplicateBackend:
             input_payload["min_speakers"] = self.min_speakers
         if self.max_speakers is not None:
             input_payload["max_speakers"] = self.max_speakers
-        if HF_TOKEN:
-            input_payload["huggingface_access_token"] = HF_TOKEN
+        if REMOTE_ASR_HF_TOKEN:
+            input_payload["huggingface_access_token"] = REMOTE_ASR_HF_TOKEN
 
         payload = {"version": version_id, "input": input_payload}
         headers = {**self._headers(), "Content-Type": "application/json"}
@@ -297,7 +296,7 @@ class ReplicateBackend:
                     or self.language
                 )
 
-                segments = _segments_from_whisperx(raw_output)
+                segments = _segments_from_provider_output(raw_output)
 
         # Estimate duration from segments
         duration_sec = 0.0

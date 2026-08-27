@@ -358,8 +358,8 @@ def install_fake_llm(tmp_path: Path, minutes: str = MINUTES_DOC) -> dict[str, st
 class FakeASRBackend:
     """Deterministic two-speaker transcript.
 
-    Implements the same `Backend` protocol as WhisperXBackend, which is the escape
-    hatch the design promised - this test is also proof that the seam works.
+    Implements the remote Backend protocol; this test is also proof that the
+    transcription seam works.
     """
 
     name = "fake:test-asr"

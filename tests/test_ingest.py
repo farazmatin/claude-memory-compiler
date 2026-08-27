@@ -84,8 +84,8 @@ def test_rescan_is_idempotent(inbox):
 
 
 def test_known_files_are_not_rehashed(inbox, monkeypatch):
-    """The inbox is a synced folder that never empties. By year five a nightly run
-    would otherwise re-read ~165 GB just to rediscover files it already knows."""
+    """The inbox is a synced folder that never empties. Repeated runs must not
+    re-read known files just to rediscover them."""
     (inbox / "a Aug 10 at 9-10 a.m..m4a").write_bytes(b"one")
     (inbox / "b Aug 11 at 9-10 a.m..m4a").write_bytes(b"two")
     assert ingest.run(verbose=False)["ingested"] == 2

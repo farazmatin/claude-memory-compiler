@@ -1,7 +1,7 @@
 [project]
 name = "meeting-minutes-compiler"
 version = "0.1.0"
-description = "Compiles meeting audio into structured minutes and a graph-RAG knowledge base"
+description = "Compiles meeting audio into structured minutes and bounded graph context"
 requires-python = ">=3.12"
 dependencies = [
     # Minutes generation (subscription-covered, no API key needed)
@@ -23,15 +23,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# ASR is a heavy, platform-specific install (torch, CUDA libs, rust-built deps).
-# Kept optional so the manifest/minutes/index stages can be installed and tested
-# on machines that will never run transcription.
-asr = [
-    # Upper bound is deliberate. whisperx moves DiarizationPipeline's auth kwarg
-    # and assign_word_speakers' location between releases; pipeline/asr.py carries
-    # shims for both, but an unpinned major would land mid-batch unannounced.
-    "whisperx>=3.1.1,<4",
-]
 dev = [
     "pytest>=8.0",
 ]
@@ -45,8 +36,7 @@ target-version = "py312"
 
 [tool.ruff.lint]
 # Explicit rule set, not ruff's default. An unpinned selection means a ruff
-# release can add rules and break CI on an unrelated push - the same failure mode
-# the whisperx upper bound guards against.
+# release can add rules and break CI on an unrelated push.
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 ignore = [
     "E501",    # line length is enforced by the formatter, not the linter
