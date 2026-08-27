@@ -125,10 +125,9 @@ orphans the previous file.
 **Entities and Relations** are the most mechanically important sections, and the
 reason is not obvious.
 
-The knowledge graph that answers questions is built by a small local model running
-on CPU — it cannot use the subscription that compiles these minutes. That model
-reliably reads an explicit list like `Atlas (feature): the platform rewrite`, and
-unreliably discovers the same fact from narrative prose. So state it outright here.
+The subscription-authored entities and relations below are published directly to
+the knowledge graph. No later model re-extracts them from narrative prose, so state
+each durable graph fact explicitly here.
 
 Rules:
 

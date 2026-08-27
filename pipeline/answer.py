@@ -1,10 +1,8 @@
 """Answer questions by splitting retrieval from synthesis.
 
-The other half of the subscription-ceiling mitigation. LightRAG's own /query path
-runs keyword extraction through its configured LLM before it touches the graph at
-all - on this deployment that is qwen3:4b on CPU at ~3.6 tok/s, measured returning
-HTTP 500 after 242 SECONDS. That path is not "slow", it is unusable, and no amount
-of caching or retrying fixes it: the bottleneck is architectural, not transient.
+LightRAG's own /query path is model-backed before it touches the graph. This build
+does not call that route: LightRAG is storage and traversal only, and the
+subscription chain owns synthesis.
 
 So retrieval here never calls it. Two sources instead, both LLM-free and both run
 every time, combined when both return something:
@@ -22,11 +20,8 @@ chain (`pipeline.llm`), timed separately from retrieval - a knowledge base you
 wait three minutes for is one you stop using, and separate timings say whether a
 slow answer is retrieval's fault or the model's.
 
-`index.query()` (LightRAG's own generation) is kept only behind the explicit
-`synthesize=False` / `pipeline query --local` flag, and even there it is bounded
-to a few seconds rather than trusted - see `_bounded_raw_query`. It is not used
-anywhere in the default path; a subscription model producing no answer is
-strictly better than a 242-second wait for a 500.
+LightRAG's model-backed `/query` route is never called. If subscription synthesis
+is unavailable, the caller receives the retrieved, cited context directly.
 
 Conversation history is accepted as a plain list of (question, answer) tuples
 rather than anything storage-shaped - this module has no idea a session exists.
@@ -37,12 +32,10 @@ always has, with no session at all.
 
 from __future__ import annotations
 
-import contextlib
-import threading
 import time
 from dataclasses import dataclass
 
-from pipeline import graph_sync, index, llm
+from pipeline import graph_sync, llm
 from pipeline.config import CHAT_HISTORY_TURNS
 from pipeline.llm import LLMError, complete
 
@@ -61,7 +54,7 @@ class Answer:
         return self.retrieval_sec + self.synthesis_sec
 
     def timing_line(self) -> str:
-        mode = self.provider if self.synthesized else "lightrag (local)"
+        mode = self.provider if self.synthesized else "retrieved context"
         return (
             f"[retrieval {self.retrieval_sec:.1f}s | synthesis "
             f"{self.synthesis_sec:.1f}s via {mode} | context {self.context_chars} chars]"
@@ -167,35 +160,6 @@ of what happened.
 ## Question
 
 {question}"""
-
-
-# `index.query()` is LightRAG's own retrieve-and-generate endpoint. It is
-# confirmed broken on this deployment (HTTP 500 after 242s - see the module
-# docstring) and must never sit on a request's critical path unbounded. This is
-# its only remaining caller (the explicit `synthesize=False` / `--local` path);
-# even there, it gets a few seconds and no more.
-RAW_QUERY_CAP_SEC = 5.0
-
-
-def _bounded_raw_query(question: str, mode: str | None, top_k: int | None) -> str | None:
-    """Try LightRAG's own generation, but never wait more than a few seconds.
-
-    Returns None on timeout or failure - the caller decides what to say. A
-    thread rather than a client-side timeout on the request itself: `index.py`
-    is not this module's to change, and Python cannot interrupt a blocking call
-    once it is in flight regardless. The abandoned call is left running in a
-    daemon thread and its eventual result (or 500) is simply discarded.
-    """
-    result: dict[str, str] = {}
-
-    def run() -> None:
-        with contextlib.suppress(index.IndexError_):
-            result["text"] = index.query(question, mode=mode, top_k=top_k)
-
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-    thread.join(timeout=RAW_QUERY_CAP_SEC)
-    return None if thread.is_alive() else result.get("text")
 
 
 def _retrieve_context(question: str) -> str:
@@ -415,16 +379,9 @@ def ask(
     question: str,
     mode: str | None = None,
     top_k: int | None = None,
-    synthesize: bool = True,
     history: list[tuple[str, str]] | None = None,
 ) -> Answer:
     """Retrieve, then synthesize.
-
-    `synthesize=False` (`pipeline query --local`) asks LightRAG's own /query
-    endpoint instead of the subscription chain - see `_bounded_raw_query` for
-    why that is bounded to a few seconds rather than trusted outright. It is
-    not the fallback when a provider is unreachable; see the `except LLMError`
-    branch below for that case, which never calls it.
 
     `history` is prior (question, answer) turns of the same conversation, oldest
     first, from a caller that tracks sessions (the dashboard does; the CLI does
@@ -434,25 +391,6 @@ def ask(
     """
     history = _fit_history_to_budget(list(history or [])[-CHAT_HISTORY_TURNS:])
     retrieval_query = _retrieval_query(question, history)
-
-    if not synthesize:
-        started = time.monotonic()
-        text = _bounded_raw_query(retrieval_query, mode, top_k)
-        if text is None:
-            text = (
-                "LightRAG's own generation is not usable on this deployment - it "
-                "runs keyword extraction through a local model that returns HTTP "
-                "500 after several minutes, so this gave up early instead of "
-                "waiting on it. Drop `--local` to use the subscription chain."
-            )
-        return Answer(
-            text=text,
-            retrieval_sec=time.monotonic() - started,
-            synthesis_sec=0.0,
-            provider=None,
-            context_chars=0,
-            synthesized=False,
-        )
 
     started = time.monotonic()
     context = _retrieve_context(retrieval_query)

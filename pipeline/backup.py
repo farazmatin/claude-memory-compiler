@@ -184,7 +184,7 @@ def run(destination: Path, include_audio: bool = True) -> BackupReport:
                 "     and speaker-overrides.yaml back into the repo.",
                 "  2. Copy db/manifest.db to db/manifest.db.",
                 "  3. docker compose up -d",
-                "  4. pipeline index          # rebuilds the LightRAG index",
+                "  4. pipeline graph-sync     # rebuilds the LightRAG graph",
                 "",
                 "The index is NOT backed up - it is derived from minutes/ and is",
                 "rebuilt by step 4. If minutes/ was lost but transcripts/ survived,",

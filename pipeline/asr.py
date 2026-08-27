@@ -475,15 +475,20 @@ def save_transcript(transcript: Transcript, speaker_names: dict[str, str] | None
 def default_backend() -> Backend:
     """Select the active ASR backend.
 
-    If MMC_ASR_BACKEND="replicate" or (MMC_ASR_BACKEND="auto" and REPLICATE_API_TOKEN is set),
-    uses serverless Replicate GPU for ~1-2 min turnaround.
-    Otherwise falls back to local CPU WhisperXBackend.
+    Replicate is the default. Local WhisperX is selected only by an explicit
+    MMC_ASR_BACKEND=whisperx opt-in; a missing token never changes providers.
     """
-    use_replicate = ASR_BACKEND == "replicate" or (
-        ASR_BACKEND == "auto" and bool(REPLICATE_API_TOKEN)
-    )
-    if use_replicate:
-        from pipeline.replicate_asr import ReplicateBackend
+    if ASR_BACKEND == "whisperx":
+        return WhisperXBackend()
+    if ASR_BACKEND not in {"replicate", "auto"}:
+        raise RuntimeError(
+            f"unknown MMC_ASR_BACKEND={ASR_BACKEND!r}; use 'replicate' or 'whisperx'"
+        )
+    if not REPLICATE_API_TOKEN:
+        raise RuntimeError(
+            "REPLICATE_API_TOKEN is required for transcription. Set it in .env; "
+            "local WhisperX is never selected implicitly."
+        )
+    from pipeline.replicate_asr import ReplicateBackend
 
-        return ReplicateBackend()
-    return WhisperXBackend()
+    return ReplicateBackend()

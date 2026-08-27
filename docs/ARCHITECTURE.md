@@ -285,38 +285,31 @@ space on something reconstructible.
 
 ---
 
-## The subscription ceiling
+## The subscription-only graph path
 
-The central open tension, and worth stating plainly.
-
-Three LLM jobs exist. Two can use subscriptions; one cannot:
+Every reasoning task uses the subscription provider chain. Graph publication and
+retrieval are deterministic storage operations:
 
 | Job | Calls/meeting | Provider | Quality-sensitive? |
 |---|---|---|---|
 | Minutes compilation | 1 | Subscription chain | Very |
 | Speaker resolution | 1 | Subscription chain | Moderately |
-| Graph & entity extraction | Many | **Local Ollama ~4B** | **Very** |
+| Entity/relation authoring | Included with minutes | Subscription chain | Very |
+| Graph publication/retrieval | Storage operations | None | Deterministic |
 
-LightRAG needs an OpenAI-compatible HTTP endpoint. Claude Code, Codex and Gemini
-CLI are interactive tools, not servers, and no subscription offers an embedding
-model at all. So the most quality-sensitive step in *retrieval* is permanently
-capped by a small model on CPU, no matter what is paid for elsewhere.
-
-Both mitigations are now built — see D17 and D18. The ceiling is narrowed rather
-than removed: entity *identification* moved to a frontier model, and answer
-*writing* moved to one, but graph traversal still runs locally.
+LightRAG remains the loopback Postgres-backed graph store, but its model-backed
+document-ingestion and `/query` routes are outside the active build. Compose points
+their model bindings at a closed loopback port so accidental calls fail closed.
 
 ### D17 — The compiler emits the knowledge graph
 
 **Decision.** The minutes template emits explicit `Entities` and `Relations`
 sections. These are parsed, canonicalized through the people registry, stored in the
-manifest, and appended to the indexed document as a normalized block.
+manifest, and published directly as graph records.
 
-**Why.** The first half of the subscription-ceiling fix. A ~4B model reads
-`Atlas (feature): the platform rewrite` reliably and discovers the same fact from
-narrative prose unreliably. The frontier model already running once per meeting can
-state it outright, so it does. Storing them in the manifest also means the corpus no
-longer depends on LightRAG's extraction quality at all.
+**Why.** The subscription model already running once per meeting can state the
+facts explicitly. Storing them in the manifest means publication is repeatable and
+the corpus does not depend on LightRAG extraction or text embeddings.
 
 **Why a tolerant line parser, not JSON.** Models emit stray prose around JSON often
 enough that a strict parse throws away a whole usable block. Recovering most of a
@@ -324,12 +317,12 @@ messy block beats discarding all of a slightly-malformed one.
 
 ### D18 — Retrieval and synthesis are separate
 
-**Decision.** `pipeline/answer.py` retrieves via LightRAG, then hands the context to
-the subscription chain to write the answer. `--local` keeps LightRAG's own
-generation, and it is the automatic fallback when no provider is reachable.
+**Decision.** `pipeline/answer.py` combines deterministic graph traversal with a
+bounded minutes/register scan, then hands the context to the subscription chain to
+write the answer. If providers are unavailable, it returns the cited retrieved
+context directly.
 
-**Why.** The second half of the ceiling fix, and the answer to query latency: answer
-quality and speed stop depending on CPU-bound local generation. Empty retrieval
+**Why.** Answer quality does not depend on a hidden fallback model. Empty retrieval
 short-circuits rather than asking a model to answer from nothing — that is how a
 knowledge base starts inventing.
 
@@ -386,9 +379,8 @@ pipeline failure it reports would be strictly worse than no alert.
 
 Accepted, with the reasoning:
 
-- **Graph traversal is still local.** D17 moved entity identification to a frontier
-  model and D18 moved answer writing, but the traversal between them runs on the
-  small local model.
+- **Graph retrieval is lexical and deterministic.** It avoids model and embedding
+  dependencies, but recall must be watched as the corpus and vocabulary grow.
 - **No voiceprints.** D19 makes spelling deterministic, not identification
   automatic.
 - **Token estimation is `len // 4`.** Deliberately rough and biased conservative:

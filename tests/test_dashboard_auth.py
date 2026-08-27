@@ -33,6 +33,7 @@ def token(monkeypatch):
 
 # ── Exposure rules ────────────────────────────────────────────────────
 
+
 def test_loopback_without_a_token_stays_open(monkeypatch):
     monkeypatch.setattr(auth, "DASHBOARD_TOKEN", "")
     assert auth.enforced("127.0.0.1") is False
@@ -52,11 +53,18 @@ def test_a_configured_token_is_enforced_even_on_loopback(token):
     assert auth.authorized("/api/meetings", Headers(), "127.0.0.1") is False
 
 
+def test_context_service_paths_need_no_shared_secret_on_loopback(token):
+    for path in auth.LOOPBACK_SERVICE_PATHS:
+        assert auth.authorized(path, Headers(), "127.0.0.1") is True
+        assert auth.authorized(path, Headers(), "0.0.0.0") is False
+
+
 def test_off_loopback_with_a_token_starts(token):
     auth.check_startup("0.0.0.0")
 
 
 # ── Credentials ───────────────────────────────────────────────────────
+
 
 def test_bearer_token_authorizes(token):
     headers = Headers(authorization=f"Bearer {token}")
@@ -87,6 +95,7 @@ def test_the_login_route_is_reachable_without_credentials(token):
 
 # ── Session integrity ─────────────────────────────────────────────────
 
+
 def test_an_expired_session_is_rejected(token):
     stale = auth.issue_session(now=time.time() - auth.SESSION_TTL_SEC - 60)
     assert auth.valid_session(stale) is False
@@ -101,7 +110,7 @@ def test_a_session_cannot_be_extended_by_editing_its_expiry(token):
 
 
 def test_malformed_session_values_are_rejected(token):
-    for value in ("", "garbage", "nodot", ".", "abc.def", f"{int(time.time())+600}."):
+    for value in ("", "garbage", "nodot", ".", "abc.def", f"{int(time.time()) + 600}."):
         assert auth.valid_session(value) is False, value
 
 
@@ -120,6 +129,7 @@ def test_a_session_signed_with_another_secret_is_rejected(monkeypatch):
 
 
 # ── Cookie hardening ──────────────────────────────────────────────────
+
 
 def test_the_cookie_is_httponly_samesite_and_scoped(token):
     header = auth.session_cookie_header()
@@ -140,6 +150,7 @@ def test_clearing_the_cookie_expires_it(token):
 
 
 # ── Misc ──────────────────────────────────────────────────────────────
+
 
 def test_empty_candidates_never_match(monkeypatch):
     monkeypatch.setattr(auth, "DASHBOARD_TOKEN", "")

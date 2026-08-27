@@ -33,7 +33,7 @@ if (-not (Test-DashboardAvailable)) {
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
     $process = Start-Process `
         -FilePath $python `
-        -ArgumentList "-m", "pipeline.cli", "dashboard", "--port", $Port `
+        -ArgumentList "-m", "pipeline.cli", "dashboard", "--host", "127.0.0.1", "--port", $Port `
         -WorkingDirectory $projectRoot `
         -WindowStyle Hidden `
         -RedirectStandardOutput $standardOutput `
@@ -61,5 +61,20 @@ if (-not (Test-DashboardAvailable)) {
     }
 }
 
+$contextHealth = $null
+try {
+    $contextHealth = Invoke-RestMethod `
+        -Uri "$address/api/context/health" `
+        -Method Get `
+        -TimeoutSec 10
+}
+catch {
+    Write-Warning "Meeting Memory is running, but context health could not be read: $($_.Exception.Message)"
+}
+
 Start-Process $address
 Write-Host "Meeting Memory is open at $address"
+if ($contextHealth) {
+    $fresh = if ($contextHealth.fresh_through) { $contextHealth.fresh_through } else { "unknown" }
+    Write-Host "Context: $($contextHealth.status) via $($contextHealth.backend), fresh through $fresh"
+}

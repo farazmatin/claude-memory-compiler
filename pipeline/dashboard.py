@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from pydantic import ValidationError
+
 from pipeline import dashboard_auth, db, index, people_merge, voices
 from pipeline.config import (
     ANTIGRAVITY_MODEL,
@@ -43,12 +45,15 @@ from pipeline.config import (
     TZ,
     now_iso,
 )
+from pipeline.context_provider import ContextQuery, ManifestContextProvider
 from pipeline.titles import clean_meeting_title
 
 STATIC_DIR = Path(__file__).with_name("static")
 MAX_QUERY_CHARS = 4_000
 PEOPLE_SUGGESTIONS_DISMISSED = "people.merge_suggestions.dismissed"
 VALID_QUERY_MODES = {"hybrid", "global", "local", "naive", "mix"}
+CONTEXT_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_context_provider = ManifestContextProvider()
 
 # ── Pipeline background runner state ──────────────────────────────────
 _pipeline_lock = threading.Lock()
@@ -141,8 +146,8 @@ def _run_pipeline_worker(stage: str, limit: int | None) -> None:
                 rc = cli.cmd_minutes(
                     argparse.Namespace(limit=limit, recompile=False, traceback=False, force=False)
                 )
-            elif stage == "index":
-                rc = cli.cmd_index(argparse.Namespace(limit=limit))
+            elif stage == "graph-sync":
+                rc = cli.cmd_graph_sync(argparse.Namespace(limit=limit))
             elif stage == "recompile":
                 rc = cli.cmd_minutes(
                     argparse.Namespace(limit=limit, recompile=True, traceback=False, force=False)
@@ -160,11 +165,13 @@ def _run_pipeline_worker(stage: str, limit: int | None) -> None:
                         )
                     )
                     if rc == 0:
-                        rc = cli.cmd_index(argparse.Namespace(limit=limit))
+                        rc = cli.cmd_graph_sync(argparse.Namespace(limit=limit))
             else:
                 raise ValueError(f"Unknown pipeline stage: {stage}")
             success = rc == 0
-            _log_buffer.append(f"[{now_iso()}] Pipeline stage '{stage}' finished with exit code {rc}")
+            _log_buffer.append(
+                f"[{now_iso()}] Pipeline stage '{stage}' finished with exit code {rc}"
+            )
     except Exception as exc:
         error_msg = str(exc)
         _log_buffer.append(f"[{now_iso()}] Pipeline stage '{stage}' crashed: {exc}")
@@ -222,25 +229,19 @@ def add_person(canonical: str, role: str | None = None, aliases: list[str] | Non
         db.add_person(conn, canonical=canonical, role=role, aliases=aliases)
 
 
-def preview_people_merge(
-    names: list[str], into: str
-) -> people_merge.MergePreview:
+def preview_people_merge(names: list[str], into: str) -> people_merge.MergePreview:
     """Preview the exact impact every dashboard merge adapter will apply."""
     db.init_db()
     return people_merge.preview(names, into)
 
 
-def merge_people(
-    from_name: str, into: str, *, expected_digest: str
-) -> people_merge.MergeResult:
+def merge_people(from_name: str, into: str, *, expected_digest: str) -> people_merge.MergeResult:
     """Apply one preview-bound person merge through the deep module."""
     source, target = from_name.strip(), into.strip()
     if not source or not target:
         raise ValueError("Both contact names are required.")
     db.init_db()
-    return people_merge.merge(
-        [source], target, expected_digest=expected_digest
-    )
+    return people_merge.merge([source], target, expected_digest=expected_digest)
 
 
 def merge_many_people(
@@ -252,9 +253,7 @@ def merge_many_people(
     if len(selected) < 2:
         raise ValueError("Select at least two contact names to merge.")
     db.init_db()
-    return people_merge.merge(
-        selected, target, expected_digest=expected_digest
-    )
+    return people_merge.merge(selected, target, expected_digest=expected_digest)
 
 
 def rename_person(
@@ -266,16 +265,12 @@ def rename_person(
         raise ValueError("Both the current and corrected names are required.")
     db.init_db()
     with db.connect() as conn:
-        existing = conn.execute(
-            "SELECT 1 FROM people WHERE canonical = ?", (target,)
-        ).fetchone()
+        existing = conn.execute("SELECT 1 FROM people WHERE canonical = ?", (target,)).fetchone()
         if existing:
             raise ValueError(
                 f"'{target}' already exists. Select both names and choose 'Merge selected'."
             )
-    return people_merge.merge(
-        [source], target, expected_digest=expected_digest
-    )
+    return people_merge.merge([source], target, expected_digest=expected_digest)
 
 
 def _normalized_person_name(name: str) -> str:
@@ -380,7 +375,9 @@ def people_merge_suggestions(limit: int = 12) -> list[dict[str, Any]]:
                 "score": round(score, 2),
             }
         )
-    suggestions.sort(key=lambda item: (-float(item["score"]), -len(item["names"]), str(item["names"][0])))
+    suggestions.sort(
+        key=lambda item: (-float(item["score"]), -len(item["names"]), str(item["names"][0]))
+    )
     return suggestions[:limit]
 
 
@@ -460,43 +457,47 @@ def get_voice_clusters() -> list[dict[str, Any]]:
                 llm_name = (row["llm_name"] or "").strip()
                 if llm_name:
                     llm_votes[llm_name] += 1
-                members.append({
-                    "meeting_id": row["meeting_id"],
-                    "label": row["label"],
-                    # Raw title_hint is a mangled Drive id; the voice card was
-                    # labelling every meeting chip with one.
-                    "meeting_title": (
-                        clean_meeting_title(m.source_name, m.title_hint, m.minutes_path)
-                        if m
-                        else "Meeting"
+                members.append(
+                    {
+                        "meeting_id": row["meeting_id"],
+                        "label": row["label"],
+                        # Raw title_hint is a mangled Drive id; the voice card was
+                        # labelling every meeting chip with one.
+                        "meeting_title": (
+                            clean_meeting_title(m.source_name, m.title_hint, m.minutes_path)
+                            if m
+                            else "Meeting"
+                        ),
+                        "meeting_date": m.meeting_date if m else None,
+                        "speech_sec": float(row["speech_sec"] or 0),
+                        "snippet_count": len(snippets) if isinstance(snippets, list) else 0,
+                        "llm_name": llm_name or None,
+                    }
+                )
+            result.append(
+                {
+                    "id": c["id"],
+                    "size": c["size"],
+                    "total_speech": c["total_speech"],
+                    "best_canonical": c["best_canonical"],
+                    "best_score": round(float(c["best_score"] or 0), 2)
+                    if c["best_score"] is not None
+                    else None,
+                    "next_canonical": c["next_canonical"],
+                    # The runner-up's score, not just its name. Triage order is the
+                    # margin between first and second guess, not the raw top score.
+                    "next_score": (
+                        round(float(c["next_score"]), 2) if c["next_score"] is not None else None
                     ),
-                    "meeting_date": m.meeting_date if m else None,
-                    "speech_sec": float(row["speech_sec"] or 0),
-                    "snippet_count": len(snippets) if isinstance(snippets, list) else 0,
-                    "llm_name": llm_name or None,
-                })
-            result.append({
-                "id": c["id"],
-                "size": c["size"],
-                "total_speech": c["total_speech"],
-                "best_canonical": c["best_canonical"],
-                "best_score": round(float(c["best_score"] or 0), 2) if c["best_score"] is not None else None,
-                "next_canonical": c["next_canonical"],
-                # The runner-up's score, not just its name. Triage order is the
-                # margin between first and second guess, not the raw top score.
-                "next_score": (
-                    round(float(c["next_score"]), 2)
-                    if c["next_score"] is not None
-                    else None
-                ),
-                "band": c["band"],
-                # A name heard in the room is independent evidence from a
-                # voiceprint score, and it is strongest exactly where the
-                # voiceprint is weakest. Offer it alongside, never instead.
-                "llm_suggestion": llm_votes.most_common(1)[0][0] if llm_votes else None,
-                "clip_seconds": round(sum(m["snippet_count"] for m in members) * SNIPPET_SEC),
-                "members": members,
-            })
+                    "band": c["band"],
+                    # A name heard in the room is independent evidence from a
+                    # voiceprint score, and it is strongest exactly where the
+                    # voiceprint is weakest. Offer it alongside, never instead.
+                    "llm_suggestion": llm_votes.most_common(1)[0][0] if llm_votes else None,
+                    "clip_seconds": round(sum(m["snippet_count"] for m in members) * SNIPPET_SEC),
+                    "members": members,
+                }
+            )
         return result
 
 
@@ -546,15 +547,11 @@ def speaker_resolution_queue(limit: int | None = None) -> dict[str, Any]:
                 "snippet_count": len(snippets) if isinstance(snippets, list) else 0,
                 "best_canonical": row["best_canonical"],
                 "best_score": (
-                    round(float(row["best_score"]), 2)
-                    if row["best_score"] is not None
-                    else None
+                    round(float(row["best_score"]), 2) if row["best_score"] is not None else None
                 ),
                 "next_canonical": row["next_canonical"],
                 "next_score": (
-                    round(float(row["next_score"]), 2)
-                    if row["next_score"] is not None
-                    else None
+                    round(float(row["next_score"]), 2) if row["next_score"] is not None else None
                 ),
                 # Clusters already report their band. One-offs render in the same
                 # triage list under the same filter, so they have to answer it too
@@ -646,9 +643,7 @@ def decision_timeline(topic: str | None = None) -> dict[str, Any]:
             decision_rows = db.get_decisions(conn, row["id"])
             question_rows = db.get_open_questions(conn, row["id"])
 
-            title = clean_meeting_title(
-                row["source_name"], row["title_hint"], row["minutes_path"]
-            )
+            title = clean_meeting_title(row["source_name"], row["title_hint"], row["minutes_path"])
             if filter_term:
                 searchable = " ".join(
                     [
@@ -670,18 +665,20 @@ def decision_timeline(topic: str | None = None) -> dict[str, Any]:
             if not decisions:
                 decisions = ["Meeting indexed and archived in memory."]
 
-            events.append({
-                "meeting_id": row["id"],
-                "short_id": row["id"][:8],
-                "date": row["meeting_date"] or "Undated",
-                "time": row["meeting_time"] or "",
-                "title": title,
-                "headline": decisions[0],
-                "decisions": decisions,
-                "speakers": speakers,
-                "entities": entity_names[:6],
-                "duration_sec": row["duration_sec"],
-            })
+            events.append(
+                {
+                    "meeting_id": row["id"],
+                    "short_id": row["id"][:8],
+                    "date": row["meeting_date"] or "Undated",
+                    "time": row["meeting_time"] or "",
+                    "title": title,
+                    "headline": decisions[0],
+                    "decisions": decisions,
+                    "speakers": speakers,
+                    "entities": entity_names[:6],
+                    "duration_sec": row["duration_sec"],
+                }
+            )
 
         return {
             "topic": topic or "All Historical Meetings",
@@ -791,33 +788,41 @@ def overview() -> dict[str, Any]:
         }
 
         # Queue breakdown
-        queue = {
-            status: statuses.get(status, 0)
-            for status in [*db.STATUS_ORDER, db.FAILED]
-        }
+        queue = {status: statuses.get(status, 0) for status in [*db.STATUS_ORDER, db.FAILED]}
 
         # Timings
         timings = db.stage_timings(conn)
 
         # Knowledge & graph stats
         entities_count = conn.execute("SELECT COUNT(*) AS count FROM entities").fetchone()["count"]
-        relations_count = conn.execute("SELECT COUNT(*) AS count FROM relations").fetchone()["count"]
+        relations_count = conn.execute("SELECT COUNT(*) AS count FROM relations").fetchone()[
+            "count"
+        ]
         top_entities = db.entity_mentions(conn, limit=8)
         people_count = conn.execute("SELECT COUNT(*) AS count FROM people").fetchone()["count"]
-        unresolved_speakers = conn.execute("SELECT COUNT(*) AS count FROM speakers WHERE name IS NULL").fetchone()["count"]
+        unresolved_speakers = conn.execute(
+            "SELECT COUNT(*) AS count FROM speakers WHERE name IS NULL"
+        ).fetchone()["count"]
 
         # Drive stats
         drive_rows = conn.execute(
             "SELECT state, COUNT(*) AS count, COALESCE(SUM(byte_size), 0) AS total_bytes FROM drive_sources GROUP BY state"
         ).fetchall()
-        drive_by_state = {r["state"]: {"count": r["count"], "bytes": r["total_bytes"]} for r in drive_rows}
+        drive_by_state = {
+            r["state"]: {"count": r["count"], "bytes": r["total_bytes"]} for r in drive_rows
+        }
         drive_total_files = sum(r["count"] for r in drive_rows)
         drive_total_bytes = sum(r["total_bytes"] for r in drive_rows)
 
         # Maintenance
         stale_templates = len(db.stale_template(conn, TEMPLATE_VERSION))
         failed_list = [
-            {"id": m.id, "short_id": m.short_id, "label": m.label, "error": (m.error or "").splitlines()[0] if m.error else "Unknown error"}
+            {
+                "id": m.id,
+                "short_id": m.short_id,
+                "label": m.label,
+                "error": (m.error or "").splitlines()[0] if m.error else "Unknown error",
+            }
             for m in db.pending(conn, db.FAILED)
         ]
 
@@ -1192,7 +1197,6 @@ def run(host: str = DASHBOARD_HOST, port: int = DASHBOARD_PORT, open_browser: bo
         server.server_close()
 
 
-
 # Deliberately self-contained and styled inline: it must render before any
 # authenticated asset can be fetched, so it cannot depend on style.css.
 LOGIN_PAGE = """<!doctype html>
@@ -1256,6 +1260,7 @@ document.getElementById('f').addEventListener('submit', async (ev) => {
 </script></body></html>
 """
 
+
 class DashboardHandler(BaseHTTPRequestHandler):
     """Small dependency-free HTTP surface for the local dashboard."""
 
@@ -1264,10 +1269,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
     # handler usable in tests that construct it without going through run().
     bind_host = "127.0.0.1"
 
-    def do_GET(self) -> None:
-        if not dashboard_auth.authorized(
-            urlparse(self.path).path.rstrip("/") or "/", self.headers, self.bind_host
+    def _request_authorized(self) -> bool:
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        # Context is the machine-to-machine seam. It is safe without the
+        # browser token only while this server is loopback-bound; the route
+        # itself repeats that check before reading any meeting metadata.
+        if path in dashboard_auth.LOOPBACK_SERVICE_PATHS and dashboard_auth.is_loopback(
+            self.bind_host
         ):
+            return True
+        return dashboard_auth.authorized(path, self.headers, self.bind_host)
+
+    def do_GET(self) -> None:
+        if not self._request_authorized():
             self._unauthorized()
             return
         parsed = urlparse(self.path)
@@ -1277,6 +1291,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/pipeline/status":
             self._json(HTTPStatus.OK, get_pipeline_status())
+            return
+        if path == "/api/context/health":
+            if self.bind_host not in CONTEXT_LOOPBACK_HOSTS:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "Context API is loopback-only."})
+                return
+            try:
+                self._json(HTTPStatus.OK, _context_provider.health().model_dump(mode="json"))
+            except Exception as exc:
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"error": f"Context health unavailable: {exc}"},
+                )
             return
         if path == "/api/diagnostics/stage-failures":
             limit_raw = parse_qs(parsed.query).get("limit", ["20"])[0]
@@ -1366,9 +1392,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._asset(parsed.path)
 
     def do_POST(self) -> None:
-        if not dashboard_auth.authorized(
-            urlparse(self.path).path.rstrip("/") or "/", self.headers, self.bind_host
-        ):
+        if not self._request_authorized():
             self._unauthorized()
             return
         parsed = urlparse(self.path)
@@ -1387,6 +1411,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if path == "/api/context/search":
+            if self.bind_host not in CONTEXT_LOOPBACK_HOSTS:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "Context API is loopback-only."})
+                return
+            try:
+                request = ContextQuery.model_validate(self._payload())
+                result = _context_provider.search(request)
+                self._json(HTTPStatus.OK, result.model_dump(mode="json"))
+            except ValidationError as exc:
+                self._json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    {
+                        "error": "Invalid context query.",
+                        "details": exc.errors(include_context=False),
+                    },
+                )
+            except Exception as exc:
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"error": f"Context search unavailable: {exc}"},
+                )
             return
         if path == "/api/timeline":
             try:
@@ -1597,9 +1643,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 expected_digest = str(payload.get("expected_digest", "")).strip()
                 if not from_name or not into:
                     raise ValueError("Both 'from_name' and 'into' are required.")
-                result = merge_people(
-                    from_name, into, expected_digest=expected_digest
-                )
+                result = merge_people(from_name, into, expected_digest=expected_digest)
                 self._json(
                     HTTPStatus.OK,
                     {"from_name": from_name, "into": into, **asdict(result)},
@@ -1618,9 +1662,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 names = [str(name).strip() for name in raw_names]
                 into = str(payload.get("into", "")).strip()
                 expected_digest = str(payload.get("expected_digest", "")).strip()
-                result = merge_many_people(
-                    names, into, expected_digest=expected_digest
-                )
+                result = merge_many_people(names, into, expected_digest=expected_digest)
                 self._json(
                     HTTPStatus.OK,
                     {
@@ -1641,9 +1683,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 from_name = str(payload.get("from_name", "")).strip()
                 new_name = str(payload.get("new_name", "")).strip()
                 expected_digest = str(payload.get("expected_digest", "")).strip()
-                result = rename_person(
-                    from_name, new_name, expected_digest=expected_digest
-                )
+                result = rename_person(from_name, new_name, expected_digest=expected_digest)
                 self._json(
                     HTTPStatus.OK,
                     {"from_name": from_name, "new_name": new_name, **asdict(result)},
@@ -1674,9 +1714,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found."})
 
     def do_DELETE(self) -> None:
-        if not dashboard_auth.authorized(
-            urlparse(self.path).path.rstrip("/") or "/", self.headers, self.bind_host
-        ):
+        if not self._request_authorized():
             self._unauthorized()
             return
         path = urlparse(self.path).path.rstrip("/")
@@ -1700,7 +1738,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         content = target.read_bytes()
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", mimetypes.guess_type(target.name)[0] or "application/octet-stream")
+        self.send_header(
+            "Content-Type", mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        )
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -1826,7 +1866,7 @@ def classify_meeting_category(
         if len(parts) >= 3:
             for line in parts[1].splitlines():
                 if line.startswith("category:"):
-                    raw_cat = line.split("category:", 1)[-1].strip().strip('"\'').lower()
+                    raw_cat = line.split("category:", 1)[-1].strip().strip("\"'").lower()
                     if raw_cat in {"personal", "household"}:
                         domain = "Personal"
                         domain_declared = True
@@ -1834,7 +1874,7 @@ def classify_meeting_category(
                         domain = "Professional"
                         domain_declared = True
                 elif line.startswith("type:"):
-                    raw_type = line.split("type:", 1)[-1].strip().strip('"\'').lower()
+                    raw_type = line.split("type:", 1)[-1].strip().strip("\"'").lower()
                     if raw_type in {"standup", "daily"}:
                         sub_type = "Standup"
                     elif raw_type in {"one-on-one", "1:1", "1-on-1"}:
@@ -1858,13 +1898,24 @@ def classify_meeting_category(
     # needs either a hit in the title, an unambiguous phrase, or two independent
     # hits before it can outweigh the default.
     strong_personal = [
-        r"rental property", r"personal matter", r"personal appointment",
-        r"separation agreement", r"car repair", r"family member",
-        r"doctor'?s? appointment", r"health insurance", r"blacklock",
+        r"rental property",
+        r"personal matter",
+        r"personal appointment",
+        r"separation agreement",
+        r"car repair",
+        r"family member",
+        r"doctor'?s? appointment",
+        r"health insurance",
+        r"blacklock",
     ]
     weak_personal = [
-        r"tenant", r"lease", r"landlord", r"mortgage", r"household",
-        r"family", r"doctor",
+        r"tenant",
+        r"lease",
+        r"landlord",
+        r"mortgage",
+        r"household",
+        r"family",
+        r"doctor",
     ]
     title_text = (title or "").lower()
 
@@ -1889,9 +1940,14 @@ def classify_meeting_category(
             sub_type = "1:1 Meeting"
         elif any(k in combined for k in ["roadmap", "planning", "delivery", "sprint"]):
             sub_type = "Planning & Delivery"
-        elif any(k in combined for k in ["architecture", "integration", "discovery", "crowdstrike", "fabric", "kafka"]):
+        elif any(
+            k in combined
+            for k in ["architecture", "integration", "discovery", "crowdstrike", "fabric", "kafka"]
+        ):
             sub_type = "Architecture & Discovery"
-        elif any(k in combined for k in ["measurement", "review", "audit", "governance", "uce", "top 15"]):
+        elif any(
+            k in combined for k in ["measurement", "review", "audit", "governance", "uce", "top 15"]
+        ):
             sub_type = "Governance & Review"
 
     return {
@@ -1909,6 +1965,7 @@ def format_meeting_datetime(date_str: str | None, time_str: str | None) -> dict[
     if date_str:
         try:
             from datetime import date
+
             d = date.fromisoformat(date_str)
             weekday = d.strftime("%A")
             formatted_date = d.strftime("%b %d, %Y")
@@ -1931,7 +1988,6 @@ def format_meeting_datetime(date_str: str | None, time_str: str | None) -> dict[
         "formatted_time": formatted_time,
         "weekday": weekday,
     }
-
 
 
 def _meeting_summary(row: dict[str, Any]) -> dict[str, Any]:

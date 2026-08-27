@@ -1,18 +1,13 @@
 """Push the manifest's entities and relations straight into LightRAG's graph.
 
-LightRAG normally discovers a graph itself, by asking its configured LLM to read
-every chunk and name the entities. Here that LLM was qwen3:4b on CPU at ~3.6
-tokens/sec, which exceeded LightRAG's 240s per-call timeout on the first chunk of
-every document: 43 of 43 documents ended in status=failed and the graph stayed
-empty, while the index stage reported success because LightRAG returns 200 when
-it *enqueues* a document, long before extraction runs.
+LightRAG can discover a graph through a model-backed document route, but this
+build does not use it. Earlier document attempts failed asynchronously while the
+index stage treated enqueue acknowledgements as completion.
 
 Re-running that extraction is not the fix. The pipeline has already extracted
 this graph once, with a frontier model on the user's subscription, during the
-minutes stage - 537 entity rows and 349 relations, canonicalised through the
-people registry. Asking a 4B model to rediscover it badly, for roughly eighteen
-hours of CPU, buys nothing. So we author the graph directly and leave Ollama to
-serve embeddings, which it does in ~2.5s a chunk once it is not being evicted.
+minutes stage. We author those records directly; LightRAG is storage and graph
+traversal only, and no model-backed LightRAG route is part of this build.
 
 The manifest stays the source of truth: a full rebuild is one command, and
 nothing here is load-bearing for the minutes themselves.
@@ -21,6 +16,7 @@ nothing here is load-bearing for the minutes themselves.
 from __future__ import annotations
 
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,8 +25,7 @@ import httpx
 from pipeline import db
 from pipeline.config import LIGHTRAG_API_KEY, LIGHTRAG_URL
 
-# One HTTP round trip per entity and per relation, against a local container.
-# Generous, because the first call can land while Ollama is still loading a model.
+# One HTTP round trip per entity and per relation, against a loopback service.
 REQUEST_TIMEOUT_SEC = 120.0
 
 
@@ -209,10 +204,14 @@ def sync(conn: sqlite3.Connection | None = None) -> SyncReport:
     return report
 
 
-def graph_labels() -> list[str]:
+def graph_labels(timeout_sec: float = 30.0) -> list[str]:
     """Entity labels currently in the graph. Empty means retrieval is dead."""
     try:
-        resp = httpx.get(f"{LIGHTRAG_URL}/graph/label/list", headers=_headers(), timeout=30.0)
+        resp = httpx.get(
+            f"{LIGHTRAG_URL}/graph/label/list",
+            headers=_headers(),
+            timeout=timeout_sec,
+        )
         resp.raise_for_status()
         labels = resp.json()
         return labels if isinstance(labels, list) else []
@@ -221,21 +220,76 @@ def graph_labels() -> list[str]:
 
 
 # ── Retrieval ─────────────────────────────────────────────────────────
-# LightRAG's own /query path runs keyword extraction through its configured LLM
-# before it touches the graph, so on this machine it inherits qwen3:4b at 3.6
-# tok/s and returns HTTP 500 after four minutes. The graph itself answers a
-# traversal in ~2.6s. So we retrieve here - label match, then subgraph - and
-# leave synthesis to the subscription-backed models in pipeline.llm. No local
-# model sits anywhere in the answer path.
+# LightRAG's own /query path is model-backed, so this build does not call it.
+# The graph itself answers a traversal directly. We retrieve here - label match,
+# then subgraph - and leave synthesis to the subscription-backed providers in
+# pipeline.llm.
 
 STOPWORDS = {
-    "what", "when", "who", "why", "how", "which", "where", "the", "a", "an", "is",
-    "are", "was", "were", "do", "does", "did", "we", "i", "you", "they", "it",
-    "of", "on", "in", "to", "for", "and", "or", "about", "with", "that", "this",
-    "there", "any", "some", "our", "my", "me", "be", "been", "have", "has", "had",
-    "decided", "decision", "decisions", "made", "discuss", "discussed", "said",
-    "tell", "show", "give", "list", "summary", "summarise", "summarize", "recent",
-    "recently", "last", "week", "meeting", "meetings",
+    "what",
+    "when",
+    "who",
+    "why",
+    "how",
+    "which",
+    "where",
+    "the",
+    "a",
+    "an",
+    "is",
+    "are",
+    "was",
+    "were",
+    "do",
+    "does",
+    "did",
+    "we",
+    "i",
+    "you",
+    "they",
+    "it",
+    "of",
+    "on",
+    "in",
+    "to",
+    "for",
+    "and",
+    "or",
+    "about",
+    "with",
+    "that",
+    "this",
+    "there",
+    "any",
+    "some",
+    "our",
+    "my",
+    "me",
+    "be",
+    "been",
+    "have",
+    "has",
+    "had",
+    "decided",
+    "decision",
+    "decisions",
+    "made",
+    "discuss",
+    "discussed",
+    "said",
+    "tell",
+    "show",
+    "give",
+    "list",
+    "summary",
+    "summarise",
+    "summarize",
+    "recent",
+    "recently",
+    "last",
+    "week",
+    "meeting",
+    "meetings",
 }
 
 
@@ -265,17 +319,91 @@ def _match_labels(question: str, labels: list[str], limit: int = 4) -> list[str]
     return [label for _, _, label in scored[:limit]]
 
 
-def _subgraph(client: httpx.Client, label: str, max_nodes: int = 24) -> dict[str, Any]:
+def _subgraph(
+    client: httpx.Client,
+    label: str,
+    max_nodes: int = 24,
+    timeout_sec: float = 60.0,
+) -> dict[str, Any]:
     try:
         resp = client.get(
             f"{LIGHTRAG_URL}/graphs",
             headers=_headers(),
             params={"label": label, "max_depth": 2, "max_nodes": max_nodes},
-            timeout=60.0,
+            timeout=timeout_sec,
         )
         return resp.json() if resp.status_code == 200 else {}
     except httpx.HTTPError:
         return {}
+
+
+def retrieve_graph(
+    question: str,
+    max_nodes: int = 24,
+    timeout_sec: float = 60.0,
+) -> dict[str, Any]:
+    """Return one normalized graph traversal without invoking an LLM.
+
+    This is the retrieval seam shared by answer synthesis and the local context
+    API. Keeping label matching and traversal here prevents the two consumers
+    from developing subtly different rankings for the same question.
+    """
+    deadline = time.monotonic() + max(0.1, timeout_sec)
+    labels = graph_labels(timeout_sec=min(30.0, timeout_sec))
+    if not labels:
+        return {"available": False, "matched_labels": [], "nodes": [], "edges": []}
+    matched = _match_labels(question, labels)
+    if not matched:
+        return {"available": True, "matched_labels": [], "nodes": [], "edges": []}
+
+    seen_nodes: dict[str, dict[str, Any]] = {}
+    seen_edges: set[tuple[str, str, str]] = set()
+    edges: list[dict[str, Any]] = []
+
+    with httpx.Client() as client:
+        for label in matched:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            data = _subgraph(
+                client,
+                label,
+                max_nodes=max_nodes,
+                timeout_sec=max(0.1, remaining),
+            )
+            for node in data.get("nodes", []):
+                props = node.get("properties", node)
+                name = str(props.get("entity_id") or props.get("id") or "").strip()
+                desc = str(props.get("description") or "").strip()
+                if name and name not in seen_nodes:
+                    seen_nodes[name] = {
+                        "name": name,
+                        "description": desc,
+                        "source_id": str(props.get("source_id") or ""),
+                    }
+            for edge in data.get("edges", []):
+                props = edge.get("properties", {})
+                src = str(edge.get("source") or "").strip()
+                dst = str(edge.get("target") or "").strip()
+                rel = str(props.get("keywords") or props.get("description") or "relates to")
+                key = (src, rel, dst)
+                if src and dst and key not in seen_edges:
+                    seen_edges.add(key)
+                    edges.append(
+                        {
+                            "source": src,
+                            "target": dst,
+                            "relationship": rel,
+                            "source_id": str(props.get("source_id") or ""),
+                        }
+                    )
+
+    return {
+        "available": True,
+        "matched_labels": matched,
+        "nodes": list(seen_nodes.values()),
+        "edges": edges,
+    }
 
 
 def retrieve_context(question: str, max_chars: int = 6000) -> str:
@@ -285,42 +413,23 @@ def retrieve_context(question: str, max_chars: int = 6000) -> str:
     the caller still supplies the minutes themselves, so this adds the shape of
     the record - who owns what, what depends on what - rather than replacing it.
     """
-    labels = graph_labels()
-    if not labels:
-        return ""
-    matched = _match_labels(question, labels)
+    graph = retrieve_graph(question)
+    matched = graph["matched_labels"]
     if not matched:
         return ""
 
-    seen_nodes: dict[str, str] = {}
-    seen_edges: set[tuple[str, str, str]] = set()
-    edge_lines: list[str] = []
-
-    with httpx.Client() as client:
-        for label in matched:
-            data = _subgraph(client, label)
-            for node in data.get("nodes", []):
-                props = node.get("properties", node)
-                name = str(props.get("entity_id") or props.get("id") or "").strip()
-                desc = str(props.get("description") or "").strip()
-                if name and name not in seen_nodes and desc:
-                    seen_nodes[name] = desc
-            for edge in data.get("edges", []):
-                props = edge.get("properties", {})
-                src = str(edge.get("source") or "").strip()
-                dst = str(edge.get("target") or "").strip()
-                rel = str(props.get("keywords") or props.get("description") or "relates to")
-                key = (src, rel, dst)
-                if src and dst and key not in seen_edges:
-                    seen_edges.add(key)
-                    edge_lines.append(f"- {src} {rel} {dst}")
-
-    if not seen_nodes and not edge_lines:
+    if not graph["nodes"] and not graph["edges"]:
         return ""
 
     parts = [f"## Knowledge graph (matched: {', '.join(matched)})", "", "### Entities"]
-    parts.extend(f"- **{name}**: {desc}" for name, desc in seen_nodes.items())
-    if edge_lines:
+    parts.extend(
+        f"- **{node['name']}**: {node['description']}"
+        for node in graph["nodes"]
+        if node["description"]
+    )
+    if graph["edges"]:
         parts += ["", "### Relationships"]
-        parts.extend(edge_lines)
+        parts.extend(
+            f"- {edge['source']} {edge['relationship']} {edge['target']}" for edge in graph["edges"]
+        )
     return "\n".join(parts)[:max_chars]

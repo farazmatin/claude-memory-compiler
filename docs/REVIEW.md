@@ -63,42 +63,37 @@ inline.
 These were deferred in the first pass and have since been built. Each notes what
 code cannot fix.
 
-### O1 — The subscription ceiling ✔ mitigated
+### O1 — The subscription-only graph path ✔ addressed
 
-No subscription can serve LightRAG (it needs an HTTP endpoint) and none offers an
-embedding model, so graph extraction runs on a ~4B local model on CPU. That
-constraint is permanent. Both designed mitigations are now built:
+The active build does not call LightRAG's model-backed ingestion or query routes.
+Both parts of the replacement are built:
 
 **O1a — the compiler emits the graph.** `pipeline/entities.py` parses explicit
 `Entities` and `Relations` sections from the minutes, canonicalizes person names
-through the people registry, stores them in the manifest, and appends a normalized
-block to the indexed document. The reasoning: a small model reads
-`Atlas (feature): the platform rewrite` reliably and discovers the same fact from
-narrative prose unreliably. The frontier model that compiles the minutes now does
-that work once, and the local model only has to read it.
+through the people registry, stores them in the manifest, and publishes the exact
+records through `pipeline graph-sync`. The subscription model compiling the minutes
+does the quality-sensitive extraction once; LightRAG is storage/traversal only.
 
 The parser is deliberately tolerant of shape (`-` bullets, `[]` brackets, `->`/`→`/`|`
 arrows, missing descriptions) because models produce all of those for one
 instruction, and recovering most of a messy block beats discarding all of a
 slightly-malformed one.
 
-**O1b — retrieval and synthesis are split.** `pipeline/answer.py` retrieves via
-LightRAG and hands the context to the subscription chain to write the answer.
-`--local` keeps LightRAG's own generation for comparison, and it is the automatic
-fallback when no provider is reachable — an answer from the small model beats no
-answer. Empty retrieval short-circuits rather than asking a model to answer from
-nothing, which is how a knowledge base starts inventing.
+**O1b — retrieval and synthesis are split.** `pipeline/answer.py` combines
+deterministic graph traversal with a bounded minutes/register scan, then hands the
+context to the subscription chain. If no provider is reachable, it returns the
+cited context directly. Empty retrieval short-circuits rather than asking a model
+to answer from nothing.
 
-*Residual:* the manifest copy of entities means the corpus is no longer dependent on
-LightRAG's extraction quality, but graph *traversal* still happens inside LightRAG.
+*Residual:* lexical graph matching and bounded minutes search need known-answer
+recall checks as the corpus grows.
 
 ### O2 — Verification ✔ made possible, not completed
 
-`pipeline doctor` runs 18 checks: ffmpeg/ffprobe, whisperx importability, the ASR
-model against the device, **HF token plus actual gated-model reachability**, every
-provider in the chain, LightRAG health and whether its storage backend is
-file-based, Ollama models, directories, disk headroom, manifest state, and glossary
-depth. Each failure carries the fix.
+`pipeline doctor` checks ffmpeg/ffprobe, whisperx importability, the ASR backend,
+**HF token plus actual gated-model reachability**, every subscription provider,
+LightRAG graph/storage health, directories, disk headroom, manifest state, and
+glossary depth. Each failure carries the fix.
 
 The gated-model check matters most: a token proves nothing about licence acceptance,
 which is the part people miss, and missing diarization costs every action item its
@@ -193,9 +188,9 @@ Two things remain true that no amount of code changes:
    tell you the environment is sound. Neither tells you the minutes are any good.
    That requires one real meeting, read against the audio, counting errors only on
    names, product terms, numbers and dates.
-2. **Graph traversal quality is still bounded by a small local model.** O1a moves
-   entity *identification* upstream to a frontier model, which is the larger half of
-   the problem, but the traversal that answers a question still runs locally.
+2. **Deterministic retrieval can miss vocabulary variants.** Entity identification
+   is subscription-authored, but lexical label matching still needs measured recall
+   and alias coverage.
 
 ---
 

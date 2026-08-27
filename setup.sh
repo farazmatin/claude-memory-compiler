@@ -125,27 +125,9 @@ ok "dependencies installed"
 
 # ── 4. Services ───────────────────────────────────────────────────────
 
-step "Starting services (LightRAG, Postgres, Ollama)"
+step "Starting services (LightRAG graph storage and Postgres)"
 docker compose up -d
 ok "containers started"
-
-printf '    waiting for Ollama'
-for _ in $(seq 1 30); do
-    if docker compose exec -T ollama ollama list >/dev/null 2>&1; then
-        printf '\n'; ok "Ollama ready"; break
-    fi
-    printf '.'; sleep 2
-done
-
-step "Pulling local models (a few GB, one time)"
-for model in qwen3:4b mxbai-embed-large; do
-    if docker compose exec -T ollama ollama list 2>/dev/null | grep -q "${model%%:*}"; then
-        ok "$model already present"
-    else
-        printf '    pulling %s...\n' "$model"
-        docker compose exec -T ollama ollama pull "$model" && ok "$model pulled"
-    fi
-done
 
 # ── 5. Initialise ─────────────────────────────────────────────────────
 

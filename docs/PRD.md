@@ -37,8 +37,8 @@ key.
 | G2 | Answers cite their source | Every claim carries an audio timestamp; every retrieval cites a meeting |
 | G3 | Aggregative questions work | "Everything customer Y said" returns material from many meetings, not five chunks |
 | G4 | The archive improves retroactively | A better minutes template rebuilds all history with no re-transcription |
-| G5 | Marginal cost per meeting ≈ 0 | Subscription LLMs and local models only; no metered API |
-| G6 | Content never leaves the host | No cloud service holds the corpus |
+| G5 | Marginal cost per meeting ≈ 0 | Subscription-backed CLIs only; no metered model API |
+| G6 | Durable corpus stays private | Raw artifacts and graph storage remain local and loopback-bound |
 
 ## Non-goals
 
@@ -85,16 +85,15 @@ them:
 | Constraint | Consequence |
 |---|---|
 | CPU-only server, no GPU | `large-v3-turbo` not `large-v3`; nightly batch not real-time |
-| Subscription LLMs (Gemini Flash → Codex → Claude), **no metered API** | Graph extraction cannot use them and runs on local Ollama |
-| No embedding model in any subscription | Embeddings are local Ollama, unconditionally |
+| Subscription LLMs (Codex → Claude → Antigravity), **no metered API** | Minutes, entities, relations, and answer synthesis use the enforced provider chain |
+| No embedding model in any subscription | Active retrieval is deterministic graph traversal plus bounded minutes/register search; no text embeddings |
 | ~5 meetings/day, indefinitely | Postgres storage from day one; ~9k documents within two years |
-| Sensitive business content | Loopback binding, local models, no cloud index |
+| Sensitive business content | Loopback graph storage, bounded prompts, no public index |
 
-**The most important consequence:** subscriptions cannot serve LightRAG, which needs
-an HTTP endpoint, so its extraction runs on a small local model. Two jobs were
-therefore moved to where the subscription does reach — the compiler emits the graph
-explicitly (D17) and synthesis is split from retrieval (D18). What remains local is
-graph traversal. See
+**The most important consequence:** the active build does not use LightRAG's
+model-backed ingestion or query routes. The compiler emits the graph explicitly
+(D17), deterministic traversal retrieves it, and subscription synthesis writes the
+answer (D18). See
 [ARCHITECTURE.md](ARCHITECTURE.md#the-subscription-ceiling).
 
 ## Success criteria
@@ -136,9 +135,8 @@ environment; none of these are environment questions.
 - Does `large-v3-turbo` lose accuracy that matters on real far-field meeting audio?
   Measure on one recording, counting errors only on names, product terms, numbers
   and dates.
-- Is graph traversal on a 4B local model good enough once entities are supplied
-  explicitly? Compiler-emitted entities (D17) removed the identification half of
-  this; the traversal half is untested.
+- Does deterministic graph traversal preserve enough cross-meeting recall as the
+  corpus grows? Measure it against the known-answer context set.
 - What is query latency at ~9k documents? `--timing` instruments it; the corpus is
   empty so far.
 - Are meetings in-person or virtual? Virtual would make Google Meet's Drive

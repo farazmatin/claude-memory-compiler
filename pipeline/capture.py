@@ -233,12 +233,6 @@ def google_drive_client() -> DriveClient:
     return _GoogleDriveClient(build("drive", "v3", credentials=credentials), MediaIoBaseDownload)
 
 
-def authorize() -> None:
-    """Authorize Google Drive interactively via browser OAuth."""
-    _credentials(interactive=True)
-    print("Google Drive successfully authorized.")
-
-
 def _credentials(*, interactive: bool):
     try:
         from google.auth.transport.requests import Request

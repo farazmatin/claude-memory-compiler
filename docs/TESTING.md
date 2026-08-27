@@ -68,7 +68,7 @@ Substituted, and only because each needs a GPU, a subscription, or a docker stac
 | Failure handling | exit codes, alerting, requeue-and-recover, one bad file not stopping the batch |
 | Data safety | inbox never modified, backup round-trips into a queryable database |
 | Cross-meeting | oldest-first ordering, prior context reaching the compiler, name normalization |
-| Operator surface | `status`, `doctor`, `entities`, `query --timing`, `query --local` |
+| Operator surface | `status`, `doctor`, `entities`, `graph-sync`, `query --timing` |
 
 ---
 
@@ -132,10 +132,10 @@ The functional layer proves the app's own wiring. It cannot prove:
 
 - **Transcription accuracy** — needs real Whisper on real meeting audio.
 - **Diarization quality** — needs real pyannote and real overlapping speech.
-- **Graph and retrieval quality** — needs real LightRAG, real Ollama, real Postgres,
-  and a corpus large enough to matter.
-- **The real CLI invocations** — `gemini -p -` and `codex exec -` are best guesses;
-  both binary and arguments are environment-overridable for that reason.
+- **Graph and retrieval quality** — needs real LightRAG/Postgres and a corpus large
+  enough to measure deterministic traversal recall.
+- **The real CLI invocations** — Codex, Claude, and Antigravity remain
+  environment-overridable because their CLI envelopes can change.
 
 `pipeline doctor` checks that these components are present and configured. Only
 running one real meeting and reading the result tells you they work well.

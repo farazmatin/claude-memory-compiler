@@ -58,6 +58,8 @@ class FakeLightRAG:
 
     def __init__(self, kv_storage: str = "PGKVStorage"):
         self.documents: dict[str, dict] = {}
+        self.graph_entities: dict[str, dict] = {}
+        self.graph_relations: list[dict] = []
         self.deleted: list[str] = []
         self.queries: list[dict] = []
         self.kv_storage = kv_storage
@@ -99,11 +101,43 @@ class FakeLightRAG:
                     return {}
 
             def do_GET(self):
-                if self.path == "/health":
+                path = self.path.split("?", 1)[0]
+                if path == "/health":
                     self._send(200, {
                         "status": "healthy",
                         "configuration": {"kv_storage": outer.kv_storage},
                     })
+                elif path == "/graph/label/list":
+                    self._send(200, sorted(outer.graph_entities))
+                elif path == "/graphs":
+                    self._send(200, {
+                        "nodes": [
+                            {"properties": {"entity_id": name, **data}}
+                            for name, data in sorted(outer.graph_entities.items())
+                        ],
+                        "edges": [
+                            {
+                                "source": relation["source_entity"],
+                                "target": relation["target_entity"],
+                                "properties": relation["relation_data"],
+                            }
+                            for relation in outer.graph_relations
+                        ],
+                    })
+                elif path == "/documents/pipeline_status":
+                    self._send(200, {
+                        "busy": False,
+                        "destructive_busy": False,
+                        "pending_enqueues": 0,
+                        "recovery_required": False,
+                        "latest_message": "idle",
+                    })
+                elif self.path == "/documents/status_counts":
+                    counts: dict[str, int] = {}
+                    for document in outer.documents.values():
+                        status = document.get("status", "unknown")
+                        counts[status] = counts.get(status, 0) + 1
+                    self._send(200, {"status_counts": counts})
                 else:
                     self._send(404, {"detail": "not found"})
 
@@ -121,8 +155,27 @@ class FakeLightRAG:
                     outer.documents[doc_id] = {
                         "text": text,
                         "file_source": payload.get("file_source"),
+                        "status": "processed",
+                        "chunks_count": 1,
                     }
                     self._send(200, {"status": "success", "id": doc_id})
+                elif self.path == "/documents/paginated":
+                    page = int(payload.get("page", 1))
+                    page_size = int(payload.get("page_size", 50))
+                    documents = [
+                        {
+                            "id": doc_id,
+                            "file_path": document.get("file_source") or "",
+                            "status": document.get("status", "unknown"),
+                            "chunks_count": document.get("chunks_count"),
+                        }
+                        for doc_id, document in sorted(outer.documents.items())
+                    ]
+                    start = (page - 1) * page_size
+                    self._send(200, {
+                        "documents": documents[start : start + page_size],
+                        "total_count": len(documents),
+                    })
                 elif self.path == "/query":
                     outer.queries.append(payload)
                     if payload.get("only_need_context"):
@@ -130,7 +183,33 @@ class FakeLightRAG:
                         joined = "\n\n".join(d["text"] for d in outer.documents.values())
                         self._send(200, {"response": joined[:4000]})
                     else:
-                        self._send(200, {"response": "local-model answer"})
+                        self._send(200, {"response": "model-backed answer"})
+                elif self.path == "/graph/entity/create":
+                    name = payload["entity_name"]
+                    if name in outer.graph_entities:
+                        self._send(409, {"detail": "entity already exists"})
+                    else:
+                        outer.graph_entities[name] = payload["entity_data"]
+                        self._send(200, {"status": "success"})
+                elif self.path == "/graph/relation/create":
+                    key = (
+                        payload["source_entity"],
+                        payload["target_entity"],
+                        payload["relation_data"].get("keywords"),
+                    )
+                    existing = {
+                        (
+                            row["source_entity"],
+                            row["target_entity"],
+                            row["relation_data"].get("keywords"),
+                        )
+                        for row in outer.graph_relations
+                    }
+                    if key in existing:
+                        self._send(409, {"detail": "relation already exists"})
+                    else:
+                        outer.graph_relations.append(payload)
+                        self._send(200, {"status": "success"})
                 else:
                     self._send(404, {"detail": "not found"})
 
@@ -143,7 +222,11 @@ class FakeLightRAG:
                     for doc_id in payload.get("doc_ids", []):
                         outer.documents.pop(doc_id, None)
                         outer.deleted.append(doc_id)
-                    self._send(200, {"status": "success"})
+                    self._send(200, {
+                        "status": "deletion_started",
+                        "message": "deletion completed",
+                        "doc_id": (payload.get("doc_ids") or [""])[0],
+                    })
                 elif self.path.startswith("/documents/"):
                     doc_id = self.path.rsplit("/", 1)[-1]
                     outer.documents.pop(doc_id, None)

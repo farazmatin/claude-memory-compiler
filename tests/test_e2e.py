@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from pipeline import asr, cli, compile_minutes, db, index, llm, people_merge
+from pipeline import asr, cli, compile_minutes, db, graph_sync, index, llm, people_merge
 from tests.e2e_harness import (
     FakeASRBackend,
     FakeLightRAG,
@@ -38,7 +38,7 @@ def app(tmp_path, monkeypatch):
 
     env = pipeline_env(tmp_path, server.url)
     env.update(install_fake_llm(tmp_path))
-    apply_env(monkeypatch, env, [asr, index, cli, llm, compile_minutes])
+    apply_env(monkeypatch, env, [asr, index, graph_sync, cli, llm, compile_minutes])
     monkeypatch.setattr(asr, "default_backend", lambda: backend)
     # This fixture's audio is ~1s with a fixed ~30-word canned transcript,
     # deliberately tiny for speed - by design that is exactly what the
@@ -83,6 +83,7 @@ def add_meeting(app, name: str = "Ali Aug 10 at 11-12 a.m..m4a", freq: int = 440
 # E2E-1  Happy path: audio in, answer out
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def test_full_pipeline_audio_to_answer(app, capsys):
     """The whole product in one test: a recording becomes a queryable answer."""
     add_meeting(app)
@@ -104,7 +105,7 @@ def test_full_pipeline_audio_to_answer(app, capsys):
 
     # It reached the end of the ladder.
     assert meeting.status == db.INDEXED
-    assert meeting.lightrag_doc_id, "doc id recorded for replace-on-recompile"
+    assert meeting.lightrag_doc_id is None, "active graph publication creates no document"
 
     # Every artifact exists on disk.
     assert Path(meeting.transcript_path).exists()
@@ -113,9 +114,7 @@ def test_full_pipeline_audio_to_answer(app, capsys):
 
     # Speakers resolved through the real LLM subprocess.
     with db.connect() as conn:
-        assert db.get_speakers(conn, meeting.id) == {
-            "SPEAKER_00": "Faraz", "SPEAKER_01": "Ali"
-        }
+        assert db.get_speakers(conn, meeting.id) == {"SPEAKER_00": "Faraz", "SPEAKER_01": "Ali"}
 
     # Entities were parsed out of the minutes and stored.
     with db.connect() as conn:
@@ -123,11 +122,12 @@ def test_full_pipeline_audio_to_answer(app, capsys):
         assert {"Atlas", "Faraz", "Northwind"} <= names
         assert db.get_relations(conn, meeting.id), "relations extracted"
 
-    # The document reached the index, carrying the canonicalized graph block.
-    assert len(app.lightrag.documents) == 1
-    indexed = next(iter(app.lightrag.documents.values()))["text"]
-    assert "## Knowledge Graph" in indexed
-    assert "Atlas -> part of -> 2026.4" in indexed
+    # Subscription-authored records reached the graph directly.
+    assert "Atlas" in app.lightrag.graph_entities
+    assert any(
+        relation["source_entity"] == "Atlas"
+        for relation in app.lightrag.graph_relations
+    )
 
     # And a question gets an answer.
     assert app.run("query", "why was Atlas deferred?") == 0
@@ -137,6 +137,7 @@ def test_full_pipeline_audio_to_answer(app, capsys):
 # ═══════════════════════════════════════════════════════════════════════
 # E2E-2  Dedup against real duplicate files
 # ═══════════════════════════════════════════════════════════════════════
+
 
 def test_duplicate_audio_is_ingested_once(app):
     """The source Drive folder really does contain byte-identical duplicates."""
@@ -148,13 +149,14 @@ def test_duplicate_audio_is_ingested_once(app):
     assert len(app.meetings()) == 1, "identical bytes under a different name is one meeting"
 
     app.run("run", "--owner", "Faraz")
-    assert len(app.lightrag.documents) == 1
+    assert "Atlas" in app.lightrag.graph_entities
     assert len(app.asr_backend.calls) == 1, "the expensive stage ran once"
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # E2E-3  Resumability and idempotence
 # ═══════════════════════════════════════════════════════════════════════
+
 
 def test_stages_advance_one_at_a_time(app):
     """Each stage claims its own status and hands on. This is what makes a crash
@@ -166,7 +168,7 @@ def test_stages_advance_one_at_a_time(app):
         ("transcribe", db.TRANSCRIBED),
         ("speakers", db.SPEAKERS_RESOLVED),
         ("minutes", db.MINUTES_COMPILED),
-        ("index", db.INDEXED),
+        ("graph-sync", db.INDEXED),
     ]:
         args = [command] + (["--owner", "Faraz"] if command == "speakers" else [])
         assert app.run(*args) == 0
@@ -178,11 +180,14 @@ def test_rerunning_a_completed_batch_does_nothing(app):
     app.run("run", "--owner", "Faraz")
 
     calls_before = len(app.asr_backend.calls)
-    docs_before = dict(app.lightrag.documents)
+    graph_before = (
+        dict(app.lightrag.graph_entities),
+        list(app.lightrag.graph_relations),
+    )
 
     assert app.run("run", "--owner", "Faraz") == 0
     assert len(app.asr_backend.calls) == calls_before, "no re-transcription"
-    assert app.lightrag.documents == docs_before, "no re-indexing"
+    assert (app.lightrag.graph_entities, app.lightrag.graph_relations) == graph_before
 
 
 def test_second_scan_skips_known_inbox_files(app):
@@ -207,11 +212,18 @@ def test_second_scan_skips_known_inbox_files(app):
 # E2E-4  Recompilation — the payoff for retaining transcripts
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def test_recompile_rebuilds_without_retranscribing(app, monkeypatch, tmp_path):
     """Bump the template, rebuild history, pay no ASR cost. This is the property
     the whole three-tier design exists to provide."""
     add_meeting(app)
     app.run("run", "--owner", "Faraz")
+
+    # Seed the explicit legacy document-repair path. The normal batch now ends
+    # at direct graph publication and never creates a LightRAG document.
+    with db.connect() as conn:
+        db.advance(conn, app.meetings()[0].id, db.MINUTES_COMPILED)
+    assert app.run("index") == 0
 
     asr_calls = len(app.asr_backend.calls)
     old_doc_id = app.meetings()[0].lightrag_doc_id
@@ -223,12 +235,16 @@ def test_recompile_rebuilds_without_retranscribing(app, monkeypatch, tmp_path):
     from pipeline.config import TEMPLATE_VERSION as CURRENT_VERSION
 
     bumped = f"{CURRENT_VERSION}-next"
-    revised = (tmp_path / "minutes_response.md").read_text().replace(
-        f'template_version: "{CURRENT_VERSION}"', f'template_version: "{bumped}"'
-    ).replace("Atlas Roadmap Review", "Atlas Roadmap Review (revised)")
+    revised = (
+        (tmp_path / "minutes_response.md")
+        .read_text()
+        .replace(f'template_version: "{CURRENT_VERSION}"', f'template_version: "{bumped}"')
+        .replace("Atlas Roadmap Review", "Atlas Roadmap Review (revised)")
+    )
     (tmp_path / "minutes_response.md").write_text(revised, encoding="utf-8")
 
     from pipeline import compile_minutes
+
     monkeypatch.setattr(compile_minutes, "TEMPLATE_VERSION", bumped)
     monkeypatch.setattr(cli, "TEMPLATE_VERSION", bumped)
 
@@ -250,6 +266,11 @@ def test_reindex_is_abandoned_when_the_stale_copy_survives(app):
     add_meeting(app)
     app.run("run", "--owner", "Faraz")
 
+    # Seed one legacy document so this test can exercise delete-before-replace.
+    with db.connect() as conn:
+        db.advance(conn, app.meetings()[0].id, db.MINUTES_COMPILED)
+    assert app.run("index") == 0
+
     # Force new content, then make deletion impossible.
     (app.minutes_dir / next(iter(p.name for p in app.minutes_dir.glob("*.md")))).write_text(
         "---\ndate: 2026-08-10\ntitle: Changed\n---\n# Changed\n", encoding="utf-8"
@@ -266,6 +287,7 @@ def test_reindex_is_abandoned_when_the_stale_copy_survives(app):
 # E2E-5  Failure handling
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def test_batch_failure_exits_nonzero_and_alerts(app, tmp_path, monkeypatch):
     """A nightly cron must not report success after a failure, and on a headless
     server the exit code alone reaches nobody."""
@@ -274,6 +296,7 @@ def test_batch_failure_exits_nonzero_and_alerts(app, tmp_path, monkeypatch):
 
     alert_log = tmp_path / "alert.txt"
     from pipeline import alert
+
     monkeypatch.setattr(alert, "ALERT_COMMAND", f"tee {alert_log}")
 
     assert app.run("run", "--owner", "Faraz") == 1
@@ -354,6 +377,7 @@ def test_provider_failure_leaves_transcript_intact(app, tmp_path, monkeypatch):
 # E2E-6  Data safety
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def test_inbox_is_never_modified(app):
     """The inbox is a cloud-synced folder; deleting from it destroys the original."""
     audio = add_meeting(app)
@@ -406,6 +430,7 @@ def test_transcripts_are_retained_and_readable(app):
 # E2E-7  Cross-meeting behaviour
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def test_meetings_are_processed_oldest_first(app):
     """Out-of-order compilation would compare a meeting against its own future."""
     add_meeting(app, "c Aug 12 at 9-10 a.m..m4a", freq=300)
@@ -427,6 +452,7 @@ def test_second_meeting_receives_prior_context(app, tmp_path, monkeypatch):
 
     captured: list[str] = []
     from pipeline import compile_minutes
+
     real_build = compile_minutes.build_prompt
 
     def spy(*args, **kwargs):
@@ -460,6 +486,7 @@ def test_people_registry_normalizes_across_meetings(app):
 # E2E-8  Operator surface
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def test_status_reports_state_and_measured_timings(app, capsys):
     add_meeting(app)
     app.run("run", "--owner", "Faraz")
@@ -469,7 +496,9 @@ def test_status_reports_state_and_measured_timings(app, capsys):
     out = capsys.readouterr().out
     assert "indexed" in out
     assert "Stage timings" in out, "measured, not estimated"
-    assert "LightRAG: reachable" in out
+    assert "LightRAG readiness" in out
+    assert "documents processed" in out
+    assert "vector chunks ready" in out
 
 
 def test_doctor_passes_against_a_configured_environment(app, capsys):
@@ -508,12 +537,3 @@ def test_query_timing_attributes_latency(app, capsys):
     # is exactly why this assertion lives here instead - on the real CLI output.
     assert "via gemini" in out, "the timing line must name the provider that answered"
     assert "via None" not in out
-
-
-def test_local_query_uses_lightrag_generation(app, capsys):
-    add_meeting(app)
-    app.run("run", "--owner", "Faraz")
-    capsys.readouterr()
-
-    assert app.run("query", "what happened?", "--local") == 0
-    assert "local-model answer" in capsys.readouterr().out

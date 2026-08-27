@@ -5,8 +5,8 @@ deliberate constraint and it shapes the design:
 
 - Gemini and Codex are CLI tools, driven here as subprocesses.
 - Claude is driven through the Agent SDK.
-- None of them can serve LightRAG, which needs an HTTP endpoint. Graph and entity
-  extraction therefore runs on local Ollama - see AGENTS.md.
+- Their structured entity and relation output is published directly to
+  LightRAG. LightRAG itself is never allowed to invoke a model.
 
 Providers are tried in priority order and fall through on failure, so a quota
 limit or a transient CLI error on the preferred provider does not stall the
@@ -164,7 +164,7 @@ def _gemini_auth_gate() -> str:
 
 
 def gemini_provider() -> CLIProvider:
-    """Gemini CLI. Highest priority: Flash is fast and cheap against quota."""
+    """Gemini CLI, available only when explicitly added to the provider order."""
     args = ["-m", GEMINI_MODEL] if GEMINI_MODEL else []
     binary = os.environ.get("MMC_GEMINI_BIN", "gemini")
     return CLIProvider(

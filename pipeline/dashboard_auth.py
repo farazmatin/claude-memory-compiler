@@ -44,6 +44,11 @@ LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 # tiny: the login page and the assets it needs to render, nothing that reads the
 # archive.
 PUBLIC_PATHS = {"/login", "/api/login", "/style.css", "/favicon.ico"}
+# Machine-to-machine context carries no raw transcript and is independently
+# rejected by DashboardHandler when the server is not loopback-bound. Keeping
+# these two paths local-service accessible avoids copying the dashboard secret
+# into Product Manager, which would collapse the repositories' security seam.
+LOOPBACK_SERVICE_PATHS = {"/api/context/search", "/api/context/health"}
 
 
 class AuthError(RuntimeError):
@@ -85,7 +90,7 @@ def check_startup(bind_host: str | None) -> None:
             f"Refusing to bind to {bind_host} without authentication. "
             "The dashboard exposes meeting minutes and DELETE /api/meetings/{id}. "
             "Set MMC_DASHBOARD_TOKEN in .env (any long random string; "
-            "`python -c \"import secrets;print(secrets.token_urlsafe(32))\"` "
+            '`python -c "import secrets;print(secrets.token_urlsafe(32))"` '
             "generates one), or bind to 127.0.0.1."
         )
 
@@ -145,6 +150,8 @@ def _cookie(headers) -> str | None:
 
 def authorized(path: str, headers, bind_host: str | None) -> bool:
     """Whether this request may proceed."""
+    if path in LOOPBACK_SERVICE_PATHS and is_loopback(bind_host):
+        return True
     if not enforced(bind_host):
         return True
     if path in PUBLIC_PATHS:

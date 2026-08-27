@@ -82,12 +82,27 @@ def block_live_lightrag_in_unit_tests(request, monkeypatch):
     if "e2e" not in request.keywords:
         from pipeline import graph_sync, index
 
+        def _blocked_client():
+            raise index.IndexError_("live LightRAG is blocked in unit tests")
+
+        monkeypatch.setattr(index, "_client", _blocked_client)
         monkeypatch.setattr(index, "query_context", lambda *args, **kwargs: "")
         # graph_sync.retrieve_context() otherwise makes a real httpx call to
         # LIGHTRAG_URL on every answer.ask(); default it to "no match" so unit
         # tests exercise the normal (local-fallback) path deterministically
         # unless a test opts into real graph content explicitly.
         monkeypatch.setattr(graph_sync, "retrieve_context", lambda *args, **kwargs: "")
+        monkeypatch.setattr(
+            graph_sync,
+            "retrieve_graph",
+            lambda *args, **kwargs: {
+                "available": False,
+                "matched_labels": [],
+                "nodes": [],
+                "edges": [],
+            },
+        )
+        monkeypatch.setattr(graph_sync, "graph_labels", lambda *args, **kwargs: [])
 
 
 @pytest.fixture()

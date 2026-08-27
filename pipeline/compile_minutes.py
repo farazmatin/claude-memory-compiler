@@ -14,6 +14,7 @@ transcripts with no ASR cost.
 from __future__ import annotations
 
 import re
+from contextlib import suppress
 from pathlib import Path
 
 from pipeline import commitments, db, entities
@@ -226,18 +227,18 @@ def load_prior_context(conn, meeting: db.Meeting, dialogue: str | None = None) -
 
     1. **Chronological** - the last few meetings. Cheap, always available, and
        catches same-day and next-day reversals.
-    2. **Topical** - a LightRAG retrieval for the subjects this meeting actually
-       discusses. This is the important one: a decision being reversed is usually
-       months old, so recency alone systematically misses exactly the long-horizon
-       reversals worth flagging.
+    2. **Topical** - deterministic LightRAG graph traversal for the subjects this
+       meeting actually discusses. This is the important one: a decision being
+       reversed is usually months old, so recency alone systematically misses
+       exactly the long-horizon reversals worth flagging.
 
     The topical lookup is safe by construction: minutes are compiled in stage 4 and
     indexed in stage 5, so this meeting is not yet in the index and every hit
     necessarily comes from an earlier one. No date filtering is needed, which is
     fortunate because LightRAG offers none.
 
-    Degrades to chronological-only when LightRAG is unreachable - prior context is
-    a quality improvement, not a prerequisite.
+    No model is invoked during retrieval. It degrades to chronological-only when
+    LightRAG is unreachable.
     """
     blocks: list[str] = []
 
@@ -258,9 +259,9 @@ def load_prior_context(conn, meeting: db.Meeting, dialogue: str | None = None) -
         blocks.append(f"### {prior.meeting_date} — {prior.title_hint or 'meeting'}\n\n{content}")
 
     if dialogue:
-        from pipeline import index
+        from pipeline import graph_sync
 
-        retrieved = index.query_context(build_topic_query(meeting, dialogue)).strip()
+        retrieved = graph_sync.retrieve_context(build_topic_query(meeting, dialogue)).strip()
         if retrieved:
             blocks.append(
                 "### Topically related earlier material\n\n"
@@ -549,10 +550,8 @@ def _delete_superseded_pm_minutes(meeting: db.Meeting, new_path: Path) -> None:
     if old_file_name != new_file_name:
         old_dest = EXPORT_PM_MINUTES_DIR / old_file_name
         if old_dest.exists():
-            try:
+            with suppress(OSError):
                 old_dest.unlink()
-            except OSError:
-                pass
 
 
 

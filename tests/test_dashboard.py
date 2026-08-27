@@ -378,7 +378,7 @@ def test_pipeline_status_and_trigger():
     assert "logs" in status
 
 
-def test_speaker_refresh_stage_runs_minutes_then_index(manifest, monkeypatch):
+def test_speaker_refresh_stage_runs_minutes_then_graph_sync(manifest, monkeypatch):
     from pipeline import cli
 
     make_meeting(manifest, "refresh-me", "2026-08-14", status=db.SPEAKERS_RESOLVED)
@@ -386,11 +386,36 @@ def test_speaker_refresh_stage_runs_minutes_then_index(manifest, monkeypatch):
     calls = []
     monkeypatch.setattr(cli, "ensure_dirs", lambda: None)
     monkeypatch.setattr(cli, "cmd_minutes", lambda args: calls.append("minutes") or 0)
-    monkeypatch.setattr(cli, "cmd_index", lambda args: calls.append("index") or 0)
+    monkeypatch.setattr(
+        cli, "cmd_graph_sync", lambda args: calls.append("graph-sync") or 0
+    )
 
     dashboard._run_pipeline_worker("speaker-refresh", None)
 
-    assert calls == ["minutes", "index"]
+    assert calls == ["minutes", "graph-sync"]
+
+
+def test_dashboard_search_refresh_uses_graph_sync_not_document_ingestion(
+    manifest, monkeypatch
+):
+    from pipeline import cli
+
+    calls = []
+    monkeypatch.setattr(cli, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(
+        cli, "cmd_graph_sync", lambda args: calls.append("graph-sync") or 0
+    )
+    monkeypatch.setattr(
+        cli,
+        "cmd_index",
+        lambda args: (_ for _ in ()).throw(
+            AssertionError("dashboard must not invoke model-backed document ingestion")
+        ),
+    )
+
+    dashboard._run_pipeline_worker("graph-sync", None)
+
+    assert calls == ["graph-sync"]
 
 
 def test_minutes_outside_archive_are_not_exposed(manifest, tmp_path, monkeypatch):

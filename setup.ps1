@@ -14,12 +14,9 @@
 
 .EXAMPLE
     .\setup.ps1
-    .\setup.ps1 -SkipModels   # skip multi-GB model pull (if resuming)
 #>
 [CmdletBinding()]
-param(
-    [switch]$SkipModels
-)
+param()
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -183,24 +180,9 @@ Write-Ok "dependencies installed"
 
 # ── 4. Services ───────────────────────────────────────────────────────
 
-Write-Step "Starting services (Postgres, LightRAG, Ollama)"
+Write-Step "Starting services (Postgres and LightRAG graph storage)"
 docker compose up -d
 Write-Ok "containers started"
-
-# Wait for Ollama
-Write-Host "    waiting for Ollama" -NoNewline
-for ($i = 0; $i -lt 30; $i++) {
-    try {
-        docker compose exec -T ollama ollama list 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host ""
-            Write-Ok "Ollama ready"
-            break
-        }
-    } catch {}
-    Write-Host "." -NoNewline
-    Start-Sleep -Seconds 2
-}
 
 # Wait for Postgres
 Write-Host "    waiting for Postgres" -NoNewline
@@ -217,22 +199,6 @@ for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 2
 }
 
-# Pull models
-if (-not $SkipModels) {
-    Write-Step "Pulling local models (a few GB, one time)"
-    foreach ($model in @("qwen3:4b", "mxbai-embed-large")) {
-        $listed = docker compose exec -T ollama ollama list 2>&1
-        $shortName = ($model -split ":")[0]
-        if ($listed -match [regex]::Escape($shortName)) {
-            Write-Ok "$model already present"
-        } else {
-            Write-Host "    pulling $model..."
-            docker compose exec -T ollama ollama pull $model
-            if ($LASTEXITCODE -eq 0) { Write-Ok "$model pulled" }
-            else { Write-Warn "$model pull failed - retry: docker compose exec ollama ollama pull $model" }
-        }
-    }
-}
 
 # ── 5. Initialise ─────────────────────────────────────────────────────
 

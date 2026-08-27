@@ -30,13 +30,12 @@ class FakeProvider:
         return f"{self.name}-response"
 
 
-def test_default_order_prefers_antigravity():
-    """Antigravity leads: it is the CLI that holds a live Google session here.
-
-    The standalone `gemini` CLI is last because it has no credentials on this
-    machine and each attempt costs ~12s before falling through.
-    """
-    assert [p.name for p in llm.build_chain()] == ["antigravity", "codex", "claude", "gemini"]
+def test_default_order_prefers_codex_then_claude():
+    assert [p.name for p in llm.build_chain()] == [
+        "codex",
+        "claude",
+        "antigravity",
+    ]
 
 
 def test_unknown_provider_names_are_skipped():
@@ -293,10 +292,10 @@ def test_antigravity_sends_the_prompt_on_stdin_not_argv(monkeypatch):
     assert payload["message"]["content"][0]["text"] == huge
 
 
-def test_antigravity_is_first_in_the_default_chain():
+def test_subscription_provider_priority_is_codex_then_claude_then_antigravity():
     from pipeline.config import LLM_PROVIDER_ORDER
 
-    assert LLM_PROVIDER_ORDER[0] == "antigravity"
+    assert LLM_PROVIDER_ORDER[:3] == ["codex", "claude", "antigravity"]
     assert "antigravity" in llm.PROVIDER_FACTORIES
 
 

@@ -154,7 +154,7 @@ Do this once before expecting speaker attribution:
    ```powershell
    uv run pipeline speakers --owner "Faraz" --limit 1
    uv run pipeline minutes --limit 1
-   uv run pipeline index --limit 1
+   uv run pipeline graph-sync
    ```
 
 ## Identifying a person manually
@@ -201,7 +201,7 @@ For every new recording:
    ```powershell
    uv run pipeline speakers --owner "Faraz" --limit 1
    uv run pipeline minutes --limit 1
-   uv run pipeline index --limit 1
+   uv run pipeline graph-sync
    ```
 
 6. Confirm the generated minutes show the right attendee and action-item owner.

@@ -42,10 +42,10 @@ transcripts/    <id>.json (word-level + speaker), <id>.md (readable turns)
   │              (also emits entities + relations)
   ▼
 minutes/        YYYY-MM-DD-title-<id8>.md               [Tier 2, THE CORPUS]
-  │  index       POST /documents/text
+  │  graph-sync  publish subscription-authored records
   ▼
-LightRAG        knowledge graph + vector index          [Tier 3, derived]
-  │  query
+LightRAG        Postgres-backed graph store             [Tier 3, derived]
+  │  deterministic traversal
   ▼
 answers with citations
 ```
@@ -252,17 +252,10 @@ with resolved names.
 
 ### 4. minutes (`pipeline/compile_minutes.py`)
 
-Runs through the provider chain in `pipeline/llm.py` — Gemini Flash, then Codex,
-then Claude — falling through on failure. All three are subscription-backed, which
-is why the highest-value artifact uses them while bulk entity extraction runs on
-local Ollama.
-
-**The constraint that shapes this:** none of the three can serve LightRAG, which
-needs an HTTP endpoint rather than a CLI. So graph extraction — the most
-quality-sensitive step in retrieval — is permanently on a small local model. Two
-open mitigations: emit entities and relations from this stage for deterministic
-indexing, and split retrieval from synthesis (`only_need_context`) so a
-subscription writes the final answer.
+Runs through the provider chain in `pipeline/llm.py` — Codex, then Claude, then
+Antigravity — falling through on failure. All three are subscription-backed. The
+minutes response includes the entities and relations that are later published
+directly to LightRAG; LightRAG never performs model-backed extraction.
 
 Prompts reach the CLI providers on **stdin**, never argv: a full transcript is tens
 of thousands of tokens and would risk `ARG_MAX`.
@@ -289,10 +282,9 @@ parsed, person names canonicalized through the people registry, stored in the
 `entities` / `relations` tables, and appended to the **indexed text** (never the
 file on disk) as a normalized `## Knowledge Graph` block.
 
-This is the mitigation for the subscription ceiling. LightRAG's extraction runs on a
-~4B local model that reads `Atlas (feature): the platform rewrite` reliably and
-discovers the same fact from narrative prose unreliably. The frontier model already
-running once per meeting states it outright instead.
+The subscription model already running once per meeting states graph facts
+explicitly. `pipeline graph-sync` publishes those exact records, so graph quality
+does not depend on a second extraction pass or a text-embedding model.
 
 The parser is tolerant by design — `-` bullets, `[]` brackets, `->`/`→`/`|` arrows,
 missing descriptions — because models produce all of those for one instruction, and
@@ -301,39 +293,20 @@ recovering most of a messy block beats discarding all of a slightly-malformed on
 Storing them in the manifest also means the corpus no longer depends on LightRAG's
 extraction quality: the entities survive independently of the index.
 
-### 5. index (`pipeline/index.py`)
+### 5. graph publication (`pipeline/graph_sync.py`)
 
-`POST /documents/text` with `file_source` set to the filename so citations trace
-back to a meeting. Minutes only. Long timeout (default 600s) because CPU-bound
-entity extraction blocks the request.
-
-**Replace, never append.** `compute_doc_id()` mirrors LightRAG's own
-`compute_mdhash_id(content.strip(), prefix="doc-")`, so the document id is knowable
-before insert and stable across restarts. `replace_minutes()` uses it to:
-
-1. Skip entirely when content is unchanged — re-extraction would burn minutes of
-   CPU to reach the same state.
-2. Delete the previous version before inserting a recompiled one.
-3. **Abandon the insert if the delete failed**, returning `replaced=False` so the
-   CLI skips the meeting and reports it.
-
-Step 3 matters: inserting anyway leaves both versions in the graph, so every entity
-and relation from the old copy survives alongside the new one and retrieval starts
-returning contradictory duplicates. That would silently invalidate the entire
-reason transcripts are retained. `delete_document()` tries the current endpoint then
-the older path, since this route has moved between releases; a total failure is
-reported rather than swallowed.
+`pipeline graph-sync` reads the manifest's subscription-authored entities and
+relations and publishes them through LightRAG's graph storage endpoints. Retrieval
+uses deterministic label matching plus graph traversal. The old document-ingestion
+client in `pipeline/index.py` is retained only for the approval-gated legacy repair
+preview; it is not called by `pipeline run` or the dashboard.
 
 ### 6. query
 
-`POST /query`. Modes: `hybrid` (default, graph + vector), `global` (aggregative,
-spans many meetings), `local` (tight entity lookup), `naive` (plain vector).
-
-Answering is split in two (`pipeline/answer.py`): LightRAG retrieves, and the
-subscription chain writes the answer. `--local` keeps LightRAG's own generation, and
-it is the automatic fallback when no provider is reachable — an answer from the small
-model beats no answer. Empty retrieval short-circuits rather than asking a model to
-answer from nothing, which is how a knowledge base starts inventing.
+Answering is split in two (`pipeline/answer.py`): deterministic graph traversal plus
+a bounded minutes/register scan retrieves context, and the subscription chain writes
+the answer. LightRAG's model-backed `/query` route is never called. If no subscription
+provider is reachable, the caller receives the cited retrieved context directly.
 
 `--timing` reports retrieval and synthesis separately, so when queries get slow the
 number says which phase is responsible.
@@ -384,7 +357,7 @@ Everything in `pipeline/config.py`, all overridable by environment variable.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `MMC_LLM_PROVIDERS` | `gemini,codex,claude` | Priority order; falls through on failure |
+| `MMC_LLM_PROVIDERS` | `codex,claude,antigravity` | Enforced priority order; falls through on failure |
 | `MMC_ALERT_COMMAND` | unset | Failure summary on stdin, `{subject}` substituted |
 | `MMC_MIN_SPEAKERS` / `MMC_MAX_SPEAKERS` | unset | Bounds passed to pyannote |
 | `MMC_IMPLAUSIBLE_SPEAKERS` | `8` | Above this, warn about over-segmentation |
@@ -408,31 +381,20 @@ the template it describes.
 
 ## Known upstream issues, already worked around
 
-| Issue | Symptom | Workaround (in `docker-compose.yml`) |
+| Issue | Symptom | Workaround |
 |---|---|---|
-| [LightRAG#2495](https://github.com/HKUDS/LightRAG/issues/2495) | Embeddings fail on Ollama 0.13.x | Pin `ollama/ollama:0.12.11` |
-| [LightRAG#2023](https://github.com/HKUDS/LightRAG/issues/2023) | Server won't boot on Ollama bindings | Set a dummy `OPENAI_API_KEY` |
 | pyannote gating | Diarization fails at *runtime*, not install | `HF_TOKEN` + accept model terms |
-| `EMBEDDING_DIM` mismatch | Opaque dimension error at insert | Must match model (mxbai-embed-large = 1024) |
+| LightRAG starts model routes even though this build does not use them | Accidental calls could invoke model-backed ingestion/query | Compose points both bindings at a closed loopback port so calls fail closed |
 
-Both services bind to **loopback only** and `LIGHTRAG_API_KEY` is enforced by
-compose. The index is a searchable record of every decision and customer
-conversation in the corpus; a `0.0.0.0` bind with the default empty key would
-expose that unauthenticated. Reach the WebUI over an SSH tunnel.
-
-CPU contention is also configured for: `MAX_ASYNC=2`, `MAX_PARALLEL_INSERT=1`,
-`OLLAMA_NUM_PARALLEL=1`, `OLLAMA_KEEP_ALIVE=30m`. Transcription and indexing share
-one CPU in the nightly batch; without these they fight for cores and both slow
-down. `OLLAMA_KEEP_ALIVE` matters because LightRAG makes many small extraction
-calls, and reloading weights between them otherwise dominates runtime.
+LightRAG and Postgres bind to **loopback only** and `LIGHTRAG_API_KEY` is enforced
+by compose. The graph contains private meeting context; never widen the bind.
 
 ## Cost model
 
 - **Transcription** — free, CPU time only. ~30–50 min per meeting.
 - **Minutes** — Claude subscription, no metered cost. One call per meeting.
-- **Indexing** — free, local Ollama. Several extraction calls per document,
-  ~5–20 min on CPU.
-- **Queries** — free, local Ollama.
+- **Graph publication/retrieval** — deterministic storage operations, no model call.
+- **Answer synthesis** — the same subscription provider chain.
 
 Total marginal cost per meeting is electricity. The tradeoff is a ~4 hour nightly
 batch, which is why `pipeline run` belongs on a timer rather than a file watcher.
@@ -454,8 +416,8 @@ snapshot that restores as corrupt. Tree sync is incremental on size+mtime, and
 nothing is ever deleted from the destination — a file vanishing from the source is
 precisely when the copy matters.
 
-`rag_storage/` and the Postgres volume are deliberately excluded. The index is
-derived; `pipeline index` rebuilds it.
+`rag_storage/` and the Postgres volume are deliberately excluded. The graph is
+derived; `pipeline graph-sync` rebuilds it from manifest entities and relations.
 
 ## Extending
 

@@ -13,7 +13,7 @@ minutes compilation loses minutes of work rather than hours.
     pipeline speakers              resolve SPEAKER_xx -> names
     pipeline voices                embed voiceprints, rematch and cluster
     pipeline minutes               compile structured minutes
-    pipeline index                 push minutes into LightRAG
+    pipeline graph-sync            publish subscription-authored graph records
     pipeline graph-sync            author the graph from the manifest
     pipeline run                   every pending stage, in order
     pipeline dashboard             browse and search the local meeting record
@@ -29,8 +29,11 @@ collide with each other.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import traceback
+from collections import Counter
+from dataclasses import asdict
 from pathlib import Path
 
 from pipeline import (
@@ -121,8 +124,21 @@ def cmd_status(_args: argparse.Namespace) -> int:
                 print(f"  {row['label']}: {row['stage']} - {detail[:120]}")
 
     try:
-        info = index.health()
-        print(f"\nLightRAG: reachable ({info.get('status', 'ok')})")
+        from pipeline import graph_sync
+
+        health = index.document_health()
+        graph_entities = len(graph_sync.graph_labels())
+        print("\nLightRAG readiness:")
+        print(f"  {'documents stored':<23} {health.documents_stored}")
+        print(f"  {'documents processed':<23} {health.documents_processed}")
+        print(f"  {'vector chunks ready':<23} {health.vector_chunks_ready}")
+        print(f"  {'graph entities ready':<23} {graph_entities}")
+        print(f"  {'failed':<23} {health.failed}")
+        print(f"  {'active':<23} {health.active}")
+        print(f"  {'pipeline busy':<23} {str(health.pipeline_busy).lower()}")
+        print(f"  {'recovery required':<23} {str(health.recovery_required).lower()}")
+        if health.latest_message:
+            print(f"  latest: {health.latest_message}")
     except index.IndexError_ as exc:
         print(f"\nLightRAG: {exc}")
     return 0
@@ -521,10 +537,9 @@ def cmd_minutes(args: argparse.Namespace) -> int:
 def cmd_graph_sync(args: argparse.Namespace) -> int:
     """Populate the knowledge graph from entities the minutes stage already extracted.
 
-    LightRAG's own extraction runs on the local 4B model and failed all 43
-    documents; the frontier model that writes the minutes has already produced
-    the same entities and relations, so this publishes those instead of asking a
-    weaker model to rediscover them.
+    The subscription model that writes the minutes has already produced the
+    entities and relations, so this publishes those exact records. LightRAG is
+    storage and traversal only and never invokes a model.
     """
     from pipeline import graph_sync
 
@@ -545,26 +560,34 @@ def cmd_graph_sync(args: argparse.Namespace) -> int:
     print(f"graph holds {after} entities after sync")
     if not after:
         return 1
-    # A populated graph is not evidence that THIS run worked. LightRAG refuses
-    # every graph edit with 409 while its ingestion pipeline is busy, so a sync
-    # can have all of its writes declined and still find a full graph waiting -
-    # the previous corpus's. Reporting success there leaves the graph quietly
-    # describing meetings that no longer exist in the form it claims.
+    # A populated graph is not evidence that THIS run worked. Reporting success
+    # after every write was refused would leave the graph quietly describing a
+    # previous corpus.
     wrote = report.entities_written + report.relations_written
     if not wrote and report.errors:
         print(
             f"graph-sync wrote nothing: {len(report.errors)} write(s) refused. "
-            "The graph still holds the PREVIOUS corpus. Re-run once LightRAG is "
-            "idle (GET /documents/pipeline_status shows busy=false)."
+            "The graph still holds the PREVIOUS corpus. Review the errors and re-run."
         )
         return 1
+    # Publication is the terminal context stage in the active build. Advance the
+    # queued meetings only after the graph is demonstrably populated and this
+    # sync reported no refused writes. The legacy document id remains untouched.
+    with db.connect() as conn:
+        queue = db.pending(conn, db.MINUTES_COMPILED, getattr(args, "limit", None))
+        for meeting in queue:
+            run_id = db.start_stage(conn, meeting.id, STAGE_INDEX)
+            db.finish_stage(conn, run_id, True, "subscription-authored graph published")
+            db.advance(conn, meeting.id, db.INDEXED)
+    if queue:
+        print(f"published context for {len(queue)} meeting(s)")
     return 0
 
 
 def cmd_export(args: argparse.Namespace) -> int:
     """Sync all eligible professional minutes to the Product Manager repo."""
-    from pipeline.config import ENABLE_PM_EXPORT, EXPORT_PM_MINUTES_DIR, MINUTES_DIR
     from pipeline.compile_minutes import is_professional_minute
+    from pipeline.config import ENABLE_PM_EXPORT, EXPORT_PM_MINUTES_DIR, MINUTES_DIR
 
     if not ENABLE_PM_EXPORT:
         print("[INFO] PM Export is disabled via MMC_ENABLE_PM_EXPORT=0")
@@ -591,9 +614,11 @@ def cmd_export(args: argparse.Namespace) -> int:
 
         dest_file = EXPORT_PM_MINUTES_DIR / path.name
         needs_write = False
-        if not dest_file.exists():
-            needs_write = True
-        elif dest_file.stat().st_mtime < path.stat().st_mtime or dest_file.stat().st_size != path.stat().st_size:
+        if (
+            not dest_file.exists()
+            or dest_file.stat().st_mtime < path.stat().st_mtime
+            or dest_file.stat().st_size != path.stat().st_size
+        ):
             needs_write = True
 
         if needs_write:
@@ -608,6 +633,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 def cmd_index(args: argparse.Namespace) -> int:
+    """Index minutes and advance only after terminal document processing."""
     db.init_db()
 
     try:
@@ -624,37 +650,34 @@ def cmd_index(args: argparse.Namespace) -> int:
         return 0
 
     failures = 0
-    stale = 0
+    incomplete = 0
     for position, meeting in enumerate(queue, 1):
         print(f"[{position}/{len(queue)}] {meeting.label}")
         if not meeting.minutes_path:
+            failures += 1
+            print("    FAILED manifest has no minutes_path")
             continue
         path = Path(meeting.minutes_path)
         if not path.exists():
-            print(f"    FAILED minutes file missing: {path}")
             failures += 1
+            print(f"    FAILED minutes file missing: {path}")
             continue
 
         with db.connect() as conn:
             run_id = db.start_stage(conn, meeting.id, STAGE_INDEX)
             try:
-                # Append the canonicalized graph block from the manifest. The
-                # local extraction model reads an explicit list reliably and
-                # discovers the same facts from prose unreliably - this is the
-                # mitigation for that ceiling.
                 augment = entities.render_for_index(
                     db.get_entities(conn, meeting.id),
                     db.get_relations(conn, meeting.id),
                 )
-                doc_id, replaced = index.replace_minutes(
-                    path, meeting.lightrag_doc_id, augment=augment
+                doc_id, processed = index.replace_minutes(
+                    path,
+                    meeting.lightrag_doc_id,
+                    augment=augment,
                 )
-                if not replaced:
-                    # The old copy is still in the graph. Refusing to insert keeps
-                    # the corpus consistent instead of leaving two contradictory
-                    # versions of the same meeting for retrieval to trip over.
-                    stale += 1
-                    detail = f"stale copy {meeting.lightrag_doc_id} could not be deleted"
+                if not processed:
+                    incomplete += 1
+                    detail = f"document {doc_id} did not reach processed state"
                     print(f"    SKIPPED {detail}")
                     db.finish_stage(conn, run_id, False, detail)
                     continue
@@ -666,13 +689,91 @@ def cmd_index(args: argparse.Namespace) -> int:
                 print(f"    FAILED {exc}")
                 db.finish_stage(conn, run_id, False, str(exc))
 
-    print(f"\nIndexed {len(queue) - failures - stale}/{len(queue)}.")
-    if stale:
+    completed = len(queue) - failures - incomplete
+    print(f"\nIndexed {completed}/{len(queue)}.")
+    if incomplete:
         print(
-            f"{stale} meeting(s) skipped because a previously indexed version "
-            f"could not be removed. Delete them in the LightRAG UI, then re-run."
+            f"{incomplete} meeting(s) stayed at minutes_compiled because their "
+            "documents did not reach terminal processed state."
         )
-    return 1 if (failures or stale) else 0
+    return 1 if (failures or incomplete) else 0
+
+
+def cmd_index_repair_preview(args: argparse.Namespace) -> int:
+    """Write an exact, read-only plan for reconciling pending index records."""
+    db.init_db()
+    output_path = Path(args.to)
+    if output_path.exists():
+        print(f"Refusing to overwrite existing preview: {output_path}", file=sys.stderr)
+        return 2
+
+    targets: list[index.RepairTarget] = []
+    missing_files: list[dict[str, str]] = []
+    with db.connect() as conn:
+        queue = db.pending(conn, db.MINUTES_COMPILED, args.limit)
+        for meeting in queue:
+            if not meeting.minutes_path:
+                missing_files.append(
+                    {"meeting_id": meeting.id, "reason": "manifest has no minutes_path"}
+                )
+                continue
+            path = Path(meeting.minutes_path)
+            if not path.exists():
+                missing_files.append(
+                    {
+                        "meeting_id": meeting.id,
+                        "minutes_path": str(path),
+                        "reason": "minutes file is missing",
+                    }
+                )
+                continue
+            augment = entities.render_for_index(
+                db.get_entities(conn, meeting.id),
+                db.get_relations(conn, meeting.id),
+            )
+            desired_doc_id = index.compute_doc_id(path.read_text(encoding="utf-8") + augment)
+            targets.append(
+                index.RepairTarget(
+                    meeting_id=meeting.id,
+                    file_source=path.name,
+                    desired_doc_id=desired_doc_id,
+                    manifest_doc_id=meeting.lightrag_doc_id,
+                )
+            )
+
+    try:
+        preview = index.build_repair_preview(targets)
+    except index.IndexError_ as exc:
+        print(f"Could not build index repair preview: {exc}", file=sys.stderr)
+        return 1
+
+    artifact = {
+        "schema_version": 1,
+        "fingerprint": preview.fingerprint,
+        "pipeline": {
+            "busy": preview.pipeline_busy,
+            "recovery_required": preview.recovery_required,
+            "latest_message": preview.latest_message,
+        },
+        "items": [asdict(item) for item in preview.items],
+        "missing_files": missing_files,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(artifact, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    actions = Counter(item.action for item in preview.items)
+    print(f"Index repair preview: {len(preview.items)} document(s)")
+    for action, count in sorted(actions.items()):
+        print(f"  {action:<24} {count}")
+    if missing_files:
+        print(f"  {'missing_file':<24} {len(missing_files)}")
+    print(f"Fingerprint: {preview.fingerprint}")
+    print(f"Saved private preview: {output_path}")
+    print("Nothing was changed. No document, graph, or manifest row was modified.")
+    return 0
 
 
 def _run_all(args: argparse.Namespace, include_ingest: bool = True) -> int:
@@ -704,7 +805,7 @@ def _run_all(args: argparse.Namespace, include_ingest: bool = True) -> int:
             limit=args.limit, force=False, traceback=False)),
         ("minutes", cmd_minutes, argparse.Namespace(
             limit=args.limit, recompile=False, traceback=False, force=False)),
-        ("index", cmd_index, argparse.Namespace(limit=args.limit)),
+        ("graph-sync", cmd_graph_sync, argparse.Namespace(limit=args.limit)),
     ]
     failed: list[str] = []
     crashes: list[str] = []
@@ -742,12 +843,7 @@ def cmd_query(args: argparse.Namespace) -> int:
     from pipeline import answer
 
     try:
-        result = answer.ask(
-            args.question,
-            mode=args.mode,
-            top_k=args.top_k,
-            synthesize=not args.local,
-        )
+        result = answer.ask(args.question, mode=args.mode, top_k=args.top_k)
     except index.IndexError_ as exc:
         print(f"{exc}", file=sys.stderr)
         return 1
@@ -1091,9 +1187,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_export.set_defaults(func=cmd_export)
 
-    p_index = subparsers.add_parser("index", help="push minutes into LightRAG")
+    p_index = subparsers.add_parser(
+        "index", help="legacy document repair path (not used by the normal batch)"
+    )
     add_common(p_index)
     p_index.set_defaults(func=cmd_index)
+
+    p_index_preview = subparsers.add_parser(
+        "index-repair-preview",
+        help="write a read-only plan for reconciling pending LightRAG documents",
+    )
+    add_common(p_index_preview)
+    p_index_preview.add_argument(
+        "--to",
+        required=True,
+        help="new private JSON artifact path; existing files are never overwritten",
+    )
+    p_index_preview.set_defaults(func=cmd_index_repair_preview)
 
     p_graph = subparsers.add_parser(
         "graph-sync", help="author the LightRAG graph from the manifest's entities"
@@ -1115,11 +1225,6 @@ def build_parser() -> argparse.ArgumentParser:
              "whose answer spans many meetings",
     )
     p_query.add_argument("--top-k", type=int, default=None)
-    p_query.add_argument(
-        "--local", action="store_true",
-        help="let LightRAG's local model write the answer instead of the "
-             "subscription chain (faster to start, lower quality)",
-    )
     p_query.add_argument(
         "--timing", action="store_true",
         help="report retrieval vs synthesis time, to see which phase is slow",

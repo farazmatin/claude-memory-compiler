@@ -1,20 +1,14 @@
 """Entities and relations emitted by the minutes compiler.
 
-This exists to work around the subscription ceiling. LightRAG's graph extraction
-needs an HTTP endpoint, so it runs on a small local model on CPU - the weakest
-model in the stack sitting at the most quality-sensitive point in retrieval. No
-subscription can serve that slot.
-
-The fix is to move the work upstream. The minutes compiler already runs on a
-frontier model once per meeting, so it emits entities and relations explicitly.
+The minutes compiler runs on the subscription provider chain once per meeting,
+so it emits entities and relations explicitly rather than asking a model-backed
+LightRAG route to rediscover them.
 Two things then happen:
 
 1. They are stored in the manifest, independent of LightRAG. The corpus is never
    hostage to the index.
-2. They are rendered into the indexed document as an explicit, labelled block.
-   A 4B model reliably picks up "Atlas (feature): the platform rewrite" when it is
-   stated outright; asking it to discover the same fact from prose is where it
-   fails.
+2. They can be published directly to the LightRAG graph without a second model
+   call.
 
 Format is deliberately line-based rather than JSON. Models emit stray prose around
 JSON often enough that a tolerant line parser recovers more of the output than a

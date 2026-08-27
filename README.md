@@ -50,7 +50,7 @@ cd claude-memory-compiler
 ```
 
 `setup.sh` checks prerequisites, installs dependencies, generates secrets, starts
-the services, pulls the local models, and runs preflight checks. It's safe to
+the graph-storage services, and runs preflight checks. It's safe to
 re-run and never overwrites an existing `.env`.
 
 **One thing it can't do for you.** Speaker detection needs a HuggingFace token
@@ -89,8 +89,6 @@ use, and how to judge whether the output is any good.
 cp .env.example .env      # then fill in MMC_LIGHTRAG_API_KEY, POSTGRES_PASSWORD, HF_TOKEN
 uv sync --extra asr
 docker compose up -d
-docker compose exec ollama ollama pull qwen3:4b
-docker compose exec ollama ollama pull mxbai-embed-large
 uv run pipeline init
 uv run pipeline doctor
 ```
@@ -103,28 +101,26 @@ Three LLM jobs, and they cannot all use the same provider:
 
 | Job | Provider | Why |
 |---|---|---|
-| Minutes compilation | Gemini Flash → Codex → Claude | Subscription-backed, tried in order, falls through on failure |
+| Minutes compilation | Codex → Claude → Antigravity | Subscription-backed, tried in order, falls through on failure |
 | Speaker resolution | same chain | ditto |
-| Graph & entity extraction | **local Ollama** | LightRAG needs an HTTP endpoint; no CLI subscription can serve one |
+| Entities and relations | same chain | Emitted with the minutes, then published directly to the graph |
+| Context retrieval | deterministic LightRAG traversal | Storage/traversal only; no model call |
 
-Set the order with `MMC_LLM_PROVIDERS=gemini,codex,claude`. A quota limit or CLI
-hiccup on the preferred provider falls through to the next rather than stalling a
-batch that already paid for transcription.
+Codex and Claude remain the first two providers even when an older environment
+value lists another order. A quota limit or CLI hiccup falls through to the next
+provider rather than stalling a batch that already paid for transcription.
 
-**The constraint worth understanding, and how it's handled.** Your subscriptions
-can't reach LightRAG's extraction step — it needs an HTTP endpoint, and no
-subscription offers embeddings at all. So two jobs were moved to where the
-subscription *does* reach:
+**The constraint worth understanding, and how it's handled.** The active build
+does not call LightRAG's model-backed document or query routes:
 
 - **The compiler emits the graph.** Minutes include explicit `Entities` and
   `Relations` sections, written by the frontier model, stored in the manifest, and
-  handed to the index pre-stated. A small model reads an explicit list reliably and
-  discovers the same facts from prose unreliably.
-- **Synthesis is split from retrieval.** LightRAG retrieves; the subscription chain
-  writes the answer. `--local` keeps LightRAG's own generation for comparison, and
-  it's the automatic fallback when no provider is reachable.
+  published directly to the graph.
+- **Synthesis is split from retrieval.** LightRAG stores and traverses the graph;
+  the subscription chain writes the answer.
 
-What remains local is graph traversal. That's narrowed, not eliminated.
+The loopback services store and traverse private data; they run no language or
+text-embedding model.
 
 For automatic phone capture, follow [USER_GUIDE.md](USER_GUIDE.md). It covers
 Easy Voice Recorder Pro, private Google Drive setup, the June 9, 2026 backfill
@@ -146,7 +142,7 @@ pipeline ingest                   # discover + dedup new audio
 pipeline transcribe               # ASR + alignment + diarization  (the slow one)
 pipeline speakers --owner "Name"  # resolve SPEAKER_00 → real names
 pipeline minutes                  # compile structured minutes
-pipeline index                    # push minutes into LightRAG
+pipeline graph-sync               # publish subscription-authored graph records
 pipeline run                      # every pending stage, in order
 pipeline status                   # where everything is, plus real stage timings
 pipeline dashboard --open         # local, read-only meeting library and RAG search
@@ -243,10 +239,10 @@ above against your actual hardware.
 pipeline doctor
 ```
 
-18 checks: ffmpeg, whisperx, the ASR model against your device, **HF token plus
-actual gated-model reachability**, every provider in the chain, LightRAG health and
-whether its storage is file-based, Ollama models, directories, disk headroom,
-manifest state, glossary depth. Each failure prints its fix.
+The checks cover ffmpeg, whisperx, the ASR backend, **HF token plus actual
+gated-model reachability**, every subscription provider in the chain, LightRAG
+graph/storage health, directories, disk headroom, manifest state, and glossary
+depth. Each failure prints its fix.
 
 The gated-model check earns its place: a HuggingFace token proves nothing about
 licence acceptance, which is the part people miss, and missing diarization costs
@@ -264,8 +260,8 @@ meeting, read against the audio.
   this, diarization is skipped with a warning and you get transcripts with no
   speaker attribution — which means action items with no owners.
 - **`MMC_LIGHTRAG_API_KEY`** — see below.
-- **Docker** for LightRAG + Ollama.
-- At least one of **`gemini`**, **`codex`**, or the **Claude Agent SDK** reachable.
+- **Docker** for loopback-only LightRAG graph storage and Postgres.
+- At least one of **Codex**, **Claude**, or **Antigravity** reachable.
 
 ## Security
 
@@ -293,8 +289,8 @@ pipeline backup --to /mnt/backup --no-audio # skip the bulkiest tier
 Uses SQLite's online backup API rather than a file copy, because copying a live
 database can capture a torn page and produce a snapshot that restores as corrupt.
 The snapshot is integrity-checked, and a `BACKUP_INFO.txt` with restore steps is
-written alongside it. The LightRAG index is deliberately **not** backed up — it is
-derived from `minutes/` and rebuilt with `pipeline index`.
+written alongside it. The LightRAG graph is deliberately **not** backed up — it is
+derived from manifest entities and relations and rebuilt with `pipeline graph-sync`.
 
 Add it to the nightly timer after `run`.
 
@@ -352,11 +348,9 @@ wiring; they cannot prove the transcript is accurate.
 | [docs/TESTING.md](docs/TESTING.md) | Test strategy and what each layer covers |
 | [AGENTS.md](AGENTS.md) | Operational reference — env vars, stage internals, gotchas |
 
-Two upstream bugs are already worked around in `docker-compose.yml`: Ollama is
-pinned to `0.12.11` because `0.13.x` breaks LightRAG's embeddings
-([#2495](https://github.com/HKUDS/LightRAG/issues/2495)), and a dummy
-`OPENAI_API_KEY` is set because the server won't boot without one even on Ollama
-bindings ([#2023](https://github.com/HKUDS/LightRAG/issues/2023)).
+`docker-compose.yml` deliberately points LightRAG's LLM and embedding bindings at
+a closed loopback port. The active build uses only graph storage/traversal, so an
+accidental model-backed ingestion or query call fails closed.
 
 ## Tuning
 
@@ -438,6 +432,6 @@ directory," so that decision stays independent. Point `inbox/` at a synced folde
 an rclone mount, or anything else that produces files.
 
 **Known open issues** are tracked honestly in
-[docs/REVIEW.md](docs/REVIEW.md#open) — including the one that matters most: no
-subscription can serve LightRAG's extraction step, so graph quality is capped by a
-small local model regardless of what you pay for.
+[docs/REVIEW.md](docs/REVIEW.md#open). Graph completeness now depends on the
+subscription-authored entity/relation output and deterministic publication, not a
+second local extraction pass.

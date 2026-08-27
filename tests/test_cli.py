@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from pipeline import cli, db, people_merge
+from pipeline import cli, db, graph_sync, index, people_merge
 
 from .conftest import make_meeting
 
@@ -40,6 +40,38 @@ def test_status_omits_stage_failures_section_when_there_are_none(manifest, capsy
     out = capsys.readouterr().out
 
     assert "Recent stage failures" not in out
+
+
+def test_status_distinguishes_document_vector_and_graph_health(
+    manifest, monkeypatch, capsys
+):
+    make_meeting(manifest, "m1", "2026-08-10", status=db.MINUTES_COMPILED)
+    manifest.commit()
+    monkeypatch.setattr(
+        cli.index,
+        "document_health",
+        lambda: index.DocumentHealth(
+            documents_stored=4,
+            documents_processed=2,
+            vector_chunks_ready=1,
+            failed=1,
+            active=1,
+            status_counts={"failed": 1, "pending": 1, "processed": 2},
+            pipeline_busy=False,
+            recovery_required=False,
+            latest_message="idle",
+        ),
+    )
+    monkeypatch.setattr(graph_sync, "graph_labels", lambda: ["Atlas", "USC"])
+
+    assert cli.cmd_status(argparse.Namespace()) == 0
+
+    out = capsys.readouterr().out
+    assert "documents stored        4" in out
+    assert "documents processed     2" in out
+    assert "vector chunks ready     1" in out
+    assert "graph entities ready    2" in out
+    assert "failed                  1" in out
 
 
 def test_people_merge_cli_previews_without_mutating(manifest, capsys):
@@ -134,6 +166,99 @@ def test_people_merge_repair_cli_previews_then_applies_exact_artifact(
     assert db.resolve_merged_name(manifest, "Mike") == "Michael"
 
 
+def test_query_has_no_local_model_mode():
+    query = next(
+        action for action in cli.build_parser()._actions if action.dest == "command"
+    ).choices["query"]
+    assert "--local" not in query.format_help()
+
+
+def test_index_advances_only_after_document_processing(
+    manifest, monkeypatch, capsys, tmp_path
+):
+    minutes_path = tmp_path / "m1.md"
+    minutes_path.write_text("minutes", encoding="utf-8")
+    make_meeting(
+        manifest,
+        "m1",
+        "2026-08-10",
+        status=db.MINUTES_COMPILED,
+        minutes_path=str(minutes_path),
+    )
+    manifest.commit()
+    monkeypatch.setattr(cli.index, "health", lambda: {})
+    monkeypatch.setattr(
+        cli.index,
+        "replace_minutes",
+        lambda *a, **k: ("doc-ready", True),
+    )
+
+    assert cli.cmd_index(argparse.Namespace(limit=None)) == 0
+    assert db.get_meeting(manifest, "m1").status == db.INDEXED
+    assert db.get_meeting(manifest, "m1").lightrag_doc_id == "doc-ready"
+    assert "indexed" in capsys.readouterr().out
+
+
+def test_index_does_not_advance_when_processing_fails(
+    manifest, monkeypatch, capsys, tmp_path
+):
+    minutes_path = tmp_path / "m1.md"
+    minutes_path.write_text("minutes", encoding="utf-8")
+    make_meeting(
+        manifest,
+        "m1",
+        "2026-08-10",
+        status=db.MINUTES_COMPILED,
+        minutes_path=str(minutes_path),
+    )
+    manifest.commit()
+    monkeypatch.setattr(cli.index, "health", lambda: {})
+    monkeypatch.setattr(cli.index, "replace_minutes", lambda *a, **k: ("doc-failed", False))
+
+    assert cli.cmd_index(argparse.Namespace(limit=None)) == 1
+    assert db.get_meeting(manifest, "m1").status == db.MINUTES_COMPILED
+    assert "SKIPPED" in capsys.readouterr().out
+
+
+def test_index_repair_preview_writes_exact_read_only_plan(
+    manifest, monkeypatch, capsys, tmp_path
+):
+    minutes_path = tmp_path / "meeting.md"
+    minutes_path.write_text("---\ndate: 2026-08-10\n---\nMinutes", encoding="utf-8")
+    make_meeting(
+        manifest,
+        "m1",
+        "2026-08-10",
+        status=db.MINUTES_COMPILED,
+        minutes_path=str(minutes_path),
+        lightrag_doc_id="doc-stale-manifest",
+    )
+    manifest.commit()
+    monkeypatch.setattr(
+        index,
+        "_document_records",
+        lambda: [index.DocumentRecord("doc-source-owner", minutes_path.name, "failed", 0)],
+    )
+    monkeypatch.setattr(
+        index,
+        "pipeline_status",
+        lambda: {"busy": False, "recovery_required": False, "latest_message": "idle"},
+    )
+    preview_path = tmp_path / "index-repair.json"
+
+    assert cli.main(
+        ["index-repair-preview", "--to", str(preview_path)]
+    ) == 0
+
+    artifact = json.loads(preview_path.read_text(encoding="utf-8"))
+    assert artifact["fingerprint"]
+    assert artifact["items"][0]["meeting_id"] == "m1"
+    assert artifact["items"][0]["action"] == "delete_then_insert"
+    assert artifact["items"][0]["delete_doc_id"] == "doc-source-owner"
+    assert db.get_meeting(manifest, "m1").status == db.MINUTES_COMPILED
+    assert "Nothing was changed" in capsys.readouterr().out
+
+
 # ── Alerting gate: skip vs. genuine failure ─────────────────────────
 #
 # cmd_minutes counts a junk-recording park separately from `failures` and
@@ -156,7 +281,7 @@ def test_run_all_does_not_alert_on_a_skip_only_batch(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "cmd_transcribe", lambda args: 0)
     monkeypatch.setattr(cli, "cmd_speakers", lambda args: 0)
     monkeypatch.setattr(cli, "cmd_minutes", lambda args: 0)  # skip-only run still exits 0
-    monkeypatch.setattr(cli, "cmd_index", lambda args: 0)
+    monkeypatch.setattr(cli, "cmd_graph_sync", lambda args: 0)
 
     rc = cli._run_all(_run_all_args(), include_ingest=False)
 
@@ -174,7 +299,7 @@ def test_run_all_alerts_on_a_genuine_stage_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "cmd_transcribe", lambda args: 1)  # a real crash
     monkeypatch.setattr(cli, "cmd_speakers", lambda args: 0)
     monkeypatch.setattr(cli, "cmd_minutes", lambda args: 0)
-    monkeypatch.setattr(cli, "cmd_index", lambda args: 0)
+    monkeypatch.setattr(cli, "cmd_graph_sync", lambda args: 0)
 
     rc = cli._run_all(_run_all_args(), include_ingest=False)
 

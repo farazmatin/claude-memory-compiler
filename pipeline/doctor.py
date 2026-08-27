@@ -86,12 +86,10 @@ def check_ffmpeg() -> list[Check]:
 
 
 def check_asr() -> list[Check]:
-    """ASR backend (Replicate serverless GPU vs local WhisperX CPU)."""
+    """ASR backend, with local execution available only by explicit opt-in."""
     checks = []
 
-    use_replicate = ASR_BACKEND == "replicate" or (
-        ASR_BACKEND == "auto" and bool(REPLICATE_API_TOKEN)
-    )
+    use_replicate = ASR_BACKEND != "whisperx"
 
     if use_replicate:
         if not REPLICATE_API_TOKEN:
@@ -99,7 +97,7 @@ def check_asr() -> list[Check]:
                 Check(
                     "asr backend",
                     FAIL,
-                    "MMC_ASR_BACKEND=replicate but REPLICATE_API_TOKEN is unset",
+                    "REPLICATE_API_TOKEN is unset; local ASR will not start implicitly",
                     "add REPLICATE_API_TOKEN=r8_... to .env",
                 )
             ]
@@ -178,9 +176,7 @@ def check_diarization() -> list[Check]:
     transcripts with no speaker attribution, which means action items with no
     owners, and the only signal is a printed warning mid-batch.
     """
-    use_replicate = ASR_BACKEND == "replicate" or (
-        ASR_BACKEND == "auto" and bool(REPLICATE_API_TOKEN)
-    )
+    use_replicate = ASR_BACKEND != "whisperx"
     if use_replicate:
         return [
             Check(
@@ -305,7 +301,7 @@ def check_lightrag() -> list[Check]:
 
 
 def _check_graph_populated() -> list[Check]:
-    """The graph has nodes, and documents actually finished processing."""
+    """The subscription-authored graph is populated and traversable."""
     from pipeline import graph_sync
 
     checks: list[Check] = []
@@ -321,34 +317,6 @@ def _check_graph_populated() -> list[Check]:
                 "pipeline graph-sync",
             )
         )
-
-    try:
-        import httpx
-
-        headers = {"X-API-Key": LIGHTRAG_API_KEY} if LIGHTRAG_API_KEY else {}
-        resp = httpx.get(f"{LIGHTRAG_URL}/documents/status_counts", headers=headers, timeout=15.0)
-        counts = resp.json().get("status_counts", resp.json()) if resp.status_code == 200 else {}
-        failed = int(counts.get("failed", 0) or 0)
-        processed = int(counts.get("processed", 0) or 0)
-        if failed:
-            # A populated graph makes this expected rather than broken: LightRAG's
-            # own extraction runs on the local model and is bypassed on purpose,
-            # so failing documents alongside a full graph is the design working.
-            # Only an empty graph AND failed documents means retrieval is dead.
-            authored = bool(labels)
-            checks.append(
-                Check(
-                    "lightrag documents",
-                    WARN if (processed or authored) else FAIL,
-                    f"{failed} failed extraction, {processed} processed"
-                    + (" - graph is authored from the manifest instead" if authored else ""),
-                    "" if authored else "pipeline graph-sync",
-                )
-            )
-        elif processed:
-            checks.append(Check("lightrag documents", OK, f"{processed} processed"))
-    except Exception as exc:  # diagnostics must never crash the run
-        checks.append(Check("lightrag documents", WARN, f"status unavailable ({exc})"[:120]))
 
     return checks
 
@@ -432,40 +400,6 @@ def check_glossary() -> list[Check]:
     return [Check("glossary", OK, f"{len(terms)} terms")]
 
 
-def check_ollama() -> list[Check]:
-    """Ollama serves LightRAG's extraction and embeddings.
-
-    Checked via the CLI when present; the HTTP check is LightRAG's own health.
-    """
-    if not shutil.which("docker"):
-        return [Check("ollama", WARN, "docker not on PATH; cannot verify models")]
-    try:
-        result = subprocess.run(
-            ["docker", "exec", "mmc-ollama", "ollama", "list"],
-            capture_output=True, text=True, timeout=20, check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return [Check("ollama", WARN, f"could not query: {type(exc).__name__}")]
-
-    if result.returncode != 0:
-        return [
-            Check("ollama", WARN, "container not running", "docker compose up -d")
-        ]
-
-    listed = result.stdout
-    missing = [m for m in ("qwen3", "mxbai-embed-large") if m not in listed]
-    if missing:
-        return [
-            Check(
-                "ollama models",
-                FAIL,
-                f"missing: {', '.join(missing)} - indexing will fail",
-                "docker compose exec ollama ollama pull " + " && ".join(missing),
-            )
-        ]
-    return [Check("ollama models", OK, "extraction and embedding models present")]
-
-
 def check_postgres() -> list[Check]:
     """Postgres holds LightRAG's KV, vector, doc-status and graph data.
 
@@ -523,8 +457,9 @@ def check_drive() -> list[Check]:
         )
     else:
         try:
-            from google.oauth2.credentials import Credentials
             from google.auth.transport.requests import Request
+            from google.oauth2.credentials import Credentials
+
             creds = Credentials.from_authorized_user_file(str(DRIVE_TOKEN_FILE), DRIVE_SCOPES)
             if creds.expired and creds.refresh_token:
                 try:
@@ -726,7 +661,6 @@ ALL_CHECKS = (
     check_alerting,
     check_postgres,
     check_lightrag,
-    check_ollama,
     check_drive,
     check_storage,
     check_manifest,

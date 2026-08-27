@@ -108,8 +108,6 @@ MMC_TIMEZONE=America/Toronto  # meeting dates depend on this
 
 ```bash
 docker compose up -d
-docker compose exec ollama ollama pull qwen3:4b
-docker compose exec ollama ollama pull mxbai-embed-large
 ```
 
 Everything binds to **localhost only**. This index will contain every decision and
@@ -148,7 +146,7 @@ uv run pipeline ingest       # finds the file, reads its date and duration
 uv run pipeline transcribe   # the slow one
 uv run pipeline speakers --owner "Your Name"
 uv run pipeline minutes
-uv run pipeline index
+uv run pipeline graph-sync
 ```
 
 **Filenames matter a little.** Dates and times are read from them where possible:
@@ -258,8 +256,8 @@ uv run pipeline query "what changed about the Q4 plan?"
 
 - `--timing` — shows how long retrieval took versus writing the answer. Use this
   when queries feel slow, to see which half is responsible.
-- `--local` — lets the small local model write the answer instead of your
-  subscription. Faster to start, noticeably worse. Mostly useful for comparison.
+- If the subscription providers are unavailable, the command returns the cited
+  retrieved context directly instead of invoking any fallback model.
 
 **If an answer looks wrong**, check whether the meeting is actually indexed:
 
@@ -338,8 +336,8 @@ uv run pipeline backup --to /mnt/backup --no-audio   # skip the bulky part
 Runs incrementally, so nightly is cheap. It never deletes from the destination — a
 file disappearing from your source is exactly when the backup matters.
 
-The search index is deliberately **not** backed up; it is rebuilt from your minutes
-with `pipeline index`.
+The graph store is deliberately **not** backed up; it is rebuilt from the
+manifest's entities and relations with `pipeline graph-sync`.
 
 **Restoring:** copy the folders back, then follow the steps in `BACKUP_INFO.txt`
 inside the backup.
@@ -360,7 +358,7 @@ uv run pipeline doctor   # what is misconfigured
 | Speakers all `SPEAKER_00` | `HF_TOKEN` missing, or the two licences not accepted | [§2.2](#22-configure) |
 | Transcription very slow | `MMC_ASR_MODEL` set to `large-v3` on CPU | Unset it to use the faster default |
 | "LightRAG unreachable" | Services not running | `docker compose up -d` |
-| Indexing fails oddly | Ollama models not pulled | `docker compose exec ollama ollama pull qwen3:4b` |
+| Graph publication fails | LightRAG/Postgres unavailable | `docker compose up -d`, then `pipeline graph-sync` |
 | Meetings stuck at `failed` | Bad file or a transient error | `pipeline retry` then `pipeline run` |
 | Wrong names in minutes | Speaker mis-identified | `speaker-overrides.yaml`, then `pipeline minutes --recompile` |
 | Too many speakers detected | Noisy audio being over-split | Set `MMC_MAX_SPEAKERS`, or improve the mic |
@@ -401,7 +399,7 @@ retroactively to your entire history**, because every transcript was kept:
 
 1. Edit `templates/minutes.md`
 2. Increment `TEMPLATE_VERSION` in `pipeline/config.py`
-3. `uv run pipeline minutes --recompile && uv run pipeline index`
+3. `uv run pipeline minutes --recompile && uv run pipeline graph-sync`
 
 Every meeting is rebuilt with the new template. **No re-transcription** — the
 expensive part is never repeated, and old index entries are replaced rather than
@@ -422,14 +420,13 @@ pipeline ingest                    find new recordings
 pipeline transcribe                speech to text with speakers  (slow)
 pipeline speakers --owner "Name"   put real names to voices
 pipeline minutes                   write the minutes
-pipeline index                     add to the knowledge base
+pipeline graph-sync                publish entities and relations
 pipeline run                       all of the above, in order
 
 pipeline query "question"          ask the knowledge base
   --mode global                      answers spanning many meetings
   --mode local                       one specific thing
   --timing                           show retrieval vs answer time
-  --local                            use the local model to answer
 
 pipeline people                    list known people
   --add NAME [ALIAS...]              register aliases

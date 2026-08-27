@@ -248,10 +248,10 @@ def test_topic_query_includes_title_and_terms(manifest):
 
 def test_prior_context_merges_topical_retrieval(manifest, monkeypatch):
     """Recency alone misses long-horizon reversals, which are the valuable case."""
-    from pipeline import index
+    from pipeline import graph_sync
 
     monkeypatch.setattr(
-        index, "query_context",
+        graph_sync, "retrieve_context",
         lambda *a, **k: "Six months ago we decided NOT to build Atlas.",
     )
     meeting = make_meeting(manifest, "m1", "2026-08-10", title_hint="Atlas")

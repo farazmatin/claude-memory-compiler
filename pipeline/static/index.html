@@ -464,7 +464,7 @@
           <div class="action-grid">
             <button type="button" class="btn-stage btn-stage-primary" onclick="runStage('all')">
               <strong>▶ Process All New Audio</strong>
-              <span>Check Drive → Transcribe → Synthesize Minutes → Index Search</span>
+              <span>Check Drive → Transcribe → Synthesize Minutes → Publish Context</span>
             </button>
             <button type="button" class="btn-stage" onclick="runStage('capture')">
               <strong>Check Drive Folder</strong>
@@ -482,9 +482,9 @@
               <strong>Generate Minutes</strong>
               <span>Synthesize executive summaries</span>
             </button>
-            <button type="button" class="btn-stage" onclick="runStage('index')">
+            <button type="button" class="btn-stage" onclick="runStage('graph-sync')">
               <strong>Update AI Search</strong>
-              <span>Make new meetings searchable</span>
+              <span>Publish subscription-authored context</span>
             </button>
             <button type="button" class="btn-stage btn-stage-warn" onclick="retryAllFailed()">
               <strong>Retry Incomplete</strong>
@@ -528,7 +528,7 @@
             <div class="funnel-step">
               <span class="funnel-label">Minutes Compiled</span>
               <strong id="funnel-compiled" class="funnel-val">—</strong>
-              <span class="funnel-sub">ready for search index</span>
+              <span class="funnel-sub">ready for context publication</span>
             </div>
             <div class="funnel-arrow">→</div>
             <div class="funnel-step highlight">

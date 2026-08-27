@@ -92,7 +92,7 @@ Write-Host "    stopping current containers..."
 docker compose down
 Write-Ok "containers stopped"
 
-Write-Host "    starting full stack (Postgres + LightRAG + Ollama)..."
+Write-Host "    starting storage stack (Postgres + LightRAG)..."
 docker compose up -d
 Write-Ok "containers started"
 
@@ -117,21 +117,6 @@ if ($pgReady) {
     Write-Fail "Postgres did not become ready in 2 minutes"
     Write-Host "    Check: docker logs mmc-postgres" -ForegroundColor DarkGray
     exit 1
-}
-
-# Wait for Ollama
-Write-Host "    waiting for Ollama" -NoNewline
-for ($i = 0; $i -lt 30; $i++) {
-    try {
-        docker compose exec -T ollama ollama list 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host ""
-            Write-Ok "Ollama ready"
-            break
-        }
-    } catch {}
-    Write-Host "." -NoNewline
-    Start-Sleep -Seconds 2
 }
 
 # Wait for LightRAG
@@ -182,7 +167,7 @@ if ($minutesFiles.Count -eq 0) {
     Write-Warn "no minutes files found to index"
 } else {
     Write-Host "    found $($minutesFiles.Count) minutes file(s) to index"
-    uv run pipeline index
+    uv run pipeline graph-sync
     if ($LASTEXITCODE -eq 0) {
         Write-Ok "$($minutesFiles.Count) minutes file(s) indexed"
     } else {

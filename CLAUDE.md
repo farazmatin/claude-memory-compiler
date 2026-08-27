@@ -38,7 +38,7 @@ uv run pipeline ingest        # discover + content-hash dedup
 uv run pipeline transcribe    # ASR + align + diarize (the expensive stage)
 uv run pipeline speakers      # SPEAKER_xx -> names
 uv run pipeline minutes       # compile structured minutes
-uv run pipeline index         # push minutes into LightRAG
+uv run pipeline graph-sync    # publish subscription-authored graph records
 uv run pipeline graph-sync    # author the graph from the manifest's entities
 uv run pipeline run           # every pending stage, in order
 uv run pipeline dashboard     # local web UI on 127.0.0.1:8765
@@ -80,18 +80,17 @@ not the hours of transcription behind it.
   meeting. Anything that needs the waveform (voice embeddings, snippets) must run
   BEFORE that call or the audio is already gone. Only 7 of 40 meetings still have
   audio on disk, and they do only because they lack a `drive_sources` row.
-- **LightRAG's own document extraction does not work on this machine.** It runs on
-  Ollama `qwen3:4b` at ~3.6 tok/s against a 240s `llm_timeout`, so every document
-  fails. The graph is authored instead by `pipeline graph-sync`, from entities the
-  minutes stage already extracted with a frontier model. `doctor` checks that the
-  graph is non-empty; a reachable LightRAG is not the same as a working one.
-- **Retrieval does not use LightRAG's `/query`.** That endpoint runs keyword
-  extraction through the same local model and returns HTTP 500 after ~242s.
-  `graph_sync.retrieve_context()` does a label match plus a `GET /graphs` traversal
-  in ~5s with no LLM. Ollama serves embeddings only.
-- **The LLM chain is subscription-backed CLIs, not metered APIs**, tried in order
-  (`config.LLM_PROVIDER_ORDER`). Antigravity (`agy`) is first and is the one holding
-  a live Google session; the standalone `gemini` CLI has no credentials here. Note
+- **LightRAG is storage and graph traversal only.** The subscription provider
+  chain authors minutes, entities, and relations; `pipeline graph-sync` publishes
+  those exact graph records. Model-backed document ingestion and `/query` are not
+  part of the active build. `doctor` checks that the graph is non-empty; a
+  reachable service is not the same as working retrieval.
+- **Retrieval uses direct graph traversal.** `graph_sync.retrieve_context()` does
+  deterministic label matching plus `GET /graphs`, and synthesis runs through the
+  subscription provider chain. No local LLM or text-embedding model is used.
+- **The LLM chain is subscription-backed CLIs**, tried in the enforced order
+  Codex, Claude, then Antigravity (`config.LLM_PROVIDER_ORDER`). The standalone
+  `gemini` CLI has no credentials here. Note
   the two have *different model namespaces* — `gemini-3.7-flash-*` exists in
   Antigravity and is unknown to `gemini`.
 - **Antigravity must be driven via `--input-format stream-json`.** `agy --print`

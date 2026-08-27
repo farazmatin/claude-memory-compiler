@@ -107,8 +107,6 @@ Before the full test, make sure ASR and the local index are available:
 ```powershell
 uv sync --extra asr
 docker compose up -d
-docker compose exec ollama ollama pull qwen3:4b
-docker compose exec ollama ollama pull mxbai-embed-large
 ```
 
 1. Record and stop it in Easy Voice Recorder Pro.
@@ -127,7 +125,7 @@ uv run pipeline ingest
 uv run pipeline transcribe --limit 1
 uv run pipeline speakers --owner "Your Name" --limit 1
 uv run pipeline minutes --limit 1
-uv run pipeline index --limit 1
+uv run pipeline graph-sync
 uv run pipeline status
 ```
 

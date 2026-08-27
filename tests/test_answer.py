@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import time
 
 import pytest
 
@@ -12,8 +11,8 @@ from pipeline.llm import LLMError
 
 # ── retrieval + synthesis ─────────────────────────────────────────────
 
-def test_local_model_retrieves_and_subscription_writes(monkeypatch):
-    """The whole point of the split: each job on the right model."""
+def test_deterministic_retrieval_and_subscription_synthesis(monkeypatch):
+    """Retrieval is model-free; writing uses the subscription chain."""
     monkeypatch.setattr(graph_sync, "retrieve_context", lambda *a, **k: "RETRIEVED CONTEXT")
     monkeypatch.setattr(answer, "complete", lambda prompt: f"answered from: {prompt[-30:]}")
     monkeypatch.setattr(llm, "last_provider", "gemini")
@@ -71,28 +70,6 @@ def test_synthesis_failure_returns_retrieved_context_unsynthesized(monkeypatch):
     assert "the graph says Atlas was deferred" in result.text
 
 
-def test_synthesize_false_uses_the_bounded_raw_query(monkeypatch):
-    monkeypatch.setattr(answer, "_bounded_raw_query", lambda *a, **k: "lightrag answer")
-    called: list[int] = []
-    monkeypatch.setattr(graph_sync, "retrieve_context", lambda *a, **k: called.append(1) or "")
-    monkeypatch.setattr(answer, "fallback_local_context", lambda *a, **k: called.append(1) or "")
-
-    result = answer.ask("q", synthesize=False)
-
-    assert result.text == "lightrag answer"
-    assert result.synthesized is False
-    assert called == [], "synthesize=False must not also pay for graph/minutes retrieval it does not use"
-
-
-def test_synthesize_false_reports_plainly_when_the_bounded_query_gives_up(monkeypatch):
-    monkeypatch.setattr(answer, "_bounded_raw_query", lambda *a, **k: None)
-
-    result = answer.ask("q", synthesize=False)
-
-    assert result.synthesized is False
-    assert "not usable" in result.text
-
-
 def test_timing_is_reported_per_phase(monkeypatch):
     """Latency at scale must be attributable: traversal or generation?"""
     monkeypatch.setattr(graph_sync, "retrieve_context", lambda *a, **k: "context")
@@ -139,40 +116,6 @@ def test_retrieve_context_empty_when_both_empty(monkeypatch):
     monkeypatch.setattr(graph_sync, "retrieve_context", lambda q: "")
     monkeypatch.setattr(answer, "fallback_local_context", lambda q: "")
     assert answer._retrieve_context("q") == ""
-
-
-# ── bounded raw query (LightRAG's own /query, --local only) ───────────
-# Regression coverage: LightRAG's /query is confirmed to return HTTP 500 after
-# 242s on this deployment. Callers must never wait anywhere near that long.
-
-def test_bounded_raw_query_gives_up_at_the_cap_not_the_real_delay(monkeypatch):
-    monkeypatch.setattr(answer, "RAW_QUERY_CAP_SEC", 0.05)
-
-    def slow_query(*a, **k):
-        time.sleep(0.3)
-        return "too late"
-
-    monkeypatch.setattr(index, "query", slow_query)
-
-    started = time.monotonic()
-    result = answer._bounded_raw_query("q", None, None)
-    elapsed = time.monotonic() - started
-
-    assert result is None
-    assert elapsed < 0.2, "must give up at the cap, not wait out the slow call"
-
-
-def test_bounded_raw_query_returns_the_result_when_fast_enough(monkeypatch):
-    monkeypatch.setattr(index, "query", lambda *a, **k: "fast answer")
-    assert answer._bounded_raw_query("q", None, None) == "fast answer"
-
-
-def test_bounded_raw_query_swallows_index_errors(monkeypatch):
-    def boom(*a, **k):
-        raise index.IndexError_("HTTP 500")
-
-    monkeypatch.setattr(index, "query", boom)
-    assert answer._bounded_raw_query("q", None, None) is None
 
 
 def test_synthesis_prompt_forbids_filling_gaps():
@@ -325,6 +268,7 @@ def test_summary_names_the_failed_stages_and_next_steps():
 
 def test_no_alert_configured_is_not_an_error(monkeypatch):
     monkeypatch.setattr(alert, "ALERT_COMMAND", "")
+    monkeypatch.setattr(alert, "_send_windows_notification", lambda *a: False)
     assert alert.send(["transcribe"]) is False
 
 
@@ -373,16 +317,19 @@ def test_windows_paths_survive_command_splitting():
 def test_failing_alert_command_does_not_raise(monkeypatch):
     """An alerting failure must never mask the pipeline failure it reports."""
     monkeypatch.setattr(alert, "ALERT_COMMAND", "false")
+    monkeypatch.setattr(alert, "_send_windows_notification", lambda *a: False)
     assert alert.send(["transcribe"]) is False
 
 
 def test_missing_alert_binary_does_not_raise(monkeypatch):
     monkeypatch.setattr(alert, "ALERT_COMMAND", "definitely-not-a-real-binary-xyz")
+    monkeypatch.setattr(alert, "_send_windows_notification", lambda *a: False)
     assert alert.send(["transcribe"]) is False
 
 
 def test_unparseable_alert_command_does_not_raise(monkeypatch):
     monkeypatch.setattr(alert, "ALERT_COMMAND", 'mail -s "unclosed')
+    monkeypatch.setattr(alert, "_send_windows_notification", lambda *a: False)
     assert alert.send(["transcribe"]) is False
 
 

@@ -73,9 +73,10 @@ ASR_COMPUTE_TYPE = os.environ.get("MMC_ASR_COMPUTE_TYPE", "int8")
 ASR_BATCH_SIZE = int(os.environ.get("MMC_ASR_BATCH_SIZE", "8"))
 ASR_LANGUAGE = os.environ.get("MMC_ASR_LANGUAGE", "en")
 
-# ASR backend selection: "auto" (uses Replicate if token is present, else local CPU),
-# "replicate" (force Replicate GPU), or "whisperx" (force local CPU WhisperX).
-ASR_BACKEND = os.environ.get("MMC_ASR_BACKEND", "auto").lower().strip()
+# ASR backend selection: Replicate is the default. Local WhisperX is available
+# only through the explicit "whisperx" opt-in; a missing cloud token must never
+# silently start a local model.
+ASR_BACKEND = os.environ.get("MMC_ASR_BACKEND", "replicate").lower().strip()
 
 # Replicate serverless GPU configuration
 REPLICATE_API_TOKEN = (
@@ -184,21 +185,25 @@ HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
 # so a quota limit on the preferred provider does not stall a nightly batch that
 # has already paid for transcription.
 #
-# All three are subscription-backed rather than metered APIs. None of them can
-# serve LightRAG, which needs an HTTP endpoint - that runs on local Ollama.
-LLM_PROVIDER_ORDER = [
+# All providers are subscription-backed rather than metered APIs. They author
+# minutes, entities, relations, and answers. LightRAG is graph storage and
+# traversal only; its model-backed document and query routes are not used.
+_configured_llm_providers = {
     name.strip()
     for name in os.environ.get(
-        "MMC_LLM_PROVIDERS", "antigravity,codex,claude,gemini"
+        "MMC_LLM_PROVIDERS", "codex,claude,antigravity"
     ).split(",")
     if name.strip()
+}
+# The environment may select a subset, but cannot reorder providers or add an
+# older/dead path from a stale .env. This is a policy, not a preference hint.
+LLM_PROVIDER_ORDER = [
+    name
+    for name in ("codex", "claude", "antigravity")
+    if name in {configured.lower() for configured in _configured_llm_providers}
 ]
 
-# Antigravity first. It is the CLI that actually holds a live Google session on
-# this machine - the standalone `gemini` CLI has no oauth_creds.json and burns
-# ~12s per call hitting an interactive prompt it can never satisfy. Antigravity
-# also exposes newer Flash models than the standalone CLI knows about, and it
-# answered a probe in 7.7s where codex takes ~59s.
+# Antigravity is the final configured fallback after Codex and Claude.
 ANTIGRAVITY_BIN = os.environ.get("MMC_ANTIGRAVITY_BIN", "agy")
 # `agy models` lists gemini-3.7-flash-{high,medium,low}. The suffix is reasoning
 # effort, not a version: medium is the sensible default for summarisation, and
