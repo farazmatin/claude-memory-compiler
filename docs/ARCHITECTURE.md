@@ -1,393 +1,181 @@
-# Architecture & Design Decisions
+# Current architecture and repository boundary
 
-Post adversarial review. For operational reference (env vars, gotchas, stage
-internals) see [AGENTS.md](../AGENTS.md); for goals and scope see [PRD.md](PRD.md).
+This document is the current source of truth for Meeting Memory. Historical
+plans and reviews may describe superseded experiments; they do not override this
+document, runtime configuration, or the executable pipeline.
 
-## The one-paragraph version
+## Purpose
 
-Audio becomes a verbatim transcript, which is retained forever but never indexed.
-The transcript is *compiled* into structured minutes, and only the minutes are
-indexed — into a knowledge graph plus vector store. Because the transcript is
-retained, the compile step is repeatable: a better template rebuilds the entire
-archive without re-transcribing. Six resumable stages over a SQLite manifest,
-processed oldest-meeting-first, driven by a nightly timer.
+Meeting Memory turns private meeting recordings into reviewable, attributable
+meeting memory. It keeps source records private, makes speaker correction
+possible, and offers narrowly bounded historical context to Product Manager.
+It does not decide product truth.
 
-```
-inbox/          audio arrives                            [Tier 1: source]
-  │  ingest      sha256 dedup, filename parse, ffprobe
-  ▼
-audio/          archived original                        never indexed
-  │  transcribe  ffmpeg 16k mono → ASR + align + diarize
-  ▼
-transcripts/    word-level, speaker-labeled              never indexed
-  │  speakers    SPEAKER_00 → real names
-  │  minutes     subscription LLM + versioned template
-  ▼
-minutes/        600-1200 structured words                [Tier 2: THE CORPUS]
-  │  index       replace-on-reindex
-  ▼
-LightRAG        graph + vector, on Postgres              [Tier 3: derived]
-  │  query
-  ▼
-answers with citations
-```
+## Ownership
 
-## The compiler analogy
+| Concern | Meeting Memory (`claude-memory-compiler`) | Product Manager |
+| --- | --- | --- |
+| Source records | Captures Drive audio; stores transcripts and derived meeting artifacts. | Does not import, mount, or query these files/databases. |
+| Meeting interpretation | Maintains speakers/persons; authors minutes, entities, and relations. | May use supplied background only to orient retrieval. |
+| Historical graph | Publishes and traverses the derived meeting graph. | Consumes a bounded loopback HTTP contract only. |
+| Product truth | Never certifies product statements. | Owns QA-gated statements, decisions, requirements, actions, artifacts, and agents. |
+| User interface | Authenticated loopback dashboard and speaker-resolution work. | PM cockpit and its own QA/review controls. |
 
-```
-audio/        raw input      immutable
-transcripts/  source code    immutable, retained forever
-LLM           compiler       extracts structure and rationale
-minutes/      object code    the indexed corpus
-LightRAG      linked binary  derived, disposable, rebuildable
+The repositories are intentionally separate. They communicate through a small,
+read-only loopback context API, not shared directories, direct database access,
+environment files, or cross-repository writes.
+
+## Normal data flow
+
+```text
+Google Drive audio
+  -> capture
+  -> ingest
+  -> transcription
+  -> speaker and voice resolution
+  -> subscription-authored minutes, entities, and relations
+  -> graph-sync
+  -> bounded ContextProvider (loopback)
+  -> Product Manager background retrieval
 ```
 
-Transcription is the only irreversible cost, and it happens exactly once per
-recording. Everything downstream is a recompile.
+`pipeline run --owner "Faraz"` executes the normal sequence. `graph-sync`
+publishes the derived meeting graph after minutes/entities/relations exist. The
+old normal-path `index` stage is retired; do not reintroduce it as a synonym for
+graph publication.
 
----
+## Model and graph policy
 
-## Decision log
+### What authors meaning
 
-Each entry records what was decided, why, and what was rejected. Several were
-revised by adversarial review; those are marked.
+Codex, Claude, and Antigravity subscription CLIs are the permitted providers
+for authored synthesis: minutes, speaker-resolution assistance, entities,
+relations, and answer synthesis. Provider order and credentials are controlled
+by runtime configuration; documentation must not embed credentials.
 
-### D1 — Index minutes, never transcripts
+Replicate ASR is the default transcription provider. No local ASR provider is
+permitted in the scheduled nightly job; WhisperX is not an automatic fallback.
 
-**Decision.** Only compiled minutes enter the RAG index. Transcripts are retained
-but excluded.
+### What does not run nightly
 
-**Why.** An hour of speech is ~10,000 words with maybe 500 words of durable signal.
-Four failure modes follow from indexing it directly:
+The normal capture and compilation path must not run a local model of any kind:
+no LLM, text embedding, speaker embedding, diarization, or ASR. Local
+generation/embedding experiments, legacy Ollama references, WhisperX, local
+pyannote/torch voice enrollment, and model-backed LightRAG document
+ingestion/query endpoints are not part of production operation.
 
-1. *No chunk boundaries* — speech has no headings, so chunks land mid-thought.
-2. *Referential collapse* — "let's do that instead" is a decision in context and
-   noise as a standalone chunk. Chunking destroys the anaphora that resolved it.
-3. *Embedding dilution* — a 90%-filler chunk embeds toward the centroid of generic
-   meeting talk. Everything resembles everything, and precision **degrades as the
-   corpus grows** — the opposite of what a multi-year archive needs.
-4. *Graph poisoning* — entity extraction mints a node per casual mention, burying
-   real structure.
+The present legacy `voices` implementation loads a local pyannote/torch speaker
+embedding model. It is a compliance blocker for overnight operation, not an
+exception to this policy. Before the job can be described as fully compliant,
+voice enrollment must be moved to an approved non-local/manual workflow or
+retired; the scheduler must not silently invoke it.
 
-**Rejected.** Indexing transcripts alongside minutes (dilutes retrieval); deleting
-transcripts after compiling (destroys D2).
+### LightRAG and Postgres
 
-### D2 — Retain transcripts to make the compile repeatable
+LightRAG backed by Postgres is used only for deterministic storage and
+traversal of subscription-authored entities and relations. It does not author
+facts, retrieve raw source text for a caller, or run its own model-backed
+ingestion/query workflow in the normal path.
 
-**Decision.** Transcripts are permanent. `TEMPLATE_VERSION` in frontmatter marks
-which template built each minutes file; bumping it makes `pipeline minutes
---recompile` rebuild from retained transcripts.
+This makes the responsibility boundary explicit:
 
-**Why.** Minutes are a *lossy* compile. The template will improve, and eventually a
-field nobody thought of will turn out to matter. With transcripts retained that is
-a re-run; without them the history is gone permanently. On CPU, where ASR is 30-50
-minutes per meeting, this is the single most valuable property in the design.
+```text
+Subscription CLI: author and synthesize meaning
+LightRAG/Postgres: store and traverse approved derived graph structure
+ContextProvider: bound and classify historical context
+Product Manager: retrieve, QA, and establish product authority
+```
 
-**Rejected.** Trusting the template to be right first time.
+## Context API contract
 
-### D3 — Graph RAG (LightRAG), not vector RAG
+The Meeting Memory dashboard, normally on loopback port `8765`, exposes:
 
-**Decision.** LightRAG, hybrid graph + vector, with `global` mode for aggregative
-questions.
+```text
+GET  /api/context/health
+POST /api/context/search
+```
 
-**Why.** PM questions are entity-centric and aggregative. "Everything customer Y
-told us" has an answer spanning forty documents; top-k retrieval returns five. That
-is a structural limitation, not a tuning problem.
+The endpoint is authenticated and loopback-bound. It returns a limited number
+of character-bounded `background` items with source provenance, not raw
+transcripts or unrestricted meeting archives. Results include freshness and
+availability signals so a consumer can distinguish `available`, `partial`,
+`stale`, and `unavailable` context.
 
-**Rejected.** Plain vector RAG (fails aggregative queries); RAGFlow (its strength
-is parsing scanned PDFs — wasted on plain-text minutes, and it costs Elasticsearch
-+ MySQL + MinIO + Redis for a feature we do not use); Graphiti (correct bi-temporal
-model, but a library needing Neo4j — an escalation, not a starting point).
+Product Manager must treat every response as non-authoritative background.
+Meeting context cannot create or override any of the following: a decision,
+commitment, owner, speaker, date, deadline, quotation, or QA-approved product
+statement. Its QA-gated catalogue remains authoritative, including when the
+context API is unavailable.
 
-**Hedge that makes this reversible.** `minutes/` is portable markdown. LightRAG is
-*replaceable*: if it stalls or gets outgrown, the corpus re-indexes into anything.
-The data is never hostage to the index.
+## Privacy and data integrity
 
-### D4 — Resumable stage machine over a SQLite manifest
+- `data/transcripts/` contains source transcript material. Do not hand-edit it.
+- Other pipeline artifacts under `data/` are generated; regenerate them through
+  the pipeline rather than editing them manually.
+- Keep services loopback-bound. Never place recordings, transcripts, tokens, or
+  credentials in logs, docs, commits, or context responses.
+- Preserve provenance from a context item to its generated source path.
+- Treat speaker/person resolution as a reviewable correction workflow, not an
+  excuse to fabricate identity or attribution.
 
-**Decision.** Each meeting is a row advancing through
-`discovered → transcribed → speakers_resolved → minutes_compiled → indexed`. Stages
-claim rows at one status and advance them.
+## Operational responsibilities
 
-**Why.** ASR is the expensive step and must never repeat. A crash during minutes
-compilation costs minutes, not the hours behind it. It also makes D2 mechanical:
-re-run stages 4-5 over years of history, touching nothing upstream.
+### Capture
 
-**Failure policy differs by stage, deliberately.** Transcription failures mark the
-row `failed` — something is wrong with the file or environment and a human should
-look. Minutes failures leave the row at `speakers_resolved` — the transcript is
-intact and a model call is retryable, so the next batch picks it up automatically.
+The scheduled job runs the normal pipeline. Its existence is not evidence of a
+successful capture: inspect task result and `uv run pipeline status`.
 
-### D5 — Process oldest-meeting-first, never discovery order
+Use the non-mutating check below when diagnosing capture:
 
-**Decision.** `db.pending()` orders by `(meeting_date, meeting_time)`.
+```powershell
+uv run pipeline capture --dry-run
+```
 
-**Why.** The minutes compiler reads earlier minutes to detect reversed decisions.
-Out-of-order compilation would compare a meeting against its own future. It also
-makes backfill build the graph in the order events actually happened.
+If Drive reports an unauthorized or expired token, a human must complete:
 
-**Revised by review.** The comparison originally used date only, which made every
-meeting blind to the other four from the same day — at five meetings a day, a
-decision reversed after lunch was never flagged.
+```powershell
+uv run pipeline auth-drive
+```
 
-### D6 — `large-v3-turbo`, not `large-v3`
-
-**Decision.** Turbo is the default ASR model.
-
-**Why.** Arithmetic, not preference. Per one-hour meeting on CPU:
-
-| Step | large-v3 | large-v3-turbo |
-|---|---|---|
-| ASR | ~60-120 min | ~8-15 min |
-| Diarization | ~15-30 min | ~15-30 min |
-| Alignment | ~5 min | ~5 min |
-| **× 5/day** | ~9 h — not viable | **~3 h — fits overnight** |
-
-Diarization is the second-largest cost and does **not** shrink with a smaller ASR
-model. It stays anyway: action-item ownership depends on it.
-
-**Escape hatch.** ASR sits behind a `Backend` protocol. A paid API or GPU model
-replaces one class and nothing downstream notices.
-
-### D7 — Copy from the inbox, never move
-
-**Decision.** Ingest copies files out and leaves the inbox untouched.
-
-**Why.** The inbox is expected to be a cloud-synced folder. Deleting from it
-propagates upstream and destroys the original recording.
-
-**Consequence, and its fix.** The inbox is never emptied, so a naive scan re-hashes
-everything nightly — ~165 GB by year five. A `seen_files` table keyed on
-path+size+mtime skips known files without reading them.
-
-### D8 — Never guess a speaker's name
-
-**Decision.** An unresolved label stays `SPEAKER_01`. The resolver returns `null`
-rather than a guess, and the prompt says so explicitly.
-
-**Why.** An action item with a *wrong* owner is worse than one with no owner: it
-silently assigns work to the wrong person and nobody notices. A visible gap is
-fixable.
-
-**Revised by review.** An earlier version assumed the dominant speaker was the
-recorder. That is wrong for a large share of a PM's calendar — in stakeholder
-interviews, user research and demos the other person talks more — and produced
-confidently reversed names, contradicting this very decision. The filename now
-supplies *candidate names* only; the LLM decides the mapping from who introduces
-themselves and who is addressed by name.
-
-### D9 — Minutes are 600-1200 structured words, not a summary
-
-**Decision.** The template targets substance, and explicitly forbids executive
-summarisation.
-
-**Why.** Summaries drop *rationale*, and rationale is what answers "why did we
-deprioritise X" — the most common question asked of a PM archive months later.
-"Chose Postgres" is nearly worthless; "chose Postgres over DynamoDB because the
-team already runs it and the access pattern is relational" is the whole value.
-
-Entities must be preserved **verbatim**: paraphrasing "Project Atlas" into "the
-platform project" creates a second disconnected graph node for one thing.
-
-### D10 — Ordered provider chain, not a single LLM
-
-**Decision.** Gemini Flash → Codex → Claude, falling through on failure. Prompts go
-in on **stdin**, never argv.
-
-**Why.** All three are subscription-backed. A quota limit on the preferred provider
-must not stall a batch that has already paid 40 CPU-minutes for transcription.
-Stdin because a full transcript is tens of thousands of tokens and would risk
-`ARG_MAX` as a command-line argument.
-
-**Unverified.** The exact invocations (`gemini -p -`, `codex exec -`) could not be
-tested — neither CLI was available. Both binary and arguments are env-overridable
-so a mismatch is a config change, not a code change.
-
-### D11 — Postgres storage from day one
-
-**Decision.** LightRAG uses `PGKVStorage` / `PGVectorStorage` /
-`PGDocStatusStorage` / `PGTableGraphStorage`, not the JSON + NanoVectorDB defaults.
-
-**Why.** Cost of delay. The file-based defaults do not hold ~9k documents and
-50-150k graph entities, and migrating a *populated* graph is painful. With zero data
-today the switch is free; in six months it is a project.
-
-**Why `PGTableGraphStorage` specifically.** It runs the graph on plain PostgreSQL
-14+ tables with no Apache AGE and no extensions, so the standard `pgvector` image
-works instead of an AGE-bundled one. This removed both a Neo4j service and an
-unusual base image from the design.
-
-### D12 — Replace on re-index, never append
-
-**Decision.** The manifest records each meeting's LightRAG document id. Re-indexing
-deletes the previous version first, and **abandons the insert if the delete fails**.
-
-**Why.** Found in review: without this, `--recompile` inserted a second copy and
-left the old version's entities in the graph, so retrieval returned contradictory
-duplicates. That silently invalidated D2 — the whole reason transcripts are
-retained. Document ids are derived locally the same way LightRAG derives them
-(`doc-{md5(content.strip())}`), so the id is knowable before insert and stable
-across restarts.
-
-The bail-out ordering matters and was itself wrong in the first draft of the fix:
-inserting before checking the delete creates the duplicate the function exists to
-prevent, and the caller cannot undo it.
-
-### D13 — Fail loudly
-
-**Decision.** `pipeline run` aggregates stage results and returns non-zero if any
-stage failed.
-
-**Why.** Found in review: the original discarded every return code and returned 0.
-A nightly cron would report success after total failure — a break in month 4 would
-surface in month 9 as an empty query result. For an unattended multi-year system,
-silent failure is the top operational risk.
-
-### D14 — Map-reduce over-budget meetings
-
-**Decision.** Under the token budget, compile in one pass. Over it, extract
-per-window notes then compile from the extracts.
-
-**Why.** A three-hour meeting is unbounded input; it would overflow the context
-window or burn a disproportionate slice of subscription quota in one call.
-Windows break only on speaker-turn boundaries — splitting mid-turn would cut a
-decision away from its rationale. A failed window leaves a visible
-`(extraction failed)` marker so the reduce step does not invent continuity.
-
-### D15 — Topical prior context, not just recent
-
-**Decision.** Prior-decision context combines the last few meetings
-(chronological) with a LightRAG retrieval on this meeting's actual subjects
-(topical).
-
-**Why.** Found in review: recency alone systematically misses long-horizon
-reversals, which are exactly the valuable case — a decision being reversed is
-usually months old, not yesterday.
-
-**A clean guarantee falls out of stage ordering.** Minutes are compiled in stage 4
-and indexed in stage 5, so the current meeting is *not yet in the index*. Every hit
-is therefore necessarily from an earlier meeting, and no date filtering is needed —
-fortunate, because LightRAG offers none. Degrades to chronological-only when the
-index is unreachable.
-
-### D16 — Back up with SQLite's online API, not `cp`
-
-**Decision.** `pipeline backup` uses `Connection.backup()` and integrity-checks the
-result.
-
-**Why.** A filesystem copy of a live SQLite database can capture a torn page or
-miss the WAL, producing a backup that restores as corrupt. A backup you cannot
-restore is worse than none: it removes the pressure to have a real one.
-
-**What is deliberately not backed up.** `rag_storage/` and the Postgres volume. The
-index is derived data — it re-indexes from `minutes/`, so backing it up spends
-space on something reconstructible.
-
----
-
-## The subscription-only graph path
-
-Every reasoning task uses the subscription provider chain. Graph publication and
-retrieval are deterministic storage operations:
-
-| Job | Calls/meeting | Provider | Quality-sensitive? |
-|---|---|---|---|
-| Minutes compilation | 1 | Subscription chain | Very |
-| Speaker resolution | 1 | Subscription chain | Moderately |
-| Entity/relation authoring | Included with minutes | Subscription chain | Very |
-| Graph publication/retrieval | Storage operations | None | Deterministic |
-
-LightRAG remains the loopback Postgres-backed graph store, but its model-backed
-document-ingestion and `/query` routes are outside the active build. Compose points
-their model bindings at a closed loopback port so accidental calls fail closed.
-
-### D17 — The compiler emits the knowledge graph
-
-**Decision.** The minutes template emits explicit `Entities` and `Relations`
-sections. These are parsed, canonicalized through the people registry, stored in the
-manifest, and published directly as graph records.
-
-**Why.** The subscription model already running once per meeting can state the
-facts explicitly. Storing them in the manifest means publication is repeatable and
-the corpus does not depend on LightRAG extraction or text embeddings.
-
-**Why a tolerant line parser, not JSON.** Models emit stray prose around JSON often
-enough that a strict parse throws away a whole usable block. Recovering most of a
-messy block beats discarding all of a slightly-malformed one.
-
-### D18 — Retrieval and synthesis are separate
-
-**Decision.** `pipeline/answer.py` combines deterministic graph traversal with a
-bounded minutes/register scan, then hands the context to the subscription chain to
-write the answer. If providers are unavailable, it returns the cited retrieved
-context directly.
-
-**Why.** Answer quality does not depend on a hidden fallback model. Empty retrieval
-short-circuits rather than asking a model to answer from nothing — that is how a
-knowledge base starts inventing.
-
-### D19 — A people registry, because models do not spell consistently
-
-**Decision.** `people` + `person_aliases` tables. Every resolved name and every
-person entity normalizes through `canonical_name()`. `pipeline people --merge`
-rewrites history across speakers, entities, and both ends of every relation.
-
-**Why.** Asking a model to spell a name the same way it did four months ago is not a
-strategy. Each variant becomes a separate graph node, so one person recorded three
-ways is three disconnected entities no query finds together. Unknown names pass
-through unchanged — a new person is normal, and dropping them would be worse than an
-unnormalized spelling.
-
-**Rejected for now.** Voiceprints. pyannote emits speaker embeddings so it is
-feasible, but this makes spelling deterministic, which was the actual failure.
-
-### D20 — Speaker bounds are supplied, over-segmentation is surfaced
-
-**Decision.** `MMC_MIN_SPEAKERS` / `MMC_MAX_SPEAKERS` are passed to pyannote when
-set. An implausible count (>8) or zero speakers produces a warning.
-
-**Why.** pyannote over-segments a noisy 1:1 into three or four speakers and
-under-counts large meetings with overlapping speech, and diarization accuracy is the
-main lever on whether action items get correct owners. Surfaced rather than
-corrected: the fix is a bound or a better microphone, not a guess.
-
-### D21 — Preflight as a command
-
-**Decision.** `pipeline doctor` runs 18 environment checks, each with a fix.
-
-**Why.** Almost everything that goes wrong here fails at *runtime*, and several
-degrade quietly. The gated-model check is the important one: a HuggingFace token
-proves nothing about licence acceptance, which is the part people miss, and missing
-diarization costs every action item its owner while printing only a mid-batch
-warning.
-
-**What it deliberately does not claim.** That the output is good. It verifies the
-environment; only a real meeting read against its audio verifies the minutes.
-
-### D22 — Alerting is a command, not a feature
-
-**Decision.** `MMC_ALERT_COMMAND` receives the failure summary on stdin, with
-`{subject}` substituted.
-
-**Why.** Exiting non-zero (D13) is necessary but not sufficient: cron mails the local
-user and nobody reads local mail on a headless server. A command rather than
-built-in email/webhook support because whatever the server already has beats a
-second notification stack. Delivery never raises — an alerting failure masking the
-pipeline failure it reports would be strictly worse than no alert.
-
-## Known limitations
-
-Accepted, with the reasoning:
-
-- **Graph retrieval is lexical and deterministic.** It avoids model and embedding
-  dependencies, but recall must be watched as the corpus and vocabulary grow.
-- **No voiceprints.** D19 makes spelling deterministic, not identification
-  automatic.
-- **Token estimation is `len // 4`.** Deliberately rough and biased conservative:
-  over-estimating costs an unnecessary map-reduce pass, under-estimating costs a
-  blown context window.
-- **`seen_files` keys on path+size+mtime.** A file edited in place with identical
-  size and mtime would be missed. This does not happen to finished recordings.
-- **Nothing has run against real audio, LightRAG, or the CLI providers.** 165 tests
-  cover logic, not integration. `pipeline doctor` verifies the environment; it
-  cannot verify output quality.
+This browser OAuth action is intentionally not automated and token contents
+must never be printed. Scheduler power/interruption policy is an operational
+setting to inspect separately from OAuth health.
+
+### Speaker and person merges
+
+Merge repair is preview-first and digest-bound. A preview changes nothing.
+Apply only the exact digest explicitly approved by the user; preserve the
+pipeline's recovery record and minute-rewrite jobs. The isolated
+`codex/merge-tightening` worktree remains separate until deliberately reviewed
+and merged.
+
+### Dashboard and context verification
+
+After changing dashboard or context code, restart the loopback dashboard and
+verify the authenticated route. Validate payload classification, bounds,
+provenance, and freshness—not merely that an HTTP route exists.
+
+## Commands
+
+```powershell
+uv run pipeline status
+uv run pipeline capture --dry-run
+uv run pipeline run --owner "Faraz"
+uv run pipeline graph-sync
+uv run pipeline doctor
+open-dashboard.ps1 -Port 8765
+```
+
+Run the narrowest relevant tests first. `uv run pytest` and
+`uv run ruff check .` are the broad Python checks when the changed area warrants
+them.
+
+## Change rules
+
+- Keep the normal pipeline free of local model dependencies of every kind.
+- Keep all callers behind the bounded ContextProvider seam; do not add a direct
+  Product Manager read of Meeting Memory files or Postgres.
+- Do not silently degrade to another model, transcript source, or ASR provider.
+- Do not hand-edit generated minutes, graph, or merge state.
+- Preserve unrelated worktree changes and do not merge isolated work solely to
+  make documentation appear current.

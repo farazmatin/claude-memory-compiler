@@ -1,35 +1,35 @@
 # Meeting Minutes Compiler
 
-**Meeting audio in. A searchable knowledge base of decisions out.**
+**Meeting audio in. Reviewable meeting memory and bounded historical context out.**
 
 Records of your meetings compile themselves into structured minutes, then into a
-knowledge graph you can actually ask questions of — "why did we deprioritize
-Atlas?", "what has this customer told us?", "when did we reverse on that?"
+meeting memory with speaker, entity, and relation records. It can supply
+bounded historical background for questions such as "why did we deprioritize
+Atlas?", "what has this customer told us?", or "when did we reverse on that?"
 
 Built for volume: roughly five meetings a day, indefinitely.
 
 ## The idea
 
 ```
-audio → transcript → minutes → knowledge graph
-        (retained)   (indexed)
+audio → transcript → minutes/entities/relations → graph context
+        (retained)                       (derived)
 ```
 
 Three tiers, and the split between them is the whole design:
 
-| Tier | What | Indexed? |
+| Tier | What | Role |
 |---|---|---|
-| 1 | Audio + full diarized transcript | **No** |
-| 2 | Structured minutes, one per meeting | **Yes** — this is the corpus |
-| 3 | Knowledge graph + vector index (LightRAG) | derived |
+| 1 | Audio + full diarized transcript | Private source material; retained, never returned wholesale as context |
+| 2 | Structured minutes plus entity/relation registers | Subscription-authored, reviewable derived meeting memory |
+| 3 | LightRAG + Postgres graph | Deterministic storage and traversal of the derived graph |
 
-**Why transcripts are not indexed.** A one-hour meeting is ~10,000 spoken words
+**Why transcripts are not used as the retrieval corpus.** A one-hour meeting is ~10,000 spoken words
 of which maybe 500 are durable signal. Speech has no headings to chunk on, and
 it's dense with pronouns — "yeah, let's just do that instead" is a decision when
-you hear it and meaningless as a retrieved chunk. Index that and every chunk
-embeds toward the centroid of "generic meeting talk," so retrieval precision
-collapses as the corpus grows. Worse, entity extraction mints a graph node for
-every casual mention and buries the real structure.
+you hear it and meaningless as isolated context. Publishing raw transcript text
+would blur the durable record with conversational filler and overwhelm the
+derived entity/relation structure.
 
 **Why transcripts are still kept.** Two reasons, and the second one shapes the
 whole architecture:
@@ -79,8 +79,9 @@ uv run pipeline dashboard --open               # foreground dashboard server
 
 Expect ~30–50 minutes for a one-hour recording on CPU.
 
-**New here?** [docs/USER_GUIDE.md](docs/USER_GUIDE.md) walks through setup, daily
-use, and how to judge whether the output is any good.
+**New here?** [USER_GUIDE.md](USER_GUIDE.md) walks through setup, daily use, and
+how to judge whether the output is any good. For the current model policy and
+the boundary with Product Manager, read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 <details>
 <summary>Manual setup, if you'd rather not run a script</summary>
@@ -119,8 +120,26 @@ does not call LightRAG's model-backed document or query routes:
 - **Synthesis is split from retrieval.** LightRAG stores and traverses the graph;
   the subscription chain writes the answer.
 
-The loopback services store and traverse private data; they run no language or
-text-embedding model.
+The loopback services store and traverse private data; they run no local model
+of any kind. Nightly operation must not load local LLM, text-embedding,
+speaker-embedding, diarization, or ASR weights. The legacy local pyannote voice
+enrollment path is a migration blocker until it is removed from nightly work or
+replaced by an approved non-local/manual workflow.
+
+## Boundary with Product Manager
+
+This repository owns private meeting records and their derived meeting memory:
+capture, transcripts, speaker/person resolution, minutes, entities, relations,
+and graph context. Product Manager owns QA-gated product statements, decisions,
+requirements, actions, artifacts, agents, and the PM cockpit.
+
+The repositories connect only through the authenticated, loopback-bound context
+API (`GET /api/context/health`, `POST /api/context/search`). Meeting Memory
+returns character-bounded, provenance-bearing `background` items; Product
+Manager never reads Meeting Memory files or databases directly. Background can
+orient retrieval but cannot establish or override a decision, commitment, owner,
+speaker, date, deadline, quotation, or QA-approved Product Manager fact. The
+complete contract is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 For automatic phone capture, follow [USER_GUIDE.md](USER_GUIDE.md). It covers
 Easy Voice Recorder Pro, private Google Drive setup, the June 9, 2026 backfill
@@ -145,9 +164,8 @@ pipeline minutes                  # compile structured minutes
 pipeline graph-sync               # publish subscription-authored graph records
 pipeline run                      # every pending stage, in order
 pipeline status                   # where everything is, plus real stage timings
-pipeline dashboard --open         # local, read-only meeting library and RAG search
-pipeline query "question"         # ask the knowledge base
-pipeline query "..." --mode global   # for answers spanning many meetings
+pipeline dashboard --open         # local meeting library, speaker review, and bounded context search
+pipeline query "question"         # deterministic graph traversal plus subscription-authored synthesis
 pipeline query "..." --timing     # retrieval vs synthesis time
 pipeline people                   # the people registry
 pipeline people --merge Mike Michael   # preview folding a duplicate
@@ -161,7 +179,8 @@ pipeline capture --complete-backfill  # permanently disable the one-time backfil
 ```
 
 `pipeline run` exits **non-zero if any stage failed**, so a nightly cron reports a
-broken batch instead of silently succeeding.
+broken batch instead of silently succeeding. Do not schedule a full run as
+policy-compliant while it can invoke legacy local voice enrollment.
 
 ## Meeting Memory dashboard
 
@@ -182,11 +201,12 @@ sign-in, install the one-time user-level sign-in setup:
 It uses a Scheduled Task when Windows permits it and otherwise installs a Startup
 shortcut for the current user. Neither option requires administrator access.
 
-It listens only on `127.0.0.1:8765` by default and never changes Drive, the
-manifest, transcripts, minutes, or speaker records. It provides the meeting
-library, compiled minutes, a link back to the original private Drive audio,
-speaker-review signals, and the same evidence-backed RAG search as `pipeline
-query`. Use `-Port 8766` with either script if the default port is occupied.
+It listens only on `127.0.0.1:8765` by default and uses its configured
+authentication. It never uploads or deletes Drive recordings. The meeting
+library provides compiled minutes, a link back to the original private Drive
+audio, speaker-review actions, and bounded context search. Review actions are
+explicit and pipeline-backed; they are not permission to hand-edit generated
+records. Use another unused loopback port, such as `-Port 8767`, if needed.
 
 `pipeline dashboard --open` remains available for a temporary foreground server;
 press `Ctrl+C` in that terminal to stop it.
@@ -212,7 +232,7 @@ Per one-hour meeting, on a modern multicore CPU:
 | **× 5/day** | ~9 hrs — not viable | **~3 hrs — fits overnight** |
 
 So the default is `large-v3-turbo`, not `large-v3`. Add ~1 hr/day for graph
-indexing and the nightly batch is about **4 hours** — run it from a timer, not a
+publication and the nightly batch is about **4 hours** — run it from a timer, not a
 filesystem watcher, or runs will overlap:
 
 ```cron
@@ -254,21 +274,19 @@ meeting, read against the audio.
 ## Prerequisites
 
 - **ffmpeg** on `PATH` (audio normalization and duration probing)
-- **`HF_TOKEN`** — a HuggingFace read token. pyannote's diarization models are
-  gated: you must also manually accept the terms for
-  `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0`. Without
-  this, diarization is skipped with a warning and you get transcripts with no
-  speaker attribution — which means action items with no owners.
+- **`HF_TOKEN`** — required only by an explicitly approved manual speaker/voice
+  workflow while the legacy pyannote assets remain available. It must not enable
+  local pyannote/torch work from the scheduled nightly job.
 - **`MMC_LIGHTRAG_API_KEY`** — see below.
 - **Docker** for loopback-only LightRAG graph storage and Postgres.
 - At least one of **Codex**, **Claude**, or **Antigravity** reachable.
 
 ## Security
 
-Both services bind to **loopback only**. This index holds a searchable record of
-every decision, customer conversation, and internal disagreement in the corpus;
-publishing it on `0.0.0.0` would put that on the network unauthenticated. To reach
-the WebUI from another machine, tunnel:
+Both services bind to **loopback only**. The derived graph holds private meeting
+context: decisions, customer conversations, and internal disagreements.
+Publishing it on `0.0.0.0` would put that on the network. To reach the WebUI from
+another machine, tunnel:
 
 ```bash
 ssh -L 9621:127.0.0.1:9621 user@server
@@ -292,7 +310,8 @@ The snapshot is integrity-checked, and a `BACKUP_INFO.txt` with restore steps is
 written alongside it. The LightRAG graph is deliberately **not** backed up — it is
 derived from manifest entities and relations and rebuilt with `pipeline graph-sync`.
 
-Add it to the nightly timer after `run`.
+`pipeline run` already includes graph publication; do not add a second legacy
+indexing step to the scheduler.
 
 ## When the batch fails
 
@@ -412,18 +431,19 @@ pipeline people --repair-merges --apply db/merge-control/repair.json --expected-
 The preview can contain private names and file paths. Creating it is read-only and
 does not authorize modifying the live manifest.
 
-**ASR sits behind a `Backend` protocol.** Swapping in a paid API or a GPU model
-touches one class and nothing downstream — the designed escape hatch from the CPU
-constraint.
+**ASR sits behind a `Backend` protocol.** The scheduled job must select the
+approved remote provider. A local CPU/GPU backend may not be introduced as a
+nightly fallback.
 
-**Re-indexing replaces, never appends.** Each meeting's LightRAG document id is
-recorded in the manifest and the old version is deleted before a recompiled one is
-inserted. If the delete fails, the insert is abandoned rather than leaving two
-contradictory copies of the same meeting in the graph.
+**Re-publishing graph records replaces, never appends.** Each meeting's derived
+graph record is tracked in the manifest and the old version is removed before a
+recompiled version is published. If removal fails, publication is abandoned
+rather than leaving contradictory copies in the graph.
 
-**The corpus outlives its index.** `minutes/` is portable markdown. If LightRAG
-stalls, slows down, or gets outgrown, the corpus re-indexes into anything else —
-your data is not hostage to it.
+**The corpus outlives its graph store.** `minutes/` and the entity/relation
+registers are portable derived artifacts. If LightRAG stalls, slows down, or gets
+outgrown, graph records can be republished elsewhere — your data is not hostage
+to it.
 
 ## Not included
 

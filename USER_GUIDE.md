@@ -1,7 +1,9 @@
 # User Guide: Automatic Meeting Capture
 
 This system records meetings on your Pixel, stores the original audio privately
-in Google Drive, and compiles the recording into searchable minutes overnight.
+in Google Drive, and compiles the recording into searchable minutes during the
+scheduled run. The scheduled path must use remote/subscription services only;
+it must not load a local model of any kind.
 It does not delete or alter anything in Google Drive.
 
 ## Your normal routine
@@ -9,7 +11,8 @@ It does not delete or alter anything in Google Drive.
 1. Open **Easy Voice Recorder Pro** and record with the Pixel's built-in microphone.
 2. Stop the recording when the meeting ends.
 3. Nothing else is required: the app uploads the finished audio to Drive, and the
-   computer collects and processes it during the nightly run.
+   computer collects and processes it during the scheduled run when the nightly
+   policy gate is compliant.
 
 The first time you set it up, complete the sections below.
 
@@ -102,7 +105,8 @@ as ambiguous. Resolve ambiguous files by renaming them with an ISO date such as
 Use a new 20-second test recording with a unique name, such as
 `2026-08-12T1100_capture-test`.
 
-Before the full test, make sure ASR and the local index are available:
+Before the full test, make sure the configured remote ASR and graph-storage
+services are available:
 
 ```powershell
 uv sync --extra asr
@@ -151,7 +155,16 @@ does not start a second run while the first is still active. Check progress with
 
 ```powershell
 uv run pipeline status
+uv run pipeline capture --dry-run
 ```
+
+The dry run checks Drive authorization without changing local files. If it
+reports an expired or unauthorized token, run `uv run pipeline auth-drive` and
+complete the browser sign-in. Inspect the Scheduled Task's last result as well:
+a configured task is not proof that capture ran. Do not schedule a full pipeline
+run while it can invoke the legacy local pyannote/torch voice-enrollment path;
+the product policy permits no local model (including speaker embedding,
+diarization, or ASR) overnight.
 
 ## 7. Review minutes and search the archive
 
@@ -163,8 +176,8 @@ Open the local Meeting Memory dashboard after a run:
 
 The browser shows every meeting, its compiled minutes, a link back to the
 original private Drive audio, and any speaker-review signal. Enter a question
-such as “What did we decide about the Drive capture approach?” to search the
-same RAG knowledge base used by `pipeline query`.
+such as “What did we decide about the Drive capture approach?” to traverse the
+derived meeting graph and bounded compiled-minute context used by `pipeline query`.
 
 The launcher keeps the dashboard running in the background, so closing the
 PowerShell window does not close the browser page. To start it automatically
@@ -177,12 +190,14 @@ after every Windows sign-in, install the one-time user-level sign-in setup:
 It uses a Scheduled Task when Windows permits it and otherwise installs a Startup
 shortcut for the current user. Neither option requires administrator access.
 
-The dashboard is read-only and defaults to `http://127.0.0.1:8765`; it does not
-upload, alter, or delete recordings, minutes, or speaker names. If the default
-port is in use, choose another one:
+The dashboard is authenticated, loopback-only, and defaults to
+`http://127.0.0.1:8765`. It does not upload or delete recordings. It does offer
+explicit speaker-review actions backed by the pipeline; use those rather than
+editing generated minutes or records directly. If the default port is in use,
+choose another unused loopback port:
 
 ```powershell
-.\scripts\open-dashboard.ps1 -Port 8766
+.\scripts\open-dashboard.ps1 -Port 8767
 ```
 
 If a meeting says **Speaker review** or **No diarization**, the minutes are still
