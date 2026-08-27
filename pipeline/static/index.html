@@ -99,17 +99,51 @@
               <span aria-hidden="true">⌕</span>
               <input id="meeting-search" type="search" placeholder="Search topic, attendee, or keyword..." />
             </label>
-            <select id="meeting-filter-category" aria-label="Filter category">
-              <option value="all">All Categories</option>
-              <option value="Professional">💼 Professional</option>
-              <option value="Personal">🏠 Personal</option>
-            </select>
-            <select id="meeting-filter-status" aria-label="Filter status">
-              <option value="all">All statuses</option>
-              <option value="ready">Ready to search</option>
-              <option value="review">Needs speaker check</option>
-              <option value="failed">Needs attention</option>
-            </select>
+            <div class="control-group">
+              <label for="meeting-sort">Sort</label>
+              <select id="meeting-sort">
+                <option value="date-desc">Newest first</option>
+                <option value="date-asc">Oldest first</option>
+                <option value="duration-desc">Longest first</option>
+                <option value="speakers-desc">Most speakers</option>
+                <option value="unresolved-desc">Most unnamed speakers</option>
+                <option value="title-asc">Title A–Z</option>
+              </select>
+            </div>
+            <div class="control-group">
+              <label for="meeting-filter-range">When</label>
+              <select id="meeting-filter-range">
+                <option value="all">Any date</option>
+                <option value="30">Last 30 days</option>
+                <option value="90">Last 90 days</option>
+                <option value="365">Last 12 months</option>
+              </select>
+            </div>
+            <div class="control-group">
+              <label for="meeting-filter-category">Category</label>
+              <select id="meeting-filter-category">
+                <option value="all">All Categories</option>
+                <option value="Professional">💼 Professional</option>
+                <option value="Personal">🏠 Personal</option>
+              </select>
+            </div>
+            <div class="control-group">
+              <label for="meeting-filter-status">Status</label>
+              <select id="meeting-filter-status">
+                <option value="all">All statuses</option>
+                <option value="ready">Ready to search</option>
+                <option value="review">Needs speaker check</option>
+                <option value="failed">Needs attention</option>
+              </select>
+            </div>
+            <div class="control-group">
+              <label for="meeting-filter-audio">Audio</label>
+              <select id="meeting-filter-audio">
+                <option value="all">Any</option>
+                <option value="yes">Recording on disk</option>
+                <option value="no">Recording deleted</option>
+              </select>
+            </div>
           </div>
         </div>
 
@@ -136,6 +170,47 @@
         <div class="speaker-resolution-status" aria-live="polite">
           <strong id="speaker-resolution-summary">Loading speaker decisions…</strong>
           <span>Start with recurring voices; they fix the most history first.</span>
+        </div>
+
+        <div class="review-controls" role="group" aria-label="Sort and filter speaker decisions">
+          <div class="control-group">
+            <label for="speaker-sort">Sort</label>
+            <select id="speaker-sort">
+              <option value="margin-asc">Closest call first</option>
+              <option value="confidence-desc">Most confident first</option>
+              <option value="confidence-asc">Least confident first</option>
+              <option value="speech-desc">Most speech first</option>
+              <option value="occurrences-desc">Heard in most meetings</option>
+              <option value="date-desc">Most recent meeting</option>
+            </select>
+          </div>
+          <div class="control-group">
+            <label for="speaker-filter-band">Band</label>
+            <select id="speaker-filter-band">
+              <option value="all">All bands</option>
+              <option value="auto">Auto — strong match</option>
+              <option value="review">Review — needs a human</option>
+              <option value="new">New — no match at all</option>
+            </select>
+          </div>
+          <div class="control-group">
+            <label for="speaker-filter-suggestion">Suggestion</label>
+            <select id="speaker-filter-suggestion">
+              <option value="all">Any suggestion</option>
+              <option value="voiceprint">Has a voiceprint match</option>
+              <option value="transcript">Named in the transcript</option>
+              <option value="none">No suggestion at all</option>
+            </select>
+          </div>
+          <div class="control-group">
+            <label for="speaker-filter-clip">Audio</label>
+            <select id="speaker-filter-clip">
+              <option value="all">Any</option>
+              <option value="yes">Has a clip to play</option>
+              <option value="no">No audio retained</option>
+            </select>
+          </div>
+          <p class="review-controls-count" id="speaker-visible-count" aria-live="polite"></p>
         </div>
 
         <section class="section-card speaker-resolution-section">
@@ -356,7 +431,7 @@
             </div>
           </div>
 
-          <form id="timeline-form" class="timeline-search-form" onsubmit="event.preventDefault(); loadTimelineForTopic($('timeline-topic-input').value);">
+          <form id="timeline-form" class="timeline-search-form">
             <label class="sr-only" for="timeline-topic-input">Timeline topic</label>
             <input type="text" id="timeline-topic-input" placeholder="Enter any project, property, or topic (e.g. Cambridge lease, Roof estimate)..." />
             <button type="submit" class="btn-action">Generate Timeline</button>

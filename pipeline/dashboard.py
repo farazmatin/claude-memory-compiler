@@ -482,6 +482,13 @@ def get_voice_clusters() -> list[dict[str, Any]]:
                 "best_canonical": c["best_canonical"],
                 "best_score": round(float(c["best_score"] or 0), 2) if c["best_score"] is not None else None,
                 "next_canonical": c["next_canonical"],
+                # The runner-up's score, not just its name. Triage order is the
+                # margin between first and second guess, not the raw top score.
+                "next_score": (
+                    round(float(c["next_score"]), 2)
+                    if c["next_score"] is not None
+                    else None
+                ),
                 "band": c["band"],
                 # A name heard in the room is independent evidence from a
                 # voiceprint score, and it is strongest exactly where the
@@ -493,7 +500,7 @@ def get_voice_clusters() -> list[dict[str, Any]]:
         return result
 
 
-def speaker_resolution_queue(limit: int = 100) -> dict[str, Any]:
+def speaker_resolution_queue(limit: int | None = None) -> dict[str, Any]:
     """Return every identity decision the owner can make from one dashboard view.
 
     Embedded labels are grouped into recurring voice clusters first: one answer
@@ -507,7 +514,7 @@ def speaker_resolution_queue(limit: int = 100) -> dict[str, Any]:
             """
             SELECT s.meeting_id, s.label, m.source_name, m.title_hint, m.minutes_path,
                    m.meeting_date, sm.speech_sec, sm.snippet_paths, sm.best_canonical,
-                   sm.best_score, sm.llm_name
+                   sm.best_score, sm.next_canonical, sm.next_score, sm.band, sm.llm_name
             FROM speakers s
             JOIN meetings m ON m.id = s.meeting_id
             LEFT JOIN speaker_matches sm
@@ -516,9 +523,9 @@ def speaker_resolution_queue(limit: int = 100) -> dict[str, Any]:
               AND (sm.state IS NULL OR sm.state = 'pending')
               AND (sm.cluster_id IS NULL OR sm.cluster_id = '')
             ORDER BY COALESCE(sm.speech_sec, 0) DESC, m.meeting_date DESC, s.label
-            LIMIT ?
-            """,
-            (limit,),
+            """
+            + ("" if limit is None else " LIMIT ?"),
+            () if limit is None else (limit,),
         ).fetchall()
 
     one_offs = []
@@ -543,6 +550,16 @@ def speaker_resolution_queue(limit: int = 100) -> dict[str, Any]:
                     if row["best_score"] is not None
                     else None
                 ),
+                "next_canonical": row["next_canonical"],
+                "next_score": (
+                    round(float(row["next_score"]), 2)
+                    if row["next_score"] is not None
+                    else None
+                ),
+                # Clusters already report their band. One-offs render in the same
+                # triage list under the same filter, so they have to answer it too
+                # or the filter quietly only applies to half the queue.
+                "band": row["band"],
                 "llm_suggestion": row["llm_name"],
             }
         )

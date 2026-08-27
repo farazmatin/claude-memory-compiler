@@ -15,6 +15,13 @@ let state = {
   personRenamePreview: null,
   personRenameBusy: false,
   pipelineRunning: false,
+  // Set on click and cleared when /api/pipeline/run answers. Without it a
+  // second click in that window slipped past the pipelineRunning guard.
+  pipelineStarting: false,
+  // Last `running` value the server actually reported. pipelineRunning is
+  // also set optimistically, so the finished-run announcement below needs a
+  // flag that only ever moves on a real status response.
+  lastServerRunning: null,
   pollTimer: null,
 };
 
@@ -82,6 +89,72 @@ async function startNewChatSession() {
 const $ = (id) => document.getElementById(id);
 const $$ = (sel) => document.querySelectorAll(sel);
 
+// ── Pending-action feedback ──────────────────────────────────────────
+// Every action here is a round trip to a local server that may be calling an
+// LLM, transcribing audio, or rewriting minutes on disk. A click used to
+// produce nothing visible until the request finished, so a slow success and a
+// dead button looked identical: the only honest signal was the toast, which
+// arrives seconds or minutes later. These helpers give the clicked control a
+// disabled, aria-busy pending state for the whole round trip, and double as
+// the double-submit guard.
+//
+// The inline `onclick` handlers in index.html cannot hand their own button to
+// the function they call without editing markup the UI contract tests pin, so
+// a capture-phase listener records it instead. Capture on document runs before
+// the target's own inline handler, so `triggerButton()` is already accurate by
+// the time that handler asks for it.
+let lastClickedButton = null;
+document.addEventListener(
+  "click",
+  (event) => {
+    lastClickedButton = event.target instanceof Element ? event.target.closest("button") : null;
+  },
+  true,
+);
+
+const triggerButton = () => lastClickedButton;
+
+function setButtonBusy(button, label = null) {
+  if (!button || button.dataset.busy === "1") return false;
+  button.dataset.busy = "1";
+  // Some controls are disabled for their own reasons - "Merge selected" needs
+  // two selections - so the prior state is restored, not assumed to be false.
+  button.dataset.idleDisabled = button.disabled ? "1" : "0";
+  button.setAttribute("aria-busy", "true");
+  // Stage buttons wrap a <strong> and a <span>; swapping textContent would
+  // flatten them, so a label is only applied when the caller asks for one.
+  if (label !== null) {
+    button.dataset.idleLabel = button.textContent;
+    button.textContent = label;
+  }
+  button.disabled = true;
+  return true;
+}
+
+function clearButtonBusy(button) {
+  if (!button || button.dataset.busy !== "1") return;
+  if (button.dataset.idleLabel !== undefined) {
+    button.textContent = button.dataset.idleLabel;
+    delete button.dataset.idleLabel;
+  }
+  button.disabled = button.dataset.idleDisabled === "1";
+  delete button.dataset.idleDisabled;
+  delete button.dataset.busy;
+  button.removeAttribute("aria-busy");
+}
+
+// Returns undefined without running `task` when the control is already busy.
+// That early return is what stops a second click firing a duplicate request.
+async function withBusy(button, label, task) {
+  if (button && button.dataset.busy === "1") return undefined;
+  setButtonBusy(button, label);
+  try {
+    return await task();
+  } finally {
+    clearButtonBusy(button);
+  }
+}
+
 // (Initialization is handled by init() at the bottom of this file)
 
 // ── Tabs Navigation ──────────────────────────────────────────────────
@@ -137,32 +210,70 @@ function setupAskModeTabs() {
 function setupEventListeners() {
   // Search & Filter
   $("meeting-search").addEventListener("input", () => filterAndRenderMeetings());
-  $("meeting-filter-status").addEventListener("change", () => filterAndRenderMeetings());
+  // The archive controls re-render the meeting list; the speaker controls
+  // re-render the review queue. Both save first, so the choice survives the
+  // reload - this queue gets worked over days, not in one sitting.
+  ["meeting-sort", "meeting-filter-range", "meeting-filter-audio", "meeting-filter-status"].forEach(
+    (id) => {
+      const control = $(id);
+      if (control) {
+        control.addEventListener("change", () => {
+          saveControlState();
+          filterAndRenderMeetings();
+        });
+      }
+    },
+  );
+  ["speaker-sort", "speaker-filter-band", "speaker-filter-suggestion", "speaker-filter-clip"].forEach(
+    (id) => {
+      const control = $(id);
+      if (control) {
+        control.addEventListener("change", () => {
+          saveControlState();
+          applySpeakerControls();
+        });
+      }
+    },
+  );
   if ($("meeting-filter-category")) {
-    $("meeting-filter-category").addEventListener("change", () => filterAndRenderMeetings());
+    $("meeting-filter-category").addEventListener("change", () => {
+      saveControlState();
+      filterAndRenderMeetings();
+    });
   }
 
   // Pipeline, export & refresh
-  $("btn-quick-run").addEventListener("click", () => runStage("all"));
+  $("btn-quick-run").addEventListener("click", (event) => runStage("all", event.currentTarget));
   $("btn-export-pm").addEventListener("click", exportToProductManager);
-  $("btn-refresh").addEventListener("click", () => {
-    loadOverview();
-    loadMeetings();
-    loadPeople();
-    loadCommitments();
-    checkPipelineStatus();
-    showToast("Refreshed archive data", "success");
-  });
+  $("btn-refresh").addEventListener("click", (event) =>
+    // The toast used to fire while all of these requests were still in flight,
+    // so it reported a refresh that had not happened yet.
+    withBusy(event.currentTarget, "↻ Refreshing…", async () => {
+      await Promise.all([
+        loadOverview(),
+        loadMeetings(),
+        loadPeople(),
+        loadCommitments(),
+        loadVoiceClusters(),
+        checkPipelineStatus(),
+      ]);
+      showToast("Refreshed archive data", "success");
+    }),
+  );
 
   // Query / RAG Form
   $("query-form").addEventListener("submit", (e) => {
     e.preventDefault();
     askArchive();
   });
+  $("timeline-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    loadTimelineForTopic($("timeline-topic-input").value, e.submitter);
+  });
 
   $("form-add-person").addEventListener("submit", (e) => {
     e.preventDefault();
-    submitAddPerson();
+    submitAddPerson(e.submitter);
   });
   $("person-merge-form").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -186,7 +297,7 @@ function setupEventListeners() {
   $("people-suggestion-no").addEventListener("click", dismissPeopleSuggestion);
   $("speaker-form").addEventListener("submit", (e) => {
     e.preventDefault();
-    submitSpeakerModal();
+    submitSpeakerModal(e.submitter);
   });
   $("voice-name-form").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -419,7 +530,10 @@ function handlePipelineStatus(status) {
   const indicator = $("pipeline-indicator");
   const statusText = $("pipeline-status-text");
   const terminalBody = $("terminal-body");
+  const wasRunning = state.lastServerRunning === true;
+  state.lastServerRunning = status.running;
   state.pipelineRunning = status.running;
+  setStageControlsRunning(status.running);
 
   const stageFriendly = {
     all: "Processing All Stages",
@@ -441,7 +555,9 @@ function handlePipelineStatus(status) {
   } else {
     indicator.classList.remove("running");
     statusText.textContent = "Processing Idle";
-    $("btn-quick-run").disabled = false;
+    // Same window as setStageControlsRunning: a poll that lands before the
+    // start request answers must not offer the button back.
+    $("btn-quick-run").disabled = state.pipelineStarting;
     $("btn-quick-run").textContent = "▶ Sync & Process Recordings";
   }
 
@@ -461,78 +577,146 @@ function handlePipelineStatus(status) {
     clearTimeout(state.pollTimer);
     state.pollTimer = null;
   }
+
+  // A finished run used to say nothing at all: the badge quietly returned to
+  // idle and a crash was visible only in the log drawer, which is closed by
+  // default. That silence is where "did my click do anything?" came from.
+  // Announce the outcome once, on the transition, and reload what the run
+  // could have changed.
+  if (wasRunning && !status.running) {
+    if (status.error) {
+      showToast(`Processing stopped: ${status.error}`, "error");
+    } else if (status.success === false) {
+      showToast("Processing finished with errors - open Diagnostics for the log.", "error");
+    } else {
+      showToast("Processing finished.", "success");
+    }
+    loadOverview();
+    loadMeetings();
+    loadPeople();
+    loadVoiceClusters();
+    loadCommitments();
+  }
 }
 
-async function runStage(stage) {
-  if (state.pipelineRunning) {
+// Lock every control that starts pipeline work while the single background
+// worker is busy. The backend rejects a concurrent run with a 400, so leaving
+// these live only bought an error toast; disabling them says why up front.
+function setStageControlsRunning(running) {
+  // The 8s overview poll can land inside the window between the click and the
+  // server reporting `running`. Without pipelineStarting in the test, that
+  // poll would briefly re-enable the whole grid mid-start.
+  const locked = running || state.pipelineStarting;
+  const controls = [
+    ...$$(".btn-stage"),
+    document.querySelector(".speaker-refresh-box .btn-action"),
+  ];
+  controls.forEach((button) => {
+    // A button mid-request owns its own disabled state; clearButtonBusy hands
+    // it back to whatever this function last decided.
+    if (button && button.dataset.busy !== "1") button.disabled = locked;
+  });
+}
+
+async function runStage(stage, trigger = triggerButton()) {
+  if (state.pipelineRunning || state.pipelineStarting) {
     showToast("Processing is already in progress.", "info");
     return;
   }
-  try {
-    const res = await fetch("/api/pipeline/run", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ stage }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Failed to start operation");
-    const stageMessage = stage === "speaker-refresh"
-      ? "Updating corrected minutes and AI search"
-      : `Started audio processing (${stage})`;
-    showToast(stageMessage, "success");
-    checkPipelineStatus();
-  } catch (err) {
-    showToast(err.message, "error");
-  }
+  state.pipelineStarting = true;
+  // Lock the action grid on the click rather than on the next status poll up
+  // to 1.5s later. That gap was long enough to read as a dead button.
+  setStageControlsRunning(true);
+  const started = await withBusy(trigger, null, async () => {
+    try {
+      const res = await fetch("/api/pipeline/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ stage }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to start operation");
+      const stageMessage = stage === "speaker-refresh"
+        ? "Updating corrected minutes and AI search"
+        : `Started audio processing (${stage})`;
+      showToast(stageMessage, "success");
+      return true;
+    } catch (err) {
+      showToast(err.message, "error");
+      return false;
+    }
+  });
+  state.pipelineStarting = false;
+  // A run that finishes between here and the first poll would otherwise never
+  // announce itself, because the transition to idle was never observed.
+  if (started) state.lastServerRunning = true;
+  else setStageControlsRunning(false);
+  checkPipelineStatus();
 }
 
-async function retryAllFailed() {
-  try {
-    const res = await fetch("/api/pipeline/retry", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status: "discovered" }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Retry failed");
-    showToast(`Requeued ${data.requeued} recordings for processing`, "success");
-    loadOverview();
-    loadMeetings();
-  } catch (err) {
-    showToast(err.message, "error");
-  }
+async function retryAllFailed(trigger = triggerButton()) {
+  await withBusy(trigger, null, async () => {
+    try {
+      const res = await fetch("/api/pipeline/retry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "discovered" }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Retry failed");
+      showToast(`Requeued ${data.requeued} recordings for processing`, "success");
+      await Promise.all([loadOverview(), loadMeetings()]);
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  });
 }
 
-async function recompileStale() {
-  try {
-    const res = await fetch("/api/pipeline/recompile", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Format refresh failed");
-    showToast("Refreshing minutes layout", "success");
-    checkPipelineStatus();
-  } catch (err) {
-    showToast(err.message, "error");
+async function recompileStale(trigger = triggerButton()) {
+  if (state.pipelineRunning || state.pipelineStarting) {
+    showToast("Processing is already in progress.", "info");
+    return;
   }
+  state.pipelineStarting = true;
+  setStageControlsRunning(true);
+  const started = await withBusy(trigger, null, async () => {
+    try {
+      const res = await fetch("/api/pipeline/recompile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Format refresh failed");
+      showToast("Refreshing minutes layout", "success");
+      return true;
+    } catch (err) {
+      showToast(err.message, "error");
+      return false;
+    }
+  });
+  state.pipelineStarting = false;
+  if (started) state.lastServerRunning = true;
+  else setStageControlsRunning(false);
+  checkPipelineStatus();
 }
 
-async function retrySingleMeeting(meetingId) {
-  try {
-    const res = await fetch(`/api/meetings/${meetingId}/retry`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status: "discovered" }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Retry failed");
-    showToast("Meeting requeued for transcription", "success");
-    loadMeetings();
-    selectMeeting(meetingId);
-  } catch (err) {
-    showToast(err.message, "error");
-  }
+async function retrySingleMeeting(meetingId, trigger = triggerButton()) {
+  await withBusy(trigger, "\u21bb Requeueing\u2026", async () => {
+    try {
+      const res = await fetch(`/api/meetings/${meetingId}/retry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "discovered" }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Retry failed");
+      showToast("Meeting requeued for transcription", "success");
+      await loadMeetings();
+      selectMeeting(meetingId);
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  });
 }
 
 function clearTerminalLogs() {
@@ -553,16 +737,198 @@ async function loadMeetings() {
   }
 }
 
+// ── Sort & filter controls ────────────────────────────────────────────
+// 104 meetings and 166 waiting speaker decisions are past what one fixed order
+// can serve: the row worth opening next is "thinnest score margin" one minute
+// and "longest speech I still have a clip for" the next. All of it runs on the
+// client - the whole archive and the whole queue already arrive in one payload
+// each, so re-sorting them costs no round trip.
+
+const CONTROL_STORAGE_KEY = "mmc.controls";
+
+const CONTROL_IDS = [
+  "meeting-sort",
+  "meeting-filter-range",
+  "meeting-filter-audio",
+  "meeting-filter-category",
+  "meeting-filter-status",
+  "speaker-sort",
+  "speaker-filter-band",
+  "speaker-filter-suggestion",
+  "speaker-filter-clip",
+];
+
+// localStorage throws outright in a browser set to block site data, so every
+// access is guarded: refusing to remember a choice must not stop a list from
+// rendering.
+function saveControlState() {
+  try {
+    const chosen = {};
+    CONTROL_IDS.forEach((id) => {
+      const control = $(id);
+      if (control) chosen[id] = control.value;
+    });
+    localStorage.setItem(CONTROL_STORAGE_KEY, JSON.stringify(chosen));
+  } catch (err) {
+    // Not remembering is a smaller problem than a console full of noise.
+  }
+}
+
+function loadControlState() {
+  let stored = {};
+  try {
+    stored = JSON.parse(localStorage.getItem(CONTROL_STORAGE_KEY) || "{}");
+  } catch (err) {
+    return;
+  }
+  CONTROL_IDS.forEach((id) => {
+    const control = $(id);
+    const value = stored[id];
+    // A stored value whose <option> has since been renamed would blank the
+    // select entirely; falling back to the markup default keeps it populated.
+    if (control && value != null && [...control.options].some((o) => o.value === value)) {
+      control.value = value;
+    }
+  });
+}
+
+// Rows with nothing to compare sort last in BOTH directions. Treating a missing
+// score as 0 would hand the top of every ascending list to the rows that were
+// never scored, which is the opposite of triage order.
+function compareBy(read, direction) {
+  const sign = direction === "asc" ? 1 : -1;
+  return (a, b) => {
+    const left = read(a);
+    const right = read(b);
+    if (left == null && right == null) return 0;
+    if (left == null) return 1;
+    if (right == null) return -1;
+    if (left === right) return 0;
+    return left < right ? -sign : sign;
+  };
+}
+
+const MEETING_SORTS = {
+  "date-desc": compareBy((m) => (m.date ? `${m.date} ${m.time || ""}` : null), "desc"),
+  "date-asc": compareBy((m) => (m.date ? `${m.date} ${m.time || ""}` : null), "asc"),
+  "duration-desc": compareBy((m) => m.duration_sec, "desc"),
+  "speakers-desc": compareBy((m) => m.speaker_count, "desc"),
+  "unresolved-desc": compareBy((m) => m.unresolved_count, "desc"),
+  "title-asc": (a, b) => (a.title || "").localeCompare(b.title || ""),
+};
+
+// A recurring cluster and a lone label are the same decision wearing two
+// shapes: clusters count `size`/`total_speech` and hold their meetings in
+// `members`, one-offs carry `speech_sec` and a single meeting inline. Reading
+// both here means every comparator and predicate below speaks one vocabulary -
+// otherwise "sort by speech time" silently sorts one of the two lists by
+// undefined.
+function normalizeSpeakerRow(row) {
+  const members = row.members || [];
+  const dates = members.map((m) => m.meeting_date).filter(Boolean);
+  const best = row.best_score == null ? null : Number(row.best_score);
+  const next = row.next_score == null ? null : Number(row.next_score);
+  return {
+    score: best,
+    // Distance to the runner-up. Null when there is no second guess to be
+    // close to: an unmatched voice is not a close call, it is no call, and it
+    // does not belong at the top of "closest call first".
+    margin: best == null || next == null ? null : Number((best - next).toFixed(4)),
+    speech: row.total_speech != null ? row.total_speech : row.speech_sec || 0,
+    occurrences: row.size != null ? row.size : 1,
+    latestDate: dates.length ? dates.slice().sort().pop() : row.meeting_date || null,
+    // Clips are cut once at enrollment and the source audio is deleted right
+    // after transcription, so "has audio" here is permanent, not pending.
+    hasClip: row.clip_seconds != null ? row.clip_seconds > 0 : (row.snippet_count || 0) > 0,
+    band: row.band || null,
+    hasVoiceprint: Boolean(row.best_canonical),
+    hasTranscriptName: Boolean(row.llm_suggestion),
+  };
+}
+
+const SPEAKER_SORTS = {
+  "margin-asc": compareBy((r) => normalizeSpeakerRow(r).margin, "asc"),
+  "confidence-desc": compareBy((r) => normalizeSpeakerRow(r).score, "desc"),
+  "confidence-asc": compareBy((r) => normalizeSpeakerRow(r).score, "asc"),
+  "speech-desc": compareBy((r) => normalizeSpeakerRow(r).speech, "desc"),
+  "occurrences-desc": compareBy((r) => normalizeSpeakerRow(r).occurrences, "desc"),
+  "date-desc": compareBy((r) => normalizeSpeakerRow(r).latestDate, "desc"),
+};
+
+function speakerMatchesFilters(row, controls) {
+  const facts = normalizeSpeakerRow(row);
+  if (controls.band !== "all" && facts.band !== controls.band) return false;
+  if (controls.clip === "yes" && !facts.hasClip) return false;
+  if (controls.clip === "no" && facts.hasClip) return false;
+  if (controls.suggestion === "voiceprint" && !facts.hasVoiceprint) return false;
+  if (controls.suggestion === "transcript" && !facts.hasTranscriptName) return false;
+  if (controls.suggestion === "none" && (facts.hasVoiceprint || facts.hasTranscriptName)) {
+    return false;
+  }
+  return true;
+}
+
+function readSpeakerControls() {
+  const value = (id, fallback) => ($(id) ? $(id).value : fallback);
+  return {
+    sort: value("speaker-sort", "margin-asc"),
+    band: value("speaker-filter-band", "all"),
+    suggestion: value("speaker-filter-suggestion", "all"),
+    clip: value("speaker-filter-clip", "all"),
+  };
+}
+
+function applySpeakerControls() {
+  const controls = readSpeakerControls();
+  const comparator = SPEAKER_SORTS[controls.sort] || SPEAKER_SORTS["margin-asc"];
+  const shape = (rows) =>
+    (rows || []).filter((row) => speakerMatchesFilters(row, controls)).sort(comparator);
+  const clusters = shape(state.voiceClusters);
+  const oneOffs = shape(state.unresolvedSpeakers);
+
+  // Say what the filters removed. A shrunken list with no count reads as
+  // "there is nothing left to do", which is the one thing it must never mean.
+  const total = (state.voiceClusters || []).length + (state.unresolvedSpeakers || []).length;
+  const shown = clusters.length + oneOffs.length;
+  const readout = $("speaker-visible-count");
+  if (readout) {
+    readout.textContent =
+      shown === total
+        ? `${total} decision${total === 1 ? "" : "s"} waiting`
+        : `${shown} of ${total} shown \u00b7 ${total - shown} hidden by filters`;
+  }
+
+  renderVoiceCards(clusters, oneOffs);
+}
+
+// Cutoffs are resolved once per render, never once per row.
+function isoDaysAgo(days) {
+  const date = new Date();
+  date.setDate(date.getDate() - days);
+  return date.toISOString().slice(0, 10);
+}
+
 function filterAndRenderMeetings() {
   const query = ($("meeting-search").value || "").toLowerCase().trim();
   const filter = $("meeting-filter-status").value;
   const categoryFilter = $("meeting-filter-category") ? $("meeting-filter-category").value : "all";
+  const rangeFilter = $("meeting-filter-range") ? $("meeting-filter-range").value : "all";
+  const audioFilter = $("meeting-filter-audio") ? $("meeting-filter-audio").value : "all";
+  const sortKey = $("meeting-sort") ? $("meeting-sort").value : "date-desc";
+  const cutoff = rangeFilter === "all" ? null : isoDaysAgo(Number(rangeFilter));
 
   const filtered = state.meetings.filter((m) => {
     if (categoryFilter !== "all" && m.category !== categoryFilter) return false;
     if (filter === "ready" && m.status !== "indexed") return false;
     if (filter === "review" && m.unresolved_count === 0) return false;
     if (filter === "failed" && m.status !== "failed") return false;
+    // A meeting whose date never parsed sits on neither side of a date window,
+    // so it stays visible rather than vanishing: hiding unparseable rows behind
+    // a date filter is how a stuck meeting goes unnoticed for a month. The
+    // status filter is the tool for putting those away.
+    if (cutoff && m.date && m.date < cutoff) return false;
+    if (audioFilter === "yes" && !m.has_audio) return false;
+    if (audioFilter === "no" && m.has_audio) return false;
 
     if (!query) return true;
     return (
@@ -577,7 +943,7 @@ function filterAndRenderMeetings() {
     );
   });
 
-  renderMeetingList(filtered);
+  renderMeetingList(filtered.sort(MEETING_SORTS[sortKey] || MEETING_SORTS["date-desc"]));
 }
 
 function renderMeetingList(meetings) {
@@ -680,7 +1046,7 @@ function renderMeetingDetail(m) {
   const categoryControl = `
     <div style="display:flex; align-items:center; gap:8px; background:var(--paper); border:1px solid var(--rule); padding:4px 10px; border-radius:6px;">
       <label for="meeting-category" style="font-size:12px; font-weight:600; color:var(--ink);">Category:</label>
-      <select id="meeting-category" onchange="updateMeetingCategory('${m.id}', this.value)" style="background:transparent;border:0;color:var(--ink);font-weight:600;">
+      <select id="meeting-category" onchange="updateMeetingCategory('${m.id}', this.value, this)" style="background:transparent;border:0;color:var(--ink);font-weight:600;">
         <option value="Professional" ${isPersonal ? "" : "selected"}>💼 Professional / Work</option>
         <option value="Personal" ${isPersonal ? "selected" : ""}>🏠 Personal</option>
       </select>
@@ -826,7 +1192,10 @@ async function executePendingDelete() {
   }
 }
 
-async function updateMeetingCategory(meetingId, domain) {
+async function updateMeetingCategory(meetingId, domain, control = $("meeting-category")) {
+  // A <select> cannot borrow withBusy's label swap, but it can still refuse a
+  // second change until the write and the reload have both landed.
+  if (control) control.disabled = true;
   try {
     const res = await fetch(`/api/meetings/${encodeURIComponent(meetingId)}/category`, {
       method: "POST",
@@ -841,6 +1210,10 @@ async function updateMeetingCategory(meetingId, domain) {
     await loadMeetings();
   } catch (err) {
     showToast(err.message, "warn");
+  } finally {
+    // The detail pane may have been re-rendered by loadMeetings, in which case
+    // this element is detached and re-enabling it is harmless.
+    if (control) control.disabled = false;
   }
 }
 
@@ -1317,29 +1690,30 @@ function setPersonRenameBusy(busy) {
   });
 }
 
-async function submitAddPerson() {
+async function submitAddPerson(trigger = triggerButton()) {
   const canonical = $("person-canonical").value.trim();
   const role = $("person-role").value.trim() || null;
   const aliasesRaw = $("person-aliases").value.trim();
   const aliases = aliasesRaw ? aliasesRaw.split(",").map((value) => value.trim()).filter(Boolean) : null;
   if (!canonical) return;
-  try {
-    const res = await fetch("/api/people", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ canonical, role, aliases }),
-    });
-    if (!res.ok) throw new Error("Failed to save person");
-    showToast(`Saved contact: ${canonical}`, "success");
-    $("person-canonical").value = "";
-    $("person-role").value = "";
-    $("person-aliases").value = "";
-    $("form-add-person").closest("details").open = false;
-    loadPeople();
-    loadOverview();
-  } catch (err) {
-    showToast(err.message, "error");
-  }
+  await withBusy(trigger, "Saving\u2026", async () => {
+    try {
+      const res = await fetch("/api/people", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ canonical, role, aliases }),
+      });
+      if (!res.ok) throw new Error("Failed to save person");
+      showToast(`Saved contact: ${canonical}`, "success");
+      $("person-canonical").value = "";
+      $("person-role").value = "";
+      $("person-aliases").value = "";
+      $("form-add-person").closest("details").open = false;
+      await Promise.all([loadPeople(), loadOverview()]);
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  });
 }
 
 async function submitMergePerson() {
@@ -1498,47 +1872,45 @@ function closeSpeakerModal() {
   $("speaker-modal").close();
 }
 
-async function submitSpeakerModal() {
+async function submitSpeakerModal(trigger = triggerButton()) {
   const meetingId = $("modal-meeting-id").value;
   const label = $("modal-speaker-label").value;
   const name = $("modal-speaker-name").value.trim();
-  try {
-    const res = await fetch(`/api/meetings/${meetingId}/speakers`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ label, name, confidence: "confirmed" }),
-    });
-    if (!res.ok) throw new Error("Failed to update speaker");
-    showToast(`Saved speaker: ${label} → ${name}`, "success");
-    closeSpeakerModal();
-    selectMeeting(meetingId);
-    loadVoiceClusters();
-    loadMeetings();
-    loadPeople();
-    loadOverview();
-  } catch (err) {
-    showToast(err.message, "error");
-  }
+  await withBusy(trigger, "Saving\u2026", async () => {
+    try {
+      const res = await fetch(`/api/meetings/${meetingId}/speakers`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label, name, confidence: "confirmed" }),
+      });
+      if (!res.ok) throw new Error("Failed to update speaker");
+      showToast(`Saved speaker: ${label} → ${name}`, "success");
+      closeSpeakerModal();
+      selectMeeting(meetingId);
+      await Promise.all([loadVoiceClusters(), loadMeetings(), loadPeople(), loadOverview()]);
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  });
 }
 
-async function confirmOneOffSpeaker(meetingId, label, name) {
+async function confirmOneOffSpeaker(meetingId, label, name, trigger = triggerButton()) {
   if (!meetingId || !label || !name) return;
-  try {
-    const res = await fetch(`/api/meetings/${meetingId}/speakers`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ label, name, confidence: "confirmed" }),
-    });
-    if (!res.ok) throw new Error("Failed to assign this speaker");
-    showToast(`Assigned ${label} as ${name}.`, "success");
-    loadVoiceClusters();
-    loadMeetings();
-    loadPeople();
-    loadOverview();
-    if (state.activeMeetingId === meetingId) selectMeeting(meetingId);
-  } catch (err) {
-    showToast(err.message, "error");
-  }
+  await withBusy(trigger, "Saving\u2026", async () => {
+    try {
+      const res = await fetch(`/api/meetings/${meetingId}/speakers`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label, name, confidence: "confirmed" }),
+      });
+      if (!res.ok) throw new Error("Failed to assign this speaker");
+      showToast(`Assigned ${label} as ${name}.`, "success");
+      await Promise.all([loadVoiceClusters(), loadMeetings(), loadPeople(), loadOverview()]);
+      if (state.activeMeetingId === meetingId) selectMeeting(meetingId);
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  });
 }
 
 // ── Commitment Register (Open Commitments by Owner) ────────────────────
@@ -1635,31 +2007,48 @@ async function askArchive() {
     return;
   }
 
+  // This is the slowest action in the dashboard - retrieval plus an LLM call,
+  // which can run well past a minute on a broad synthesis. A static "preparing
+  // answer" line cannot be told apart from a hung request, so the seconds are
+  // counted on screen: a number that keeps moving is the proof of life.
+  const submit = $("query-form").querySelector('button[type="submit"]');
   answerEl.className = "answer";
-  answerEl.innerHTML = `<p>Consulting your meeting archive and preparing answer...</p>`;
+  answerEl.innerHTML =
+    '<p>Consulting your meeting archive and preparing answer' +
+    ' <span id="answer-elapsed" class="answer-elapsed">0s</span></p>';
+  let elapsed = 0;
+  const ticker = setInterval(() => {
+    elapsed += 1;
+    const readout = $("answer-elapsed");
+    if (readout) readout.textContent = `${elapsed}s`;
+  }, 1000);
 
-  try {
-    const res = await fetch("/api/query", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, mode, session_id: getChatSessionId() }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Query could not be completed");
-    if (data.session_id) setChatSessionId(data.session_id);
+  await withBusy(submit, null, async () => {
+    try {
+      const res = await fetch("/api/query", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, mode, session_id: getChatSessionId() }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Query could not be completed");
+      if (data.session_id) setChatSessionId(data.session_id);
 
-    const retrievedSec = Number.isFinite(data.retrieval_sec) ? data.retrieval_sec.toFixed(1) : "?";
-    const providerNote = data.provider ? ` · Answered by: ${escapeHtml(data.provider)}` : "";
-    answerEl.innerHTML = `
-      <div>${renderMarkdown(data.answer)}</div>
-      <span class="answer-meta">
-        Retrieved in ${retrievedSec}s · Mode: ${escapeHtml(mode)}${providerNote}
-      </span>
-    `;
-  } catch (err) {
-    answerEl.className = "answer empty";
-    answerEl.innerHTML = `<p style="color:var(--clay)">Search service note: ${escapeHtml(err.message)}</p>`;
-  }
+      const retrievedSec = Number.isFinite(data.retrieval_sec) ? data.retrieval_sec.toFixed(1) : "?";
+      const providerNote = data.provider ? ` · Answered by: ${escapeHtml(data.provider)}` : "";
+      answerEl.innerHTML = `
+        <div>${renderMarkdown(data.answer)}</div>
+        <span class="answer-meta">
+          Retrieved in ${retrievedSec}s · Mode: ${escapeHtml(mode)}${providerNote}
+        </span>
+      `;
+    } catch (err) {
+      answerEl.className = "answer empty";
+      answerEl.innerHTML = `<p style="color:var(--clay)">Search service note: ${escapeHtml(err.message)}</p>`;
+    } finally {
+      clearInterval(ticker);
+    }
+  });
 }
 
 // ── Utilities & Formatting ───────────────────────────────────────────
@@ -1709,19 +2098,23 @@ async function loadVoiceClusters() {
     const data = await res.json();
     state.voiceClusters = data.clusters || [];
     state.unresolvedSpeakers = data.one_offs || [];
-    renderVoiceCards(state.voiceClusters);
+    applySpeakerControls();
   } catch (err) {
     console.error("Failed to load speaker resolution queue:", err);
   }
 }
 
-function renderVoiceCards(clusters) {
+function renderVoiceCards(clusters, oneOffRows) {
   stopClusterPlayback();
   const banner = $("voice-review-banner");
   const clusterList = $("speaker-resolution-clusters");
-  const oneOffs = state.unresolvedSpeakers || [];
+  const oneOffs = oneOffRows || state.unresolvedSpeakers || [];
   const oneOffList = $("speaker-resolution-oneoffs");
+  // `total` counts every waiting decision, filtered or not - the tab badge has
+  // to keep meaning "work outstanding". Whether THIS view came back empty is a
+  // different question, and the two answers need different words.
   const { total } = updateSpeakerResolutionSummary();
+  const filteredOut = Boolean(total) && !clusters.length && !oneOffs.length;
 
   if (!total) {
     if (banner) banner.style.display = "none";
@@ -1815,15 +2208,23 @@ function renderVoiceCards(clusters) {
   }
 
   if (clusterList) {
-    clusterList.innerHTML = cardsHtml || '<p class="empty-cell">No recurring voices need a decision.</p>';
+    clusterList.innerHTML =
+      cardsHtml ||
+      (filteredOut
+        ? '<p class="empty-cell">No recurring voice matches these filters.</p>'
+        : '<p class="empty-cell">No recurring voices need a decision.</p>');
   }
   if (oneOffList) {
-    oneOffList.innerHTML = renderOneOffSpeakerCards(oneOffs);
+    oneOffList.innerHTML = renderOneOffSpeakerCards(oneOffs, filteredOut);
   }
 }
 
-function renderOneOffSpeakerCards(oneOffs) {
-  if (!oneOffs.length) return '<p class="empty-cell">No one-off unnamed speakers.</p>';
+function renderOneOffSpeakerCards(oneOffs, filteredOut) {
+  if (!oneOffs.length) {
+    return filteredOut
+      ? '<p class="empty-cell">No one-off label matches these filters.</p>'
+      : '<p class="empty-cell">No one-off unnamed speakers.</p>';
+  }
   return oneOffs.map((speaker) => {
     const voiceMatch = speaker.best_canonical && (speaker.best_score || 0) >= 0.7
       ? `<button type="button" class="btn-action btn-sm js-oneoff-confirm" data-meeting="${escapeHtml(speaker.meeting_id)}" data-label="${escapeHtml(speaker.label)}" data-name="${escapeHtml(speaker.best_canonical)}">Use ${escapeHtml(speaker.best_canonical)}</button>`
@@ -1922,12 +2323,12 @@ document.addEventListener("click", (event) => {
   }
   const confirm = event.target.closest(".js-voice-confirm");
   if (confirm) {
-    confirmVoiceCluster(confirm.dataset.cluster, confirm.dataset.name);
+    confirmVoiceCluster(confirm.dataset.cluster, confirm.dataset.name, confirm);
     return;
   }
   const dismiss = event.target.closest(".js-voice-dismiss");
   if (dismiss) {
-    dismissVoiceCluster(dismiss.dataset.cluster);
+    dismissVoiceCluster(dismiss.dataset.cluster, dismiss);
     return;
   }
   const custom = event.target.closest(".js-voice-custom");
@@ -1939,7 +2340,12 @@ document.addEventListener("click", (event) => {
   }
   const oneOffConfirm = event.target.closest(".js-oneoff-confirm");
   if (oneOffConfirm) {
-    confirmOneOffSpeaker(oneOffConfirm.dataset.meeting, oneOffConfirm.dataset.label, oneOffConfirm.dataset.name);
+    confirmOneOffSpeaker(
+      oneOffConfirm.dataset.meeting,
+      oneOffConfirm.dataset.label,
+      oneOffConfirm.dataset.name,
+      oneOffConfirm,
+    );
   }
 });
 
@@ -2047,7 +2453,7 @@ function moveClusterClip(offset, control) {
   showClusterClip(clusterPlayer.index + offset);
 }
 
-async function confirmConfidentVoiceClusters() {
+async function confirmConfidentVoiceClusters(trigger = triggerButton()) {
   const candidates = (state.voiceClusters || []).filter(
     (cluster) => cluster.best_canonical && (cluster.best_score || 0) >= 0.85,
   );
@@ -2057,65 +2463,70 @@ async function confirmConfidentVoiceClusters() {
   }
   const names = [...new Set(candidates.map((cluster) => cluster.best_canonical))].join(", ");
   if (!window.confirm(`Confirm ${candidates.length} voice(s) as: ${names}?`)) return;
-  try {
-    const res = await fetch("/api/voices/confirm-confident", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ threshold: 0.85 }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Failed to confirm voices");
-    showToast(
-      `Enrolled ${data.clusters} voice(s) across ${data.meetings} meeting(s). ${data.skipped} left for review.`,
-      "success",
-    );
-    loadVoiceClusters();
-    loadMeetings();
-    loadPeople();
-    loadOverview();
-  } catch (err) {
-    showToast(err.message, "error");
-  }
+  await withBusy(trigger, "Confirming\u2026", async () => {
+    try {
+      const res = await fetch("/api/voices/confirm-confident", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ threshold: 0.85 }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to confirm voices");
+      showToast(
+        `Enrolled ${data.clusters} voice(s) across ${data.meetings} meeting(s). ${data.skipped} left for review.`,
+        "success",
+      );
+      await Promise.all([loadVoiceClusters(), loadMeetings(), loadPeople(), loadOverview()]);
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  });
 }
 
-async function confirmVoiceCluster(clusterId, canonical) {
-  try {
-    const res = await fetch("/api/voices/confirm", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cluster_id: clusterId, canonical }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Failed to confirm voice");
-    showToast(`Enrolled voiceprint for '${canonical}' across ${data.confirmed || "all"} meetings!`, "success");
-    loadVoiceClusters();
-    loadMeetings();
-    loadPeople();
-    loadOverview();
-    if (state.activeMeetingId) selectMeeting(state.activeMeetingId);
-    return true;
-  } catch (err) {
-    showToast(err.message, "error");
-    return false;
-  }
+// `trigger` is null when the modal calls this, because submitVoiceNameModal
+// already owns the pending state of its own Save button.
+async function confirmVoiceCluster(clusterId, canonical, trigger = null) {
+  const outcome = await withBusy(trigger, "Confirming\u2026", async () => {
+    try {
+      const res = await fetch("/api/voices/confirm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cluster_id: clusterId, canonical }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to confirm voice");
+      showToast(`Enrolled voiceprint for '${canonical}' across ${data.confirmed || "all"} meetings!`, "success");
+      await Promise.all([loadVoiceClusters(), loadMeetings(), loadPeople(), loadOverview()]);
+      if (state.activeMeetingId) selectMeeting(state.activeMeetingId);
+      return true;
+    } catch (err) {
+      showToast(err.message, "error");
+      return false;
+    }
+  });
+  // withBusy returns undefined when it refused a second click on a busy
+  // control; that is not a successful confirmation.
+  return outcome === true;
 }
 
-async function dismissVoiceCluster(clusterId) {
+async function dismissVoiceCluster(clusterId, trigger = triggerButton()) {
   if (!window.confirm(
     "Mark this voice as noise or crosstalk? It will leave speaker review without being assigned to a person. No audio, transcript, or minutes will be deleted.",
   )) return;
-  try {
-    const res = await fetch("/api/voices/dismiss", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cluster_id: clusterId }),
-    });
-    if (!res.ok) throw new Error("Failed to dismiss cluster");
-    showToast("Marked this fragment as non-speaker noise. No meeting content was deleted.", "info");
-    loadVoiceClusters();
-  } catch (err) {
-    showToast(err.message, "error");
-  }
+  await withBusy(trigger, "Dismissing\u2026", async () => {
+    try {
+      const res = await fetch("/api/voices/dismiss", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cluster_id: clusterId }),
+      });
+      if (!res.ok) throw new Error("Failed to dismiss cluster");
+      showToast("Marked this fragment as non-speaker noise. No meeting content was deleted.", "info");
+      await loadVoiceClusters();
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  });
 }
 
 function openVoiceNameModal(clusterId) {
@@ -2167,7 +2578,7 @@ async function submitVoiceNameModal() {
   const save = $("voice-name-save");
   save.disabled = true;
   save.textContent = "Saving…";
-  const saved = await confirmVoiceCluster($("voice-name-cluster-id").value, name);
+  const saved = await confirmVoiceCluster($("voice-name-cluster-id").value, name, null);
   save.disabled = false;
   save.textContent = "Confirm Speaker";
   if (saved) {
@@ -2205,7 +2616,7 @@ function switchAskMode(mode) {
   }
 }
 
-async function loadTimelineForTopic(topic) {
+async function loadTimelineForTopic(topic, trigger = triggerButton()) {
   const input = $("timeline-topic-input");
   if (input && topic !== "all") input.value = topic;
   const container = $("timeline-results");
@@ -2213,14 +2624,16 @@ async function loadTimelineForTopic(topic) {
 
   container.innerHTML = `<div class="empty-timeline"><p>Compiling chronological decision evolution for <strong>${escapeHtml(topic === "all" ? "All Projects" : topic)}</strong>...</p></div>`;
 
-  try {
-    const res = await fetch(`/api/timeline?topic=${encodeURIComponent(topic)}`);
-    if (!res.ok) throw new Error("Failed to load timeline");
-    const data = await res.json();
-    renderTimeline(data);
-  } catch (err) {
-    container.innerHTML = `<div class="empty-timeline"><p style="color:var(--clay)">Failed to load timeline: ${escapeHtml(err.message)}</p></div>`;
-  }
+  await withBusy(trigger, null, async () => {
+    try {
+      const res = await fetch(`/api/timeline?topic=${encodeURIComponent(topic)}`);
+      if (!res.ok) throw new Error("Failed to load timeline");
+      const data = await res.json();
+      renderTimeline(data);
+    } catch (err) {
+      container.innerHTML = `<div class="empty-timeline"><p style="color:var(--clay)">Failed to load timeline: ${escapeHtml(err.message)}</p></div>`;
+    }
+  });
 }
 
 function renderTimeline(data) {
@@ -2285,6 +2698,9 @@ function jumpToMeeting(meetingId) {
 
 // ── Application Initialization ───────────────────────────────────────
 function init() {
+  // Before any load(): the first render must already honour the saved choices,
+  // or the list visibly re-sorts itself a beat after it appears.
+  loadControlState();
   setupTabs();
   setupAskModeTabs();
   setupEventListeners();

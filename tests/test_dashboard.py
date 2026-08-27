@@ -735,9 +735,10 @@ def test_merge_many_people_preserves_voice_samples_before_deleting_sources(manif
         assert {sample["label"] for sample in samples} == {"SPEAKER_00", "SPEAKER_01"}
 
 
-def test_people_merge_http_preview_and_stale_digest_conflict(manifest):
+def test_people_merge_http_preview_and_stale_digest_conflict(manifest, monkeypatch):
     from http import HTTPStatus
 
+    monkeypatch.setattr(dashboard.dashboard_auth, "authorized", lambda *_: True)
     db.add_person(manifest, "Mike")
     manifest.commit()
 
@@ -830,6 +831,7 @@ def test_cluster_members_expose_clip_count_and_inferred_name(manifest, monkeypat
             "best_canonical": "Yuliya",
             "best_score": 0.81,
             "next_canonical": None,
+            "next_score": None,
             "band": "review",
         }
     ])
@@ -877,6 +879,9 @@ def test_speaker_resolution_queue_keeps_one_off_labels_visible(manifest, monkeyp
             "snippet_count": 0,
             "best_canonical": None,
             "best_score": None,
+            "next_canonical": None,
+            "next_score": None,
+            "band": None,
             "llm_suggestion": "Ali",
         }
     ]
@@ -899,6 +904,7 @@ def test_cluster_offers_the_transcript_name_as_a_second_suggestion(manifest, mon
             "best_canonical": "Yuliya",
             "best_score": 0.55,
             "next_canonical": None,
+            "next_score": None,
             "band": "review",
         }
     ])
@@ -938,3 +944,122 @@ def test_confirm_all_only_touches_clusters_above_the_threshold(manifest, monkeyp
     assert result["clusters"] == 1
     assert result["meetings"] == 3
     assert result["skipped"] == 2
+
+
+def test_cluster_payload_exposes_runner_up_score(manifest, monkeypatch):
+    """The review card cannot rank by margin without the runner-up's score.
+
+    `best_score` alone says "0.72 confident"; it does not say whether the second
+    guess sat at 0.71 (a coin flip a human must break) or 0.20 (a safe accept).
+    The margin is the whole signal for triage order, so the score has to cross
+    the wire alongside the name that already does.
+    """
+    monkeypatch.setattr(dashboard.voices, "cluster_pending", lambda conn: None)
+    monkeypatch.setattr(db, "pending_clusters", lambda conn, limit=50: [
+        {
+            "id": "cluster-margin",
+            "size": 1,
+            "total_speech": 90.0,
+            "best_canonical": "Yuliya",
+            "best_score": 0.72,
+            "next_canonical": "Ruth",
+            "next_score": 0.71,
+            "band": "review",
+        }
+    ])
+    _pending_match(manifest, "c" * 64, "SPEAKER_04", "cluster-margin")
+
+    cluster = dashboard.get_voice_clusters()[0]
+
+    assert cluster["next_canonical"] == "Ruth"
+    assert cluster["next_score"] == 0.71
+
+
+def test_one_off_payload_exposes_runner_up_score(manifest, monkeypatch):
+    """One-off labels get triaged in the same list, so they need the same field."""
+    meeting_id = "one-off-margin"
+    make_meeting(manifest, meeting_id, "2026-08-12", title_hint="Client review")
+    db.set_speaker(manifest, meeting_id, "SPEAKER_05", None, "unknown")
+    db.upsert_speaker_match(
+        manifest,
+        meeting_id=meeting_id,
+        label="SPEAKER_05",
+        state="pending",
+        speech_sec=44.0,
+        best_canonical="Dan",
+        best_score=0.66,
+        next_canonical="Danish",
+        next_score=0.64,
+    )
+    manifest.commit()
+    monkeypatch.setattr(dashboard, "get_voice_clusters", lambda: [])
+
+    one_off = dashboard.speaker_resolution_queue()["one_offs"][0]
+
+    assert one_off["next_canonical"] == "Danish"
+    assert one_off["next_score"] == 0.64
+
+
+def test_queue_returns_every_pending_one_off_not_the_first_hundred(manifest, monkeypatch):
+    """A filter over a truncated list gives a confidently wrong answer.
+
+    The old default stopped at 100 while 121 labels qualified, so 21 were
+    invisible - and "no labels under 30s" would have been a lie about the 21 the
+    query never reached. Sorting client-side means the client must hold them all.
+    """
+    monkeypatch.setattr(dashboard, "get_voice_clusters", lambda: [])
+    for index in range(105):
+        meeting_id = f"bulk-one-off-{index:03d}"
+        make_meeting(manifest, meeting_id, "2026-08-12", title_hint="Standup")
+        db.set_speaker(manifest, meeting_id, "SPEAKER_00", None, "unknown")
+        db.upsert_speaker_match(
+            manifest,
+            meeting_id=meeting_id,
+            label="SPEAKER_00",
+            state="pending",
+            speech_sec=float(index),
+        )
+    manifest.commit()
+
+    assert len(dashboard.speaker_resolution_queue()["one_offs"]) == 105
+
+
+def test_pending_clusters_returns_every_cluster_not_the_first_fifty(manifest):
+    """Same truncation trap on the cluster side, five rows from biting."""
+    for index in range(55):
+        manifest.execute(
+            """
+            INSERT INTO voice_clusters
+                (id, size, total_speech, best_canonical, best_score,
+                 next_canonical, next_score, band, created_at)
+            VALUES (?, 1, ?, NULL, NULL, NULL, NULL, 'review', '2026-08-12T09:00:00')
+            """,
+            (f"cluster-{index:03d}", float(index)),
+        )
+    manifest.commit()
+
+    assert len(db.pending_clusters(manifest)) == 55
+
+
+def test_one_off_payload_exposes_band(manifest, monkeypatch):
+    """A band filter that only reaches half the queue is worse than none.
+
+    Clusters carry `band` already. One-offs render in the same list under the
+    same control, so a shared "show only review-band" filter would quietly leave
+    every one-off visible - the user reads that as "no one-offs are in review".
+    """
+    meeting_id = "one-off-band"
+    make_meeting(manifest, meeting_id, "2026-08-12", title_hint="Client review")
+    db.set_speaker(manifest, meeting_id, "SPEAKER_06", None, "unknown")
+    db.upsert_speaker_match(
+        manifest,
+        meeting_id=meeting_id,
+        label="SPEAKER_06",
+        state="pending",
+        speech_sec=12.0,
+        band="review",
+    )
+    manifest.commit()
+    monkeypatch.setattr(dashboard, "get_voice_clusters", lambda: [])
+
+    assert dashboard.speaker_resolution_queue()["one_offs"][0]["band"] == "review"

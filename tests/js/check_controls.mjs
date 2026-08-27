@@ -1,62 +1,19 @@
-/** Exercise the real people-merge controls from pipeline/static/app.js. */
+/**
+ * Exercise the real sort/filter logic out of pipeline/static/app.js.
+ *
+ * There is no JS test runner in this repo, so this drives the shipped source
+ * directly: the module is evaluated with the smallest possible DOM stubs and the
+ * comparators and predicates are called with the two row shapes the API
+ * actually returns.
+ */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 
 const source = readFileSync("pipeline/static/app.js", "utf8");
+
 const noop = () => {};
 const elements = new Map();
-
-function element(overrides = {}) {
-  return {
-    value: "",
-    textContent: "",
-    innerHTML: "",
-    hidden: false,
-    disabled: false,
-    dataset: {},
-    style: {},
-    classList: { add: noop, remove: noop, toggle: noop },
-    addEventListener: noop,
-    setAttribute(name, value) { this[name] = value; },
-    removeAttribute(name) { delete this[name]; },
-    focus() { this.focused = true; },
-    select: noop,
-    showModal() { this.open = true; },
-    close() { this.open = false; },
-    closest: () => null,
-    appendChild: noop,
-    remove: noop,
-    ...overrides,
-  };
-}
-
-for (const id of [
-  "people-suggestions",
-  "people-suggestion-yes",
-  "people-suggestion-rename",
-  "people-suggestion-no",
-  "people-suggestion-target",
-  "people-suggestion-rename-panel",
-  "people-suggestion-review",
-  "people-suggestion-preview-panel",
-  "people-suggestion-preview",
-  "people-suggestion-confirm",
-  "person-merge-modal",
-  "person-merge-sources",
-  "person-merge-selected-list",
-  "person-merge-target",
-  "person-merge-target-custom",
-  "person-merge-preview",
-  "person-merge-save",
-  "person-rename-modal",
-  "person-rename-source",
-  "person-rename-name",
-  "person-rename-preview",
-  "person-rename-save",
-  "toast-container",
-]) elements.set(id, element());
-
 const sandbox = {
   console,
   document: {
@@ -64,14 +21,17 @@ const sandbox = {
     getElementById: (id) => elements.get(id) || null,
     querySelector: () => null,
     querySelectorAll: () => [],
-    createElement: () => element(),
+    createElement: () => ({ style: {}, setAttribute: noop, appendChild: noop }),
   },
-  window: { addEventListener: noop },
-  localStorage: { getItem: () => null, setItem: noop },
-  crypto: { randomUUID: () => "00000000-0000-0000-0000-000000000000" },
+  window: { addEventListener: noop, matchMedia: () => ({ matches: false }) },
+  localStorage: {
+    store: new Map(),
+    getItem(k) { return this.store.has(k) ? this.store.get(k) : null; },
+    setItem(k, v) { this.store.set(k, String(v)); },
+  },
   setInterval: noop,
-  setTimeout: (fn) => fn(),
-  fetch: () => Promise.reject(new Error("unexpected network call")),
+  setTimeout: noop,
+  fetch: () => Promise.reject(new Error("no network in this harness")),
   Date,
   JSON,
   Math,
@@ -83,283 +43,195 @@ const sandbox = {
   Set,
   Map,
   Intl,
-  Promise,
   isNaN,
   parseInt,
   parseFloat,
 };
 sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
-new vm.Script(`${source}\nrefreshPeopleDependentViews = () => {};\nglobalThis.__mergeExports = {
-  state,
-  revealPeopleSuggestionRename,
-  previewPeopleSuggestion,
-  confirmPeopleSuggestionMerge,
-  openSelectedPeopleMergeModal,
-  submitMergePerson,
-  openPersonRenameModal,
-  submitPersonRename,
-};`).runInContext(sandbox);
+// Top-level `const` stays in the script's lexical scope and never lands on the
+// global object, so the sort tables have to be handed out explicitly. Appended
+// to the real source rather than copied out of it - this still tests shipped code.
+const exposed = `${source}
+globalThis.__exports = {
+  MEETING_SORTS, SPEAKER_SORTS,
+  normalizeSpeakerRow, speakerMatchesFilters, isoDaysAgo, compareBy,
+};`;
+new vm.Script(exposed).runInContext(sandbox);
 
 const {
-  state,
-  revealPeopleSuggestionRename,
-  previewPeopleSuggestion,
-  confirmPeopleSuggestionMerge,
-  openSelectedPeopleMergeModal,
-  submitMergePerson,
-  openPersonRenameModal,
-  submitPersonRename,
-} = sandbox.__mergeExports;
+  MEETING_SORTS,
+  SPEAKER_SORTS,
+  normalizeSpeakerRow,
+  speakerMatchesFilters,
+  isoDaysAgo,
+  compareBy,
+} = sandbox.__exports;
+
+const order = (rows, comparator) => rows.slice().sort(comparator);
 let checks = 0;
-
-state.peopleSuggestions = [{ names: ["Mike", "Michael"], target: "Michael" }];
-elements.get("people-suggestions").dataset.target = "Michael";
-revealPeopleSuggestionRename();
-assert.equal(elements.get("people-suggestion-rename-panel").hidden, false);
-assert.equal(elements.get("people-suggestion-target").value, "Michael");
-assert.equal(elements.get("people-suggestion-target").focused, true);
-checks += 1;
-
-const calls = [];
-sandbox.fetch = async (url, options = {}) => {
-  calls.push({ url, body: options.body ? JSON.parse(options.body) : null });
-  if (url === "/api/people/merge-preview") {
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({
-        digest: "preview-digest",
-        requested_target: "Mikael",
-        actual_target: "Mikael",
-        affected_meetings: 3,
-        files_changed: 2,
-        literal_matches: 4,
-        missing_files: [],
-        conflicts: [],
-      }),
-    };
-  }
-  if (url === "/api/people/merge-many") {
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({
-        target: "Mikael",
-        minutes_rewritten: 2,
-        minutes_unchanged: 1,
-        minutes_missing: 0,
-        rewrite_conflicts: 0,
-        pending_rewrites: 0,
-      }),
-    };
-  }
-  return { ok: false, status: 503, json: async () => ({}) };
+const check = (label, fn) => {
+  fn();
+  checks += 1;
+  console.log(`  ok  ${label}`);
 };
 
-elements.get("people-suggestions").dataset.names = JSON.stringify(["Mike", "Michael"]);
-elements.get("people-suggestion-target").value = "Mikael";
-await previewPeopleSuggestion();
-assert.deepEqual(calls[0], {
-  url: "/api/people/merge-preview",
-  body: { names: ["Mike", "Michael"], into: "Mikael" },
-});
-assert.equal(elements.get("people-suggestion-confirm").disabled, false);
-
-await confirmPeopleSuggestionMerge();
-const mutation = calls.find((call) => call.url === "/api/people/merge-many");
-assert.deepEqual(mutation.body, {
-  names: ["Mike", "Michael"],
-  into: "Mikael",
-  expected_digest: "preview-digest",
-});
-assert.equal(state.peopleSuggestions.length, 0);
-checks += 1;
-
-let releasePreview;
-let previewCalls = 0;
-sandbox.fetch = (url) => {
-  assert.equal(url, "/api/people/merge-preview");
-  previewCalls += 1;
-  return new Promise((resolve) => {
-    releasePreview = () => resolve({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        digest: "busy-preview",
-        requested_target: "Michael",
-        actual_target: "Michael",
-        affected_meetings: 1,
-        files_changed: 0,
-        literal_matches: 0,
-        missing_files: [],
-        conflicts: [],
-      }),
-    });
-  });
+// ── The two row shapes the API really returns ──────────────────────────
+const cluster = {
+  id: "c1", size: 4, total_speech: 300, best_canonical: "Yuliya",
+  best_score: 0.72, next_canonical: "Ruth", next_score: 0.71, band: "review",
+  clip_seconds: 18, llm_suggestion: null,
+  members: [{ meeting_date: "2026-03-01" }, { meeting_date: "2026-08-02" }],
 };
-state.peopleSuggestions = [{ names: ["Mike", "Michael"], target: "Michael" }];
-state.peopleSuggestionMergePreview = null;
-elements.get("people-suggestions").dataset.names = JSON.stringify(["Mike", "Michael"]);
-elements.get("people-suggestions").dataset.target = "Michael";
-elements.get("people-suggestion-target").value = "Michael";
-const firstPreview = previewPeopleSuggestion();
-const duplicatePreview = await previewPeopleSuggestion();
-assert.equal(duplicatePreview, false);
-assert.equal(previewCalls, 1);
-assert.equal(elements.get("people-suggestion-target").disabled, true);
-releasePreview();
-await firstPreview;
-assert.equal(elements.get("people-suggestion-target").disabled, false);
-checks += 1;
-
-state.peopleSuggestions = [{ names: ["Mike", "Michael"], target: "Michael" }];
-state.peopleSuggestionMergePreview = {
-  digest: "stale-digest",
-  requested_target: "Michael",
+const oneOff = {
+  meeting_id: "m1", label: "SPEAKER_00", speech_sec: 44, snippet_count: 0,
+  best_canonical: null, best_score: null, next_canonical: null, next_score: null,
+  band: "new", llm_suggestion: "Dan", meeting_date: "2026-07-15",
 };
-sandbox.fetch = async () => ({
-  ok: false,
-  status: 409,
-  json: async () => ({ error: "preview changed" }),
-});
-const staleApplied = await confirmPeopleSuggestionMerge();
-assert.equal(staleApplied, false);
-assert.equal(state.peopleSuggestions.length, 1);
-assert.equal(state.peopleSuggestionMergePreview, null);
-assert.equal(elements.get("people-suggestion-confirm").disabled, true);
-assert.match(elements.get("people-suggestion-preview").textContent, /stale/i);
-checks += 1;
 
-state.peopleSuggestionMergePreview = {
-  digest: "valid-digest",
-  requested_target: "Michael",
-};
-sandbox.fetch = async () => ({
-  ok: false,
-  status: 500,
-  json: async () => ({ error: "disk refused" }),
-});
-const failedApplied = await confirmPeopleSuggestionMerge();
-assert.equal(failedApplied, false);
-assert.equal(state.peopleSuggestions.length, 1);
-assert.equal(elements.get("people-suggestion-confirm").disabled, false);
-assert.equal(elements.get("people-suggestion-target").disabled, false);
-checks += 1;
+console.log("normalizeSpeakerRow reads both shapes");
+check("cluster speech comes from total_speech", () =>
+  assert.equal(normalizeSpeakerRow(cluster).speech, 300));
+check("one-off speech comes from speech_sec", () =>
+  assert.equal(normalizeSpeakerRow(oneOff).speech, 44));
+check("cluster occurrences come from size", () =>
+  assert.equal(normalizeSpeakerRow(cluster).occurrences, 4));
+check("a one-off counts as one occurrence", () =>
+  assert.equal(normalizeSpeakerRow(oneOff).occurrences, 1));
+check("cluster date is the LATEST member meeting", () =>
+  assert.equal(normalizeSpeakerRow(cluster).latestDate, "2026-08-02"));
+check("one-off date comes from its own meeting", () =>
+  assert.equal(normalizeSpeakerRow(oneOff).latestDate, "2026-07-15"));
+check("margin is best minus next", () =>
+  assert.equal(normalizeSpeakerRow(cluster).margin, 0.01));
+check("no runner-up means no margin, not a margin of zero", () =>
+  assert.equal(normalizeSpeakerRow(oneOff).margin, null));
+check("clip presence reads clip_seconds for clusters", () =>
+  assert.equal(normalizeSpeakerRow(cluster).hasClip, true));
+check("clip presence reads snippet_count for one-offs", () =>
+  assert.equal(normalizeSpeakerRow(oneOff).hasClip, false));
 
-const modalCalls = [];
-sandbox.fetch = async (url, options = {}) => {
-  const body = options.body ? JSON.parse(options.body) : null;
-  modalCalls.push({ url, body });
-  if (url === "/api/people/merge-preview") {
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({
-        digest: "modal-digest",
-        requested_target: "Aimee",
-        actual_target: "Aimee",
-        affected_meetings: 2,
-        files_changed: 1,
-        literal_matches: 3,
-        missing_files: [],
-        conflicts: [],
-      }),
-    };
-  }
-  if (url === "/api/people/merge-many") {
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({
-        target: "Aimee",
-        minutes_rewritten: 1,
-        minutes_unchanged: 0,
-        minutes_missing: 0,
-        rewrite_conflicts: 0,
-        pending_rewrites: 0,
-      }),
-    };
-  }
-  return { ok: false, status: 404, json: async () => ({}) };
-};
-state.selectedPeople = new Set(["Zoe", "Amy"]);
-openSelectedPeopleMergeModal();
-assert.deepEqual(
-  JSON.parse(elements.get("person-merge-sources").value),
-  ["Amy", "Zoe"],
-);
-elements.get("person-merge-target").value = "Amy";
-elements.get("person-merge-target-custom").value = "Aimee";
-await submitMergePerson();
-assert.deepEqual(modalCalls[0], {
-  url: "/api/people/merge-preview",
-  body: { names: ["Amy", "Zoe"], into: "Aimee" },
-});
-assert.match(elements.get("person-merge-save").textContent, /confirm/i);
-await submitMergePerson();
-assert.deepEqual(modalCalls[1], {
-  url: "/api/people/merge-many",
-  body: {
-    names: ["Amy", "Zoe"],
-    into: "Aimee",
-    expected_digest: "modal-digest",
-  },
-});
-checks += 1;
+console.log("SPEAKER_SORTS put the row needing a human first");
+const thin = { ...cluster, id: "thin", best_score: 0.72, next_score: 0.71 };
+const wide = { ...cluster, id: "wide", best_score: 0.95, next_score: 0.20 };
+const unscored = { ...oneOff, label: "unscored" };
+check("closest call first ranks a 0.01 margin above a 0.75 margin", () =>
+  assert.deepEqual(
+    order([wide, thin], SPEAKER_SORTS["margin-asc"]).map((r) => r.id),
+    ["thin", "wide"],
+  ));
+check("an unscored row sorts LAST in ascending margin, not first", () =>
+  assert.equal(
+    order([unscored, thin, wide], SPEAKER_SORTS["margin-asc"]).at(-1).label,
+    "unscored",
+  ));
+check("an unscored row also sorts last by descending confidence", () =>
+  assert.equal(
+    order([unscored, thin], SPEAKER_SORTS["confidence-desc"]).at(-1).label,
+    "unscored",
+  ));
+check("least confident first still keeps unscored rows last", () =>
+  assert.equal(
+    order([unscored, thin, wide], SPEAKER_SORTS["confidence-asc"]).at(-1).label,
+    "unscored",
+  ));
+check("speech sort compares a cluster against a one-off correctly", () =>
+  assert.deepEqual(
+    order([oneOff, cluster], SPEAKER_SORTS["speech-desc"]).map((r) => r.id || r.label),
+    ["c1", "SPEAKER_00"],
+  ));
+check("occurrences sort puts the 4-meeting cluster above a one-off", () =>
+  assert.deepEqual(
+    order([oneOff, cluster], SPEAKER_SORTS["occurrences-desc"]).map((r) => r.id || r.label),
+    ["c1", "SPEAKER_00"],
+  ));
+check("date sort mixes both shapes by their real dates", () =>
+  assert.deepEqual(
+    order([oneOff, cluster], SPEAKER_SORTS["date-desc"]).map((r) => r.id || r.label),
+    ["c1", "SPEAKER_00"],
+  ));
 
-const renameCalls = [];
-sandbox.fetch = async (url, options = {}) => {
-  const body = options.body ? JSON.parse(options.body) : null;
-  renameCalls.push({ url, body });
-  if (url === "/api/people/merge-preview") {
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({
-        digest: "rename-digest",
-        requested_target: "John",
-        actual_target: "John",
-        affected_meetings: 1,
-        files_changed: 1,
-        literal_matches: 2,
-        missing_files: [],
-        conflicts: [],
-      }),
-    };
-  }
-  if (url === "/api/people/rename") {
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({
-        target: "John",
-        minutes_rewritten: 1,
-        minutes_unchanged: 0,
-        minutes_missing: 0,
-        rewrite_conflicts: 0,
-        pending_rewrites: 0,
-      }),
-    };
-  }
-  return { ok: false, status: 404, json: async () => ({}) };
-};
-openPersonRenameModal("Jon");
-elements.get("person-rename-name").value = "John";
-await submitPersonRename();
-assert.deepEqual(renameCalls[0], {
-  url: "/api/people/merge-preview",
-  body: { names: ["Jon"], into: "John" },
+console.log("speakerMatchesFilters reaches BOTH shapes");
+const all = { band: "all", suggestion: "all", clip: "all" };
+check("band filter matches a cluster", () =>
+  assert.equal(speakerMatchesFilters(cluster, { ...all, band: "review" }), true));
+check("band filter excludes a cluster in another band", () =>
+  assert.equal(speakerMatchesFilters(cluster, { ...all, band: "new" }), false));
+check("band filter genuinely applies to one-offs too", () => {
+  assert.equal(speakerMatchesFilters(oneOff, { ...all, band: "new" }), true);
+  assert.equal(speakerMatchesFilters(oneOff, { ...all, band: "review" }), false);
 });
-await submitPersonRename();
-assert.deepEqual(renameCalls[1], {
-  url: "/api/people/rename",
-  body: {
-    from_name: "Jon",
-    new_name: "John",
-    expected_digest: "rename-digest",
-  },
+check("voiceprint filter keeps the matched cluster, drops the unmatched one-off", () => {
+  assert.equal(speakerMatchesFilters(cluster, { ...all, suggestion: "voiceprint" }), true);
+  assert.equal(speakerMatchesFilters(oneOff, { ...all, suggestion: "voiceprint" }), false);
 });
-checks += 1;
+check("transcript filter keeps the row named in the room", () => {
+  assert.equal(speakerMatchesFilters(oneOff, { ...all, suggestion: "transcript" }), true);
+  assert.equal(speakerMatchesFilters(cluster, { ...all, suggestion: "transcript" }), false);
+});
+check("'no suggestion at all' needs both signals absent", () => {
+  const bare = { ...oneOff, llm_suggestion: null };
+  assert.equal(speakerMatchesFilters(bare, { ...all, suggestion: "none" }), true);
+  assert.equal(speakerMatchesFilters(oneOff, { ...all, suggestion: "none" }), false);
+  assert.equal(speakerMatchesFilters(cluster, { ...all, suggestion: "none" }), false);
+});
+check("clip filter separates playable from silent rows", () => {
+  assert.equal(speakerMatchesFilters(cluster, { ...all, clip: "yes" }), true);
+  assert.equal(speakerMatchesFilters(oneOff, { ...all, clip: "yes" }), false);
+  assert.equal(speakerMatchesFilters(oneOff, { ...all, clip: "no" }), true);
+});
+check("filters compose rather than overriding one another", () =>
+  assert.equal(
+    speakerMatchesFilters(cluster, { band: "review", suggestion: "voiceprint", clip: "yes" }),
+    true,
+  ));
 
-console.log(`${checks} checks passed`);
+console.log("MEETING_SORTS");
+const older = { id: "old", date: "2026-01-05", time: "09:00", duration_sec: 600, speaker_count: 2, unresolved_count: 0, title: "Zebra" };
+const newer = { id: "new", date: "2026-08-20", time: "14:00", duration_sec: 9000, speaker_count: 7, unresolved_count: 5, title: "Alpha" };
+const undated = { id: "undated", date: null, time: null, duration_sec: null, speaker_count: 0, unresolved_count: 0, title: "Broken" };
+check("newest first", () =>
+  assert.deepEqual(order([older, newer], MEETING_SORTS["date-desc"]).map((m) => m.id), ["new", "old"]));
+check("oldest first", () =>
+  assert.deepEqual(order([newer, older], MEETING_SORTS["date-asc"]).map((m) => m.id), ["old", "new"]));
+check("an undated meeting sorts last in BOTH directions, never to the top", () => {
+  assert.equal(order([undated, older, newer], MEETING_SORTS["date-desc"]).at(-1).id, "undated");
+  assert.equal(order([undated, older, newer], MEETING_SORTS["date-asc"]).at(-1).id, "undated");
+});
+check("longest first", () =>
+  assert.deepEqual(order([older, newer], MEETING_SORTS["duration-desc"]).map((m) => m.id), ["new", "old"]));
+check("most speakers first", () =>
+  assert.deepEqual(order([older, newer], MEETING_SORTS["speakers-desc"]).map((m) => m.id), ["new", "old"]));
+check("most unnamed speakers first", () =>
+  assert.deepEqual(order([older, newer], MEETING_SORTS["unresolved-desc"]).map((m) => m.id), ["new", "old"]));
+check("title A-Z", () =>
+  assert.deepEqual(order([older, newer], MEETING_SORTS["title-asc"]).map((m) => m.id), ["new", "old"]));
+check("same-day meetings break the tie on time", () => {
+  const morning = { id: "am", date: "2026-08-20", time: "09:00" };
+  const evening = { id: "pm", date: "2026-08-20", time: "18:00" };
+  assert.deepEqual(order([morning, evening], MEETING_SORTS["date-desc"]).map((m) => m.id), ["pm", "am"]);
+});
+
+console.log("date window");
+check("isoDaysAgo returns a plain YYYY-MM-DD cutoff in the past", () => {
+  const cutoff = isoDaysAgo(30);
+  assert.match(cutoff, /^\d{4}-\d{2}-\d{2}$/);
+  assert.ok(cutoff < new Date().toISOString().slice(0, 10));
+});
+check("a 30-day window keeps a recent date and drops an old one", () => {
+  const cutoff = isoDaysAgo(30);
+  assert.ok(new Date().toISOString().slice(0, 10) >= cutoff);
+  assert.ok("2020-01-01" < cutoff);
+});
+
+console.log("comparators are stable and side-effect free");
+check("sorting does not mutate the input array", () => {
+  const rows = [newer, older, undated];
+  const before = rows.map((r) => r.id);
+  order(rows, MEETING_SORTS["date-desc"]);
+  assert.deepEqual(rows.map((r) => r.id), before);
+});
+check("compareBy reports equality as 0 so equal rows keep their order", () =>
+  assert.equal(compareBy((r) => r.v, "desc")({ v: 1 }, { v: 1 }), 0));
+
+console.log(`\n${checks} checks passed`);

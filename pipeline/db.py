@@ -1436,17 +1436,24 @@ def replace_clusters(conn: sqlite3.Connection, clusters: list[dict[str, object]]
             )
 
 
-def pending_clusters(conn: sqlite3.Connection, limit: int = 50) -> list[sqlite3.Row]:
+def pending_clusters(
+    conn: sqlite3.Connection, limit: int | None = None
+) -> list[sqlite3.Row]:
     """The review queue, most valuable first.
 
     Ordered by total speaking time so the earliest answers resolve the most
     history: in a personal archive a handful of recurring people dominate.
+
+    Unbounded by default. The old default of 50 sat 5 rows above the real queue
+    and had already been worked around at the one call site that noticed
+    (voices.py passed 10_000). A cap that silently drops rows turns any filter
+    built on top of this into a confident lie, so callers that want a cap now
+    say so.
     """
-    return list(
-        conn.execute(
-            "SELECT * FROM voice_clusters ORDER BY total_speech DESC LIMIT ?", (limit,)
-        )
-    )
+    sql = "SELECT * FROM voice_clusters ORDER BY total_speech DESC"
+    if limit is None:
+        return list(conn.execute(sql))
+    return list(conn.execute(f"{sql} LIMIT ?", (limit,)))
 
 
 def add_voice_sample(

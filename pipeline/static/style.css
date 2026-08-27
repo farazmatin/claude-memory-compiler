@@ -354,7 +354,58 @@ h3 {
 .archive-filters {
   display: flex;
   gap: 12px;
-  align-items: center;
+  /* flex-end, not center: every control below is a labelled stack, so centering
+     would float the bare search box against the labels rather than the inputs. */
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+/* A labelled control. Six selects sit in a row here and two of them used to
+   carry only an aria-label, which reads fine to a screen reader and tells a
+   sighted user nothing about which list the select governs. */
+.control-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.control-group > label {
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted, #6b7280);
+  white-space: nowrap;
+}
+
+.control-group > select {
+  background: transparent;
+  border: 1px solid var(--rule);
+  padding: 6px 10px;
+  color: var(--ink);
+  max-width: 100%;
+}
+
+/* The speaker bar. Same vocabulary as the archive bar so the two read as one
+   control language, plus a live count - a filtered list that does not say what
+   it hid reads as "nothing left to do". */
+.review-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: flex-end;
+  margin: 0 0 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--rule);
+  background: var(--paper-2, rgba(0, 0, 0, 0.015));
+}
+
+.review-controls-count {
+  margin: 0 0 0 auto;
+  font-size: 0.78rem;
+  color: var(--muted, #6b7280);
+  align-self: flex-end;
+  padding-bottom: 6px;
 }
 
 .search {
@@ -1432,6 +1483,19 @@ footer {
     align-items: stretch;
     flex-direction: column;
   }
+  .review-controls {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .review-controls .control-group > select {
+    min-width: 0;
+    width: 100%;
+  }
+  .review-controls-count {
+    grid-column: 1 / -1;
+    margin: 0;
+    padding-bottom: 0;
+  }
   .archive-filters {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2189,4 +2253,61 @@ footer {
   color: var(--muted);
   font-style: italic;
   margin-left: 4px;
+}
+
+/* ── Pending actions ──────────────────────────────────────────────────
+   Every action in this dashboard is a round trip to a local server that may
+   be transcribing audio, calling an LLM, or rewriting minutes on disk. A
+   click with no visible pending state is indistinguishable from a dead
+   button, so anything mid-request dims, stops responding to the pointer, and
+   carries a spinner. `aria-busy` is the state the script already sets, so it
+   is also the selector here - no second class to keep in sync. */
+[aria-busy="true"] {
+  cursor: progress;
+  opacity: 0.72;
+  position: relative;
+}
+
+button[aria-busy="true"] {
+  /* Room for the spinner on the trailing edge, so the label does not shift. */
+  padding-right: 2.1em;
+}
+
+button[aria-busy="true"]::after {
+  content: "";
+  position: absolute;
+  right: 0.7em;
+  top: 50%;
+  width: 0.85em;
+  height: 0.85em;
+  margin-top: -0.425em;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: pending-spin 0.7s linear infinite;
+}
+
+@keyframes pending-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button[aria-busy="true"]::after {
+    animation-duration: 2.4s;
+  }
+}
+
+/* The elapsed-seconds readout while the archive is being queried. Retrieval
+   plus an LLM answer can run past a minute, and a number that keeps moving is
+   what separates "still working" from "hung". */
+.answer-elapsed {
+  display: inline-block;
+  min-width: 3.2em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(29, 41, 35, 0.1);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85em;
 }
