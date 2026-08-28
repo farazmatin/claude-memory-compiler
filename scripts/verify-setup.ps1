@@ -31,7 +31,7 @@ function Add-Result {
 
 try {
     Write-Host ""
-    Write-Host "Meeting Minutes Compiler - On-demand Verification" -ForegroundColor Cyan
+    Write-Host "Meeting Minutes Compiler - Continuous Drive Verification" -ForegroundColor Cyan
     Write-Host ""
 
     $checks = @(

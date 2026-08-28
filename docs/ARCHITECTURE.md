@@ -21,16 +21,26 @@ The repositories communicate through a small, read-only loopback context API,
 not shared directories, direct database access, environment files, or
 cross-repository writes.
 
-## On-demand flow
+## Continuous Drive flow
 
     Google Drive audio
       -> capture -> ingest -> Replicate transcription -> speaker resolution
       -> subscription-authored minutes, entities, and relations
       -> graph-sync -> bounded ContextProvider -> Product Manager background
 
-Run the flow when requested with:
+The watcher polls the approved private Drive folder every 60 seconds and starts
+the flow only after it captures a newly-arrived recording. It is a single-flight
+continuous process, not a nightly batch. Replicate is always the transcription
+provider. Existing pending recordings are processed only with an explicit
+catch-up request, so starting the watcher never silently starts old paid work.
 
-    uv run pipeline run --owner "Faraz"
+Start it at sign-in:
+
+    uv run pipeline watch --owner "Faraz"
+
+For a one-time operational catch-up (including the current queue):
+
+    uv run pipeline watch --owner "Faraz" --catch-up
 
 ## Provider policy
 

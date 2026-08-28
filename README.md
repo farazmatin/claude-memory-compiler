@@ -45,7 +45,7 @@ commits and do not print them.
 Process recordings on demand:
 
     uv run pipeline capture --dry-run
-    uv run pipeline run --owner "Faraz"
+    uv run pipeline watch --owner "Faraz"
     uv run pipeline status
 
 Use capture --dry-run to check Drive authorization without modifying local files.
@@ -65,7 +65,7 @@ If it reports authorization failure, run:
     pipeline speakers --owner "Name"
     pipeline minutes
     pipeline graph-sync
-    pipeline run --owner "Name"
+    pipeline watch --owner "Name"
     pipeline doctor
     pipeline dashboard --open
     pipeline query "question"

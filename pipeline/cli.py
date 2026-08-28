@@ -14,14 +14,15 @@ minutes compilation loses minutes of work rather than hours.
     pipeline minutes               compile structured minutes
     pipeline graph-sync            publish subscription-authored graph records
     pipeline graph-sync            author the graph from the manifest
-    pipeline run                   every pending stage, in order
+    pipeline watch                 process each newly-arrived Drive recording
     pipeline dashboard             browse and search the local meeting record
     pipeline query "question"      ask the knowledge base
     pipeline status                where everything is, plus stage timings
     pipeline retry                 requeue failed meetings
 
-Run `pipeline run` on demand after recordings are ready. It performs a
-bounded batch and reports failures directly to the initiating operator.
+`pipeline watch` is the normal continuous entry point. It polls Drive, then
+uses Replicate and the subscription-authored stages only for newly captured
+recordings. `pipeline run` remains the explicit catch-up/recovery command.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ from pipeline.config import (
     AUTO_REQUEUE_LIMIT,
     DASHBOARD_HOST,
     DASHBOARD_PORT,
+    DB_DIR,
     MIN_MEETING_SEC,
     MIN_TRANSCRIPT_WORDS,
     OWNER_NAME,
@@ -778,6 +780,56 @@ def cmd_run(args: argparse.Namespace) -> int:
     return _run_all(args)
 
 
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Continuously process a newly-arrived Drive recording, once and in order."""
+    from pipeline import watcher
+
+    ensure_dirs()
+    db.init_db()
+
+    def process_pending() -> int:
+        return _run_all(
+            argparse.Namespace(limit=args.limit, no_llm=False, owner=args.owner),
+            include_ingest=False,
+        )
+
+    def cycle() -> watcher.CycleResult:
+        try:
+            return watcher.run_cycle(
+                capture.run,
+                lambda: cmd_ingest(argparse.Namespace(then_run=False)),
+                process_pending,
+            )
+        except Exception as exc:
+            print(f"Drive watcher capture failed: {exc}", file=sys.stderr)
+            from pipeline import alert
+
+            alert.send(["drive_watcher"], detail=str(exc))
+            return watcher.CycleResult(0, 0, processed=False, failed=True)
+
+    try:
+        with watcher.WatchLease(DB_DIR / "drive-watcher.lock"):
+            if args.catch_up:
+                print("Drive watcher catch-up: processing existing pending recordings.")
+                if process_pending():
+                    return 1
+            if args.once:
+                result = cycle()
+                print(
+                    f"Drive watcher: {'failed' if result.failed else 'processed' if result.processed else 'waiting'}; "
+                    f"scanned {result.scanned}, downloaded {result.downloaded}."
+                )
+                return 1 if result.failed else 0
+            print(
+                f"Drive watcher running every {args.interval_sec:g}s. "
+                "New Drive audio is processed with Replicate as soon as it is captured."
+            )
+            return watcher.watch(cycle, interval_sec=args.interval_sec)
+    except watcher.WatcherAlreadyRunning as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
 def cmd_query(args: argparse.Namespace) -> int:
     from pipeline import answer
 
@@ -1146,6 +1198,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--owner", default=OWNER_NAME or None)
     p_run.add_argument("--no-llm", action="store_true")
     p_run.set_defaults(func=cmd_run)
+
+    p_watch = subparsers.add_parser(
+        "watch", help="continuously process new private Drive recordings (Replicate only)"
+    )
+    p_watch.add_argument(
+        "--interval-sec", type=float, default=60.0,
+        help="Drive polling interval in seconds (default: 60)",
+    )
+    p_watch.add_argument("--limit", type=int, default=None)
+    p_watch.add_argument("--owner", default=OWNER_NAME or None)
+    p_watch.add_argument(
+        "--catch-up", action="store_true",
+        help="also process recordings already pending when the watcher starts",
+    )
+    p_watch.add_argument("--once", action="store_true", help="run one capture poll and exit")
+    p_watch.set_defaults(func=cmd_watch)
 
     p_query = subparsers.add_parser("query", help="ask the knowledge base")
     p_query.add_argument("question")
