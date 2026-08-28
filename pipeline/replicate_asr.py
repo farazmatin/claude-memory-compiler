@@ -34,7 +34,12 @@ from pipeline.config import (
     REPLICATE_MODEL,
     REPLICATE_POLL_INTERVAL_SEC,
     REPLICATE_TIMEOUT_SEC,
+    REPLICATE_UPLOAD_ATTEMPTS,
+    REPLICATE_UPLOAD_BACKOFF_MAX_SEC,
+    REPLICATE_UPLOAD_BACKOFF_SEC,
     TARGET_SAMPLE_RATE,
+    UPLOAD_AUDIO_BITRATE,
+    UPLOAD_AUDIO_CODEC,
 )
 
 REPLICATE_API_BASE = "https://api.replicate.com/v1"
@@ -42,26 +47,69 @@ DEFAULT_VERSION = "655845d6190ef70573c669245f245892cd039df4b880a1e3a65852c09252f
 
 
 class ReplicateError(RuntimeError):
-    """Raised when Replicate API requests or predictions fail."""
+    """Raised when Replicate API requests or predictions fail.
+
+    ``transient`` distinguishes a network fault, which is worth requeueing, from
+    a rejected token or malformed input, which repeats identically forever.
+    """
+
+    def __init__(self, *args: object, transient: bool = False) -> None:
+        super().__init__(*args)
+        self.transient = transient
+
+
+# ffmpeg encoder -> (container suffix, HTTP content type). The upload body must
+# be labelled for what it actually is; an Ogg body sent as audio/mpeg is a silent
+# decode failure on the far side rather than an error anyone sees.
+_UPLOAD_FORMATS: dict[str, tuple[str, str]] = {
+    "libopus": (".ogg", "audio/ogg"),
+    "libmp3lame": (".mp3", "audio/mpeg"),
+    "aac": (".m4a", "audio/mp4"),
+}
+_FALLBACK_CODEC = "libmp3lame"
+
+
+def upload_content_type(path: Path) -> str:
+    """HTTP content type for an encoded upload body, by container suffix."""
+    for suffix, content_type in _UPLOAD_FORMATS.values():
+        if path.suffix.lower() == suffix:
+            return content_type
+    return "application/octet-stream"
 
 
 def normalize_audio_for_upload(src: Path, dest: Path) -> Path:
-    """Transcode to 16 kHz mono MP3 (64k) for fast, lightweight upload.
+    """Transcode to a small 16 kHz mono body for fast, reliable upload.
 
-    Compressing from raw WAV to 64k mono MP3 reduces upload payload from
-    ~115 MB/hr down to ~15 MB/hr without degrading Whisper ASR accuracy,
-    preventing network dropouts on large meeting recordings.
+    Payload size drives the upload failure rate on a flaky path, so this sends as
+    few bytes as the ASR and diarizer can work with: ~2-4 MB/hr of Opus in place
+    of ~115 MB/hr of raw WAV. See ``UPLOAD_AUDIO_CODEC`` for the accuracy
+    measurements behind the default.
+
+    Falls back to MP3 when the configured encoder is missing rather than failing
+    the meeting: an ffmpeg build without libopus is a packaging problem, not a
+    reason to lose a recording.
     """
-    subprocess.run(
-        [
-            "ffmpeg", "-nostdin", "-y", "-i", str(src),
-            "-ac", "1", "-ar", str(TARGET_SAMPLE_RATE),
-            "-c:a", "libmp3lame", "-b:a", "64k", str(dest),
-        ],
-        check=True,
-        capture_output=True,
+    codec = UPLOAD_AUDIO_CODEC if UPLOAD_AUDIO_CODEC in _UPLOAD_FORMATS else _FALLBACK_CODEC
+    for candidate in dict.fromkeys([codec, _FALLBACK_CODEC]):
+        suffix, _ = _UPLOAD_FORMATS[candidate]
+        out = dest.with_suffix(suffix)
+        result = subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-y", "-i", str(src),
+                "-ac", "1", "-ar", str(TARGET_SAMPLE_RATE),
+                "-c:a", candidate, "-b:a", UPLOAD_AUDIO_BITRATE, str(out),
+            ],
+            capture_output=True,
+        )
+        if result.returncode == 0 and out.is_file() and out.stat().st_size > 0:
+            return out
+        if candidate != _FALLBACK_CODEC:
+            print(f"    {candidate} unavailable, falling back to {_FALLBACK_CODEC}")
+
+    raise ReplicateError(
+        f"ffmpeg could not encode {src.name} for upload with "
+        f"{codec} or {_FALLBACK_CODEC}"
     )
-    return dest
 
 
 class ReplicateBackend:
@@ -126,14 +174,26 @@ class ReplicateBackend:
         return DEFAULT_VERSION
 
     def _upload_file(self, client: httpx.Client, audio_path: Path) -> str:
-        """Upload audio to Replicate's temporary files store with retry on network error."""
+        """Upload audio to Replicate's temporary files store with retry on network error.
+
+        Retry hard rather than briefly. Large bodies are reset mid-transfer at a
+        rate that climbs with payload size (see the measurements on
+        ``REPLICATE_UPLOAD_ATTEMPTS``), so a long recording can lose several
+        attempts in a row on an otherwise healthy connection. Giving up early
+        parks the meeting at ``failed`` and no minutes are ever compiled for it.
+        """
         upload_url = f"{REPLICATE_API_BASE}/files"
         last_exc: Exception | None = None
+        attempts = max(1, REPLICATE_UPLOAD_ATTEMPTS)
 
-        for attempt in range(1, 4):
+        for attempt in range(1, attempts + 1):
             try:
                 with open(audio_path, "rb") as f:
-                    files = {"content": (audio_path.name, f, "audio/mpeg")}
+                    files = {
+                        "content": (
+                            audio_path.name, f, upload_content_type(audio_path),
+                        )
+                    }
                     resp = client.post(
                         upload_url,
                         headers=self._headers(),
@@ -158,11 +218,21 @@ class ReplicateBackend:
                 )
             except (httpx.RemoteProtocolError, httpx.NetworkError, httpx.TimeoutException) as exc:
                 last_exc = exc
-                if attempt < 3:
-                    print(f"    upload network retry ({attempt}/3)...")
-                    time.sleep(2.0 * attempt)
+                if attempt < attempts:
+                    delay = min(
+                        REPLICATE_UPLOAD_BACKOFF_SEC * (2 ** (attempt - 1)),
+                        REPLICATE_UPLOAD_BACKOFF_MAX_SEC,
+                    )
+                    print(
+                        f"    upload network retry ({attempt}/{attempts}), "
+                        f"waiting {delay:.0f}s..."
+                    )
+                    time.sleep(delay)
 
-        raise ReplicateError(f"Audio upload failed after 3 attempts: {last_exc}")
+        raise ReplicateError(
+            f"Audio upload failed after {attempts} attempts: {last_exc}",
+            transient=True,
+        )
 
     def _create_prediction(
         self, client: httpx.Client, audio_url: str, initial_prompt: str
@@ -251,13 +321,13 @@ class ReplicateBackend:
             )
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            # 1. Compress to 64k mono MP3 for fast, reliable upload
-            mp3_path = normalize_audio_for_upload(audio_path, Path(tmpdir) / "upload.mp3")
-            mp3_size_mb = mp3_path.stat().st_size / (1024 * 1024)
+            # 1. Compress to a small 16 kHz mono body for fast, reliable upload
+            upload_path = normalize_audio_for_upload(audio_path, Path(tmpdir) / "upload")
+            upload_size_mb = upload_path.stat().st_size / (1024 * 1024)
 
             with httpx.Client() as client:
-                print(f"    uploading to Replicate ({mp3_size_mb:.1f} MB)...")
-                audio_url = self._upload_file(client, mp3_path)
+                print(f"    uploading to Replicate ({upload_size_mb:.1f} MB)...")
+                audio_url = self._upload_file(client, upload_path)
 
                 print(f"    transcribing on Replicate GPU ({self.model_name})...")
                 result_data: dict[str, Any] | None = None

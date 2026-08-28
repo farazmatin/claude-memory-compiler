@@ -311,3 +311,76 @@ def test_append_chat_turn_rejects_duplicate_index_for_same_session(manifest):
             "VALUES ('s1', 0, 'dup', 'dup', 1, ?)",
             (db.now_iso(),),
         )
+
+
+def test_transient_failure_is_requeued_automatically(manifest):
+    """A dropped upload must not need a human to notice it.
+
+    Six recordings sat at FAILED with `Server disconnected without sending a
+    response` until someone read the manifest by hand; no minutes were compiled
+    for any of them in the meantime.
+    """
+    make_meeting(manifest, "m1", "2026-08-10")
+    db.mark_failed(manifest, "m1", "ReplicateError: Audio upload failed", retryable=True)
+
+    requeued = db.requeue_transient(manifest, db.DISCOVERED, max_retries=3)
+
+    assert requeued == ["m1"]
+    reloaded = db.get_meeting(manifest, "m1")
+    assert reloaded.status == db.DISCOVERED
+    assert reloaded.error is None
+
+
+def test_permanent_failure_is_never_requeued(manifest):
+    """A bad token or missing audio repeats forever; auto-retry would spin."""
+    make_meeting(manifest, "m1", "2026-08-10")
+    db.mark_failed(manifest, "m1", "audio file missing and could not be restored")
+
+    assert db.requeue_transient(manifest, db.DISCOVERED, max_retries=3) == []
+    assert db.get_meeting(manifest, "m1").status == db.FAILED
+
+
+def test_auto_requeue_gives_up_after_the_limit(manifest):
+    """A genuine outage must not requeue the same recording forever."""
+    make_meeting(manifest, "m1", "2026-08-10")
+
+    for _ in range(3):
+        db.mark_failed(manifest, "m1", "ReplicateError: upload failed", retryable=True)
+        assert db.requeue_transient(manifest, db.DISCOVERED, max_retries=3) == ["m1"]
+
+    db.mark_failed(manifest, "m1", "ReplicateError: upload failed", retryable=True)
+    assert db.requeue_transient(manifest, db.DISCOVERED, max_retries=3) == []
+    assert db.get_meeting(manifest, "m1").status == db.FAILED
+
+
+def test_reaching_a_later_stage_clears_the_retry_budget(manifest):
+    """Next month's blip gets a full budget, not the leftovers from this one."""
+    make_meeting(manifest, "m1", "2026-08-10")
+    db.mark_failed(manifest, "m1", "ReplicateError: upload failed", retryable=True)
+    db.requeue_transient(manifest, db.DISCOVERED, max_retries=3)
+
+    db.advance(manifest, "m1", db.TRANSCRIBED, transcript_path="/t.json")
+
+    db.mark_failed(manifest, "m1", "ReplicateError: upload failed", retryable=True)
+    for _ in range(3):
+        assert db.requeue_transient(manifest, db.DISCOVERED, max_retries=3) == ["m1"]
+        db.mark_failed(manifest, "m1", "ReplicateError: upload failed", retryable=True)
+
+
+def test_an_explicit_retry_restores_the_auto_requeue_budget(manifest):
+    """A person rewinding a meeting has usually just fixed the cause.
+
+    Auto-requeues are spent without anyone watching; an explicit `pipeline retry`
+    is a decision, and it should not inherit an exhausted budget.
+    """
+    make_meeting(manifest, "m1", "2026-08-10")
+    for _ in range(3):
+        db.mark_failed(manifest, "m1", "ReplicateError: upload failed", retryable=True)
+        db.requeue_transient(manifest, db.DISCOVERED, max_retries=3)
+    db.mark_failed(manifest, "m1", "ReplicateError: upload failed", retryable=True)
+    assert db.requeue_transient(manifest, db.DISCOVERED, max_retries=3) == []
+
+    db.reset_to(manifest, "m1", db.DISCOVERED)
+
+    db.mark_failed(manifest, "m1", "ReplicateError: upload failed", retryable=True)
+    assert db.requeue_transient(manifest, db.DISCOVERED, max_retries=3) == ["m1"]

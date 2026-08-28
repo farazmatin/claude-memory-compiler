@@ -75,6 +75,37 @@ REPLICATE_MODEL = os.environ.get("MMC_REPLICATE_MODEL", "victor-upmeet/whisperx"
 REPLICATE_TIMEOUT_SEC = float(os.environ.get("MMC_REPLICATE_TIMEOUT", "600"))
 REPLICATE_POLL_INTERVAL_SEC = float(os.environ.get("MMC_REPLICATE_POLL_INTERVAL", "2.0"))
 
+# Large upload bodies get reset mid-transfer on this network path: measured
+# success per attempt is 8/8 at <=5 MB, ~50% at 10 MB, and ~33% at 20-35 MB, with
+# the reset arriving 1-2s in. Three attempts inside a ~7-second window therefore
+# lost every recording over ~30 minutes long and parked six of them at `failed`,
+# so no minutes were ever compiled. Eight attempts on a capped exponential
+# backoff take a 33% per-attempt success rate to ~96% overall.
+REPLICATE_UPLOAD_ATTEMPTS = int(os.environ.get("MMC_REPLICATE_UPLOAD_ATTEMPTS", "8"))
+REPLICATE_UPLOAD_BACKOFF_SEC = float(
+    os.environ.get("MMC_REPLICATE_UPLOAD_BACKOFF", "5.0")
+)
+REPLICATE_UPLOAD_BACKOFF_MAX_SEC = float(
+    os.environ.get("MMC_REPLICATE_UPLOAD_BACKOFF_MAX", "60.0")
+)
+
+# Even eight attempts lose a recording if the rough patch outlasts them, and a
+# row parked at FAILED is only recovered by a human reading the manifest - six
+# of them sat there for a day with no minutes. Each later run spends one of
+# these on a network-faulted meeting; the budget keeps a real multi-day outage
+# from requeueing the same recording forever.
+AUTO_REQUEUE_LIMIT = int(os.environ.get("MMC_AUTO_REQUEUE_LIMIT", "3"))
+
+# Upload encoding. Reset probability climbs with payload size, so the cheapest
+# reliability win is sending less: 32 kbps Opus is ~2x smaller than the 64 kbps
+# MP3 it replaces (a 72-minute meeting: ~35 MB -> ~16 MB) and upload time drops
+# with it. Verified against 64k MP3 on a 7-minute six-speaker sample - word
+# counts within 1% and a diarization talk-split of 47/18/15/14 against 46/19/16/14,
+# closer than two runs of the same file differ from each other. Opus below 32k
+# starts merging the quietest speakers, so lower it only deliberately.
+UPLOAD_AUDIO_CODEC = os.environ.get("MMC_UPLOAD_CODEC", "libopus").strip()
+UPLOAD_AUDIO_BITRATE = os.environ.get("MMC_UPLOAD_BITRATE", "32k").strip()
+
 # Every ASR model resamples to 16 kHz mono internally, so normalizing to it up
 # front costs no accuracy and shrinks ~18 MB/hr of m4a to ~2-4 MB/hr.
 TARGET_SAMPLE_RATE = 16_000

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
+from pipeline import replicate_asr
 from pipeline.replicate_asr import ReplicateBackend, ReplicateError
 
 
@@ -203,3 +206,117 @@ def test_default_backend_selection(monkeypatch):
     monkeypatch.setattr(asr, "REPLICATE_API_TOKEN", "")
     with pytest.raises(RuntimeError, match="REPLICATE_API_TOKEN is required"):
         asr.default_backend()
+
+
+def test_replicate_upload_survives_consecutive_resets(tmp_path: Path, monkeypatch):
+    """Several resets in a row must not permanently park a meeting.
+
+    Large upload bodies are reset mid-transfer often enough that a long
+    recording loses attempt after attempt. Six recordings were lost to
+    `Server disconnected without sending a response` when three attempts inside
+    a ~7-second window were all that stood between them and `failed`.
+    """
+    backend = ReplicateBackend(api_token="r8_test123")
+    fake_mp3 = tmp_path / "audio.mp3"
+    fake_mp3.write_bytes(bytes([255, 251]) + bytes(40))
+
+    monkeypatch.setattr(replicate_asr.time, "sleep", lambda _s: None)
+
+    ok_resp = MagicMock(status_code=201)
+    ok_resp.json.return_value = {"urls": {"get": "https://replicate.delivery/pbxt/ok.mp3"}}
+
+    resets = [httpx.RemoteProtocolError("Server disconnected without sending a response.")] * 4
+    calls = {"n": 0}
+
+    def post(*_args, **_kwargs):
+        calls["n"] += 1
+        if resets:
+            raise resets.pop(0)
+        return ok_resp
+
+    mock_client = MagicMock()
+    mock_client.post.side_effect = post
+
+    assert backend._upload_file(mock_client, fake_mp3) == "https://replicate.delivery/pbxt/ok.mp3"
+    assert calls["n"] == 5, "must keep retrying past four consecutive resets"
+
+
+def test_replicate_upload_retry_window_spans_minutes(tmp_path: Path, monkeypatch):
+    """The retry window has to outlast a multi-minute rough patch."""
+    backend = ReplicateBackend(api_token="r8_test123")
+    fake_mp3 = tmp_path / "audio.mp3"
+    fake_mp3.write_bytes(bytes([255, 251]) + bytes(40))
+
+    slept: list[float] = []
+    monkeypatch.setattr(replicate_asr.time, "sleep", slept.append)
+
+    mock_client = MagicMock()
+    mock_client.post.side_effect = httpx.RemoteProtocolError(
+        "Server disconnected without sending a response."
+    )
+
+    with pytest.raises(ReplicateError, match="Audio upload failed"):
+        backend._upload_file(mock_client, fake_mp3)
+
+    assert sum(slept) >= 180.0, f"retry window only spans {sum(slept):.0f}s"
+    assert max(slept) <= 60.0, "backoff must stay capped"
+
+
+def test_upload_encoding_halves_the_payload(tmp_path: Path, monkeypatch):
+    """Smaller bodies get reset less often, so the upload encoding is load-bearing.
+
+    Measured on this network: uploads succeeded 8/8 at <=5 MB, about half the time
+    at 10 MB, and about a third of the time at 20-35 MB. A 72-minute meeting at
+    the old 64k MP3 is ~35 MB; at 32k Opus it is ~16 MB.
+    """
+    source = tmp_path / "source.wav"
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-y", "-f", "lavfi",
+         "-i", "anoisesrc=duration=60:color=brown", "-ac", "1", "-ar", "16000",
+         str(source)],
+        check=True, capture_output=True,
+    )
+
+    encoded = replicate_asr.normalize_audio_for_upload(source, tmp_path / "upload")
+
+    monkeypatch.setattr(replicate_asr, "UPLOAD_AUDIO_CODEC", "libmp3lame")
+    monkeypatch.setattr(replicate_asr, "UPLOAD_AUDIO_BITRATE", "64k")
+    previous = replicate_asr.normalize_audio_for_upload(source, tmp_path / "previous")
+
+    assert encoded.is_file() and encoded.stat().st_size > 0
+    assert encoded.stat().st_size < previous.stat().st_size * 0.6, (
+        f"upload payload is {encoded.stat().st_size/1000:.0f} KB against "
+        f"{previous.stat().st_size/1000:.0f} KB for the 64k MP3 it replaced"
+    )
+
+
+def test_upload_falls_back_when_the_encoder_is_missing(tmp_path: Path, monkeypatch):
+    """An ffmpeg build without libopus is a packaging problem, not a lost meeting."""
+    source = tmp_path / "source.wav"
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-y", "-f", "lavfi", "-i", "sine=duration=5",
+         "-ac", "1", "-ar", "16000", str(source)],
+        check=True, capture_output=True,
+    )
+    monkeypatch.setattr(replicate_asr, "UPLOAD_AUDIO_CODEC", "libtotallymissing")
+
+    encoded = replicate_asr.normalize_audio_for_upload(source, tmp_path / "upload")
+
+    assert encoded.suffix == ".mp3" and encoded.stat().st_size > 0
+
+
+def test_upload_content_type_matches_the_encoding(tmp_path: Path):
+    """A body labelled audio/mpeg that is really Ogg is a silent decode failure."""
+    backend = ReplicateBackend(api_token="r8_test123")
+    ogg = tmp_path / "upload.ogg"
+    ogg.write_bytes(b"OggS" + bytes(40))
+
+    ok_resp = MagicMock(status_code=201)
+    ok_resp.json.return_value = {"urls": {"get": "https://replicate.delivery/pbxt/ok.ogg"}}
+    mock_client = MagicMock()
+    mock_client.post.return_value = ok_resp
+
+    backend._upload_file(mock_client, ogg)
+
+    sent = mock_client.post.call_args.kwargs["files"]["content"]
+    assert sent[2] == "audio/ogg", f"declared {sent[2]} for an Ogg body"

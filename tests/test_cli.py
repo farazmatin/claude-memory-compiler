@@ -306,3 +306,52 @@ def test_run_all_alerts_on_a_genuine_stage_failure(tmp_path, monkeypatch):
     assert rc == 1
     assert alert_log.exists(), "a genuine failure must invoke the alert command"
     assert "transcribe" in alert_log.read_text(encoding="utf-8")
+
+
+def test_run_all_requeues_a_network_failure_before_transcribing(manifest, monkeypatch):
+    """The next run picks up a dropped upload without anyone reading the manifest.
+
+    Six recordings were parked at FAILED by `Server disconnected without sending
+    a response`; every later run said "Nothing to transcribe" and no minutes were
+    ever compiled for them.
+    """
+    from .conftest import make_meeting
+
+    make_meeting(manifest, "m1", "2026-08-10")
+    db.mark_failed(manifest, "m1", "ReplicateError: Audio upload failed", retryable=True)
+    manifest.commit()  # _run_all reads through its own connection
+
+    seen: list[str] = []
+
+    def record(_args):
+        with db.connect() as conn:
+            seen.extend(m.id for m in db.pending(conn, db.DISCOVERED))
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_transcribe", record)
+    monkeypatch.setattr(cli, "cmd_speakers", lambda args: 0)
+    monkeypatch.setattr(cli, "cmd_minutes", lambda args: 0)
+    monkeypatch.setattr(cli, "cmd_graph_sync", lambda args: 0)
+
+    cli._run_all(_run_all_args(), include_ingest=False)
+
+    assert seen == ["m1"], "a network-failed meeting must be queued for the next run"
+
+
+def test_run_all_leaves_a_permanent_failure_parked(manifest, monkeypatch):
+    """A missing file repeats identically; requeueing it would spin every run."""
+    from .conftest import make_meeting
+
+    make_meeting(manifest, "m1", "2026-08-10")
+    db.mark_failed(manifest, "m1", "audio file missing and could not be restored")
+    manifest.commit()
+
+    monkeypatch.setattr(cli, "cmd_transcribe", lambda args: 0)
+    monkeypatch.setattr(cli, "cmd_speakers", lambda args: 0)
+    monkeypatch.setattr(cli, "cmd_minutes", lambda args: 0)
+    monkeypatch.setattr(cli, "cmd_graph_sync", lambda args: 0)
+
+    cli._run_all(_run_all_args(), include_ingest=False)
+
+    with db.connect() as conn:
+        assert db.get_meeting(conn, "m1").status == db.FAILED

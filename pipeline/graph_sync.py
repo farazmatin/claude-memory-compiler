@@ -33,19 +33,45 @@ class GraphSyncError(RuntimeError):
     """Raised when LightRAG rejects a graph write."""
 
 
+# Outcome of one graph write.
+#
+# DROPPED exists because "refused" and "failed" are not the same thing. LightRAG's
+# naming contract filters digits-and-dots tokens, so an extracted entity named
+# "1.0" is refused with HTTP 400 on every run, forever. Counting that as a write
+# failure wedged publication for the whole corpus: once every other entity
+# already exists, `entities_written` is 0 on every later run, so the "wrote
+# nothing" guard fired on the one permanent refusal and eight meetings sat at
+# minutes_compiled with their minutes already written to disk.
+WRITTEN = "written"
+DUPLICATE = "duplicate"
+DROPPED = "dropped"
+FAILED = "failed"
+
+# Refusals a later run cannot fix, because the payload itself is unacceptable.
+# 401/403/429 are deliberately absent: a dead key or a rate limit is recoverable,
+# and silently dropping those would publish a corpus with holes in it.
+_PERMANENT_REFUSAL = frozenset({400, 409, 422})
+
+
 @dataclass
 class SyncReport:
     entities_written: int = 0
     entities_skipped: int = 0
+    entities_dropped: int = 0
     relations_written: int = 0
     relations_skipped: int = 0
+    relations_dropped: int = 0
     errors: list[str] = field(default_factory=list)
+    drops: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         line = (
             f"{self.entities_written} entities, {self.relations_written} relations written; "
             f"{self.entities_skipped} entities and {self.relations_skipped} relations skipped"
         )
+        dropped = self.entities_dropped + self.relations_dropped
+        if dropped:
+            line += f"; {dropped} unpublishable record(s) dropped"
         if self.errors:
             line += f"; {len(self.errors)} error(s)"
         return line
@@ -139,20 +165,23 @@ def collect(conn: sqlite3.Connection) -> tuple[dict[str, dict[str, Any]], list[d
     return entities, relations
 
 
-def _post(client: httpx.Client, path: str, payload: dict[str, Any]) -> tuple[bool, str]:
+def _post(client: httpx.Client, path: str, payload: dict[str, Any]) -> tuple[str, str]:
+    """Write one record. Returns the outcome and a detail string for reporting."""
     try:
         resp = client.post(
             f"{LIGHTRAG_URL}{path}", headers=_headers(), json=payload, timeout=REQUEST_TIMEOUT_SEC
         )
     except httpx.HTTPError as exc:
-        return False, f"{type(exc).__name__}: {exc}"
+        return FAILED, f"{type(exc).__name__}: {exc}"
     if resp.status_code == 200:
-        return True, ""
+        return WRITTEN, ""
     # A duplicate is not a failure: re-running the sync must be safe.
     body = resp.text[:200]
     if resp.status_code in (400, 409) and "exist" in body.lower():
-        return False, ""
-    return False, f"HTTP {resp.status_code}: {body}"
+        return DUPLICATE, ""
+    if resp.status_code in _PERMANENT_REFUSAL:
+        return DROPPED, f"HTTP {resp.status_code}: {body}"
+    return FAILED, f"HTTP {resp.status_code}: {body}"
 
 
 def sync(conn: sqlite3.Connection | None = None) -> SyncReport:
@@ -174,13 +203,16 @@ def sync(conn: sqlite3.Connection | None = None) -> SyncReport:
                     "source_id": "|".join(sorted(data["meetings"])),
                 },
             }
-            ok, err = _post(client, "/graph/entity/create", payload)
-            if ok:
+            outcome, detail = _post(client, "/graph/entity/create", payload)
+            if outcome == WRITTEN:
                 report.entities_written += 1
+            elif outcome == DROPPED:
+                report.entities_dropped += 1
+                report.drops.append(f"entity {name}: {detail}")
             else:
                 report.entities_skipped += 1
-                if err:
-                    report.errors.append(f"entity {name}: {err}")
+                if detail:
+                    report.errors.append(f"entity {name}: {detail}")
 
         for rel in relations:
             payload = {
@@ -193,13 +225,17 @@ def sync(conn: sqlite3.Connection | None = None) -> SyncReport:
                     "source_id": rel["meeting_id"],
                 },
             }
-            ok, err = _post(client, "/graph/relation/create", payload)
-            if ok:
+            outcome, detail = _post(client, "/graph/relation/create", payload)
+            label = f"relation {rel['source']}->{rel['target']}"
+            if outcome == WRITTEN:
                 report.relations_written += 1
+            elif outcome == DROPPED:
+                report.relations_dropped += 1
+                report.drops.append(f"{label}: {detail}")
             else:
                 report.relations_skipped += 1
-                if err:
-                    report.errors.append(f"relation {rel['source']}->{rel['target']}: {err}")
+                if detail:
+                    report.errors.append(f"{label}: {detail}")
 
     return report
 

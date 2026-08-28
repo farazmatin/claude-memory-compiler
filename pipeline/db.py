@@ -42,6 +42,12 @@ CREATE TABLE IF NOT EXISTS meetings (
     template_version TEXT,
     transcript_path TEXT,
     minutes_path    TEXT,
+    -- Set when the stage failure was a network fault rather than a bad input, so
+    -- the next pipeline run can requeue it without a human reading the manifest.
+    retryable       INTEGER NOT NULL DEFAULT 0,
+    -- Auto-requeues spent on the current failure. Bounded so a real outage
+    -- cannot spin, and cleared once the meeting clears the failing stage.
+    retry_count     INTEGER NOT NULL DEFAULT 0,
     -- LightRAG's id for the indexed copy of this meeting's minutes. Required to
     -- DELETE the stale version before re-indexing a recompiled document;
     -- without it a recompile leaves the old entities in the graph forever.
@@ -368,6 +374,10 @@ class Meeting:
     error: str | None
     created_at: str
     updated_at: str
+    # Defaulted and last so callers that build a Meeting by hand - tests, and the
+    # dashboard's synthetic rows - do not have to know about the retry budget.
+    retryable: int = 0
+    retry_count: int = 0
 
     @property
     def short_id(self) -> str:
@@ -435,6 +445,10 @@ def connect(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
 #  column -> DDL. Applied to manifests created before the column existed.
 MIGRATIONS: dict[str, str] = {
     "lightrag_doc_id": "ALTER TABLE meetings ADD COLUMN lightrag_doc_id TEXT",
+    "retryable":
+        "ALTER TABLE meetings ADD COLUMN retryable INTEGER NOT NULL DEFAULT 0",
+    "retry_count":
+        "ALTER TABLE meetings ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
 }
 
 
@@ -585,7 +599,7 @@ def advance(
     allowed = {
         "audio_path", "meeting_date", "meeting_time", "title_hint", "duration_sec",
         "asr_model", "template_version", "transcript_path", "minutes_path",
-        "lightrag_doc_id", "error",
+        "lightrag_doc_id", "error", "retryable", "retry_count",
     }
     unknown = set(fields) - allowed
     if unknown:
@@ -593,6 +607,13 @@ def advance(
 
     if status != FAILED:
         fields.setdefault("error", None)
+
+    # Clearing the failing stage settles the old failure, so next month's blip
+    # starts with a full retry budget instead of this month's leftovers. A
+    # requeue back to DISCOVERED is not progress and must keep the count.
+    if status in STATUS_ORDER and status != DISCOVERED:
+        fields.setdefault("retryable", 0)
+        fields.setdefault("retry_count", 0)
 
     assignments = ", ".join(f"{k} = ?" for k in fields)
     prefix = f"{assignments}, " if assignments else ""
@@ -602,21 +623,70 @@ def advance(
     )
 
 
-def mark_failed(conn: sqlite3.Connection, meeting_id: str, error: str) -> None:
+def mark_failed(
+    conn: sqlite3.Connection,
+    meeting_id: str,
+    error: str,
+    *,
+    retryable: bool = False,
+) -> None:
     """Park a meeting with its error message.
 
     Kept out of the status ladder deliberately - a failed row is retried by
     resetting it with `reset_to`, so a transient ffmpeg or HF-token problem
     never silently loses the recording.
+
+    ``retryable`` marks a network fault rather than a bad input, which lets
+    ``requeue_transient`` pick the row up on the next run. Default False: a
+    missing file or a rejected token repeats identically forever, and
+    auto-retrying it would spin without ever producing minutes.
     """
-    advance(conn, meeting_id, FAILED, error=error[:4000])
+    advance(conn, meeting_id, FAILED, error=error[:4000], retryable=int(retryable))
+
+
+def requeue_transient(
+    conn: sqlite3.Connection, status: str, max_retries: int
+) -> list[str]:
+    """Rewind network-failed meetings to `status`, within their retry budget.
+
+    Recovery used to depend on a person reading the manifest and running
+    `pipeline retry`: six recordings sat parked at FAILED for a day with no
+    minutes compiled. Bounded by `max_retries` so a genuine multi-day outage
+    still comes to rest at FAILED where `pipeline status` reports it.
+    """
+    if status not in STATUS_ORDER:
+        raise ValueError(f"Not a pipeline status: {status}")
+
+    rows = conn.execute(
+        """
+        SELECT id FROM meetings
+        WHERE status = ? AND retryable = 1 AND retry_count < ?
+        ORDER BY meeting_date IS NULL, meeting_date, meeting_time, created_at
+        """,
+        (FAILED, max_retries),
+    ).fetchall()
+
+    requeued: list[str] = []
+    for row in rows:
+        conn.execute(
+            "UPDATE meetings SET retry_count = retry_count + 1 WHERE id = ?",
+            (row["id"],),
+        )
+        advance(conn, row["id"], status)
+        requeued.append(row["id"])
+    return requeued
 
 
 def reset_to(conn: sqlite3.Connection, meeting_id: str, status: str) -> None:
-    """Rewind a meeting so a stage will pick it up again."""
+    """Rewind a meeting so a stage will pick it up again.
+
+    Restores the auto-requeue budget: every caller is a person deciding to retry
+    - `pipeline retry`, or a dashboard review action - and they have usually just
+    fixed the cause, so the row should not inherit a budget spent unattended.
+    """
     if status not in STATUS_ORDER:
         raise ValueError(f"Not a pipeline status: {status}")
-    advance(conn, meeting_id, status)
+    advance(conn, meeting_id, status, retryable=0, retry_count=0)
 
 
 def queue_minutes_refresh(conn: sqlite3.Connection, meeting_ids: list[str]) -> int:

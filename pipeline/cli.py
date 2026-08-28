@@ -45,6 +45,7 @@ from pipeline import (
     speakers,
 )
 from pipeline.config import (
+    AUTO_REQUEUE_LIMIT,
     DASHBOARD_HOST,
     DASHBOARD_PORT,
     MIN_MEETING_SEC,
@@ -209,6 +210,20 @@ def cmd_capture(args: argparse.Namespace) -> int:
 
 # ── Stage runners ─────────────────────────────────────────────────────
 
+def _is_transient(exc: BaseException) -> bool:
+    """Is this failure worth requeueing on the next run?
+
+    Only network faults. A rejected token, a missing file, or a malformed
+    transcript fails identically every time, and requeueing one would spin every
+    run forever without ever producing minutes.
+    """
+    import httpx
+
+    if getattr(exc, "transient", False):
+        return True
+    return isinstance(exc, httpx.TransportError | TimeoutError | ConnectionError)
+
+
 def cmd_transcribe(args: argparse.Namespace) -> int:
     """ASR + alignment + diarization. The expensive stage."""
     from pipeline import asr
@@ -286,7 +301,7 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
                 traceback.print_exc()
             with db.connect() as conn:
                 db.finish_stage(conn, run_id, False, detail)
-                db.mark_failed(conn, meeting.id, detail)
+                db.mark_failed(conn, meeting.id, detail, retryable=_is_transient(exc))
 
     print(f"\nTranscribed {len(queue) - failures}/{len(queue)}.")
     return 1 if failures and not args.keep_going else 0
@@ -472,6 +487,10 @@ def cmd_graph_sync(args: argparse.Namespace) -> int:
     print(report.summary())
     for err in report.errors[:10]:
         print(f"  {err[:160]}")
+    # Dropped records are not failures, but they are data the graph will never
+    # hold. Print them so a junk extraction stays visible instead of silent.
+    for drop in report.drops[:10]:
+        print(f"  dropped {drop[:160]}")
     after = len(graph_sync.graph_labels())
     print(f"graph holds {after} entities after sync")
     if not after:
@@ -698,6 +717,20 @@ def _run_all(args: argparse.Namespace, include_ingest: bool = True) -> int:
     Returns non-zero if any stage failed. The command is deliberately
     operator-started, so failure remains visible to the person who requested it.
     """
+    db.init_db()
+
+    # A meeting parked by a dropped upload is invisible to every later stage:
+    # `pending(DISCOVERED)` skips FAILED rows, so the run reports "Nothing to
+    # transcribe" and no minutes are ever compiled. Spend one retry from its
+    # budget here instead of waiting for someone to read the manifest.
+    with db.connect() as conn:
+        requeued = db.requeue_transient(conn, db.DISCOVERED, AUTO_REQUEUE_LIMIT)
+    if requeued:
+        print(
+            f"Requeued {len(requeued)} meeting(s) that failed on a network fault: "
+            + ", ".join(m[:12] for m in requeued)
+        )
+
     stages: list[tuple[str, object, argparse.Namespace]] = []
     if include_ingest:
         stages.append(("capture", cmd_capture, argparse.Namespace(dry_run=False, complete_backfill=False)))
