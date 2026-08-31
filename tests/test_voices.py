@@ -407,6 +407,102 @@ def test_rematch_ignores_resolved_labels(manifest):
     assert voices.rematch_pending(manifest, MODEL) == 0
 
 
+# ── Auto-apply ────────────────────────────────────────────────────────
+#
+# Until this existed, the auto band was a flag with no consequence: the matcher
+# decided a label was safe and nothing applied it. These tests are about the
+# shape of what it writes, because writing a name nobody asked for is the one
+# thing in this module that can be wrong without erroring.
+
+def test_an_auto_band_label_gets_the_name_and_leaves_the_queue(manifest):
+    enroll(manifest, "Ali", vec(1.0, 0.0, 0.0))
+    add_pending(manifest, "meet-new", "SPEAKER_00", vec(1.0, 0.0, 0.0), speech_sec=120.0)
+    voices.rematch_pending(manifest, MODEL)
+
+    assert db.get_speakers(manifest, "meet-new") == {"SPEAKER_00": "Ali"}
+    row = db.get_speaker_match(manifest, "meet-new", "SPEAKER_00")
+    assert row["state"] == voices.STATE_RESOLVED
+    assert row["resolved_as"] == "Ali"
+    # The embedding stays: a later correction has to be able to rewrite the
+    # voiceprint through the normal forget path.
+    assert row["embedding"] is not None
+
+
+def test_an_auto_applied_name_is_inferred_not_confirmed(manifest):
+    """`confirmed` means an ear decided, and speakers.py treats it as
+    un-degradable. A machine match that claimed it would make itself
+    uncorrectable by the review flow that exists."""
+    enroll(manifest, "Ali", vec(1.0, 0.0, 0.0))
+    add_pending(manifest, "meet-new", "SPEAKER_00", vec(1.0, 0.0, 0.0), speech_sec=120.0)
+    voices.rematch_pending(manifest, MODEL)
+
+    row = manifest.execute(
+        "SELECT confidence FROM speakers WHERE meeting_id = ? AND label = ?",
+        ("meet-new", "SPEAKER_00"),
+    ).fetchone()
+    assert row["confidence"] == "inferred"
+
+
+def test_auto_apply_queues_the_minutes_for_refresh(manifest):
+    """The minutes name people. Applying a name without re-rendering them leaves
+    the archive disagreeing with the manifest."""
+    enroll(manifest, "Ali", vec(1.0, 0.0, 0.0))
+    add_pending(manifest, "meet-new", "SPEAKER_00", vec(1.0, 0.0, 0.0), speech_sec=120.0)
+    db.advance(manifest, "meet-new", db.MINUTES_COMPILED)
+
+    voices.rematch_pending(manifest, MODEL)
+
+    assert db.get_meeting(manifest, "meet-new").status == db.SPEAKERS_RESOLVED
+
+
+def test_auto_apply_refuses_when_the_transcript_pass_disagrees(manifest):
+    """Two independent signals disagreeing is information, not a tie to break."""
+    enroll(manifest, "Ali", vec(1.0, 0.0, 0.0))
+    add_pending(
+        manifest, "meet-new", "SPEAKER_00", vec(1.0, 0.0, 0.0),
+        speech_sec=120.0, band=voices.BAND_AUTO, best_canonical="Ali", llm_name="Ruth",
+    )
+
+    assert voices.apply_auto(manifest, MODEL) == []
+    assert db.get_speakers(manifest, "meet-new") == {}
+    assert db.get_speaker_match(manifest, "meet-new", "SPEAKER_00")["state"] == "pending"
+
+
+def test_auto_apply_never_overwrites_a_human_answer(manifest):
+    enroll(manifest, "Ali", vec(1.0, 0.0, 0.0))
+    add_pending(
+        manifest, "meet-new", "SPEAKER_00", vec(1.0, 0.0, 0.0),
+        speech_sec=120.0, band=voices.BAND_AUTO, best_canonical="Ali",
+    )
+    db.set_speaker(manifest, "meet-new", "SPEAKER_00", "Ruth", "confirmed")
+
+    assert voices.apply_auto(manifest, MODEL) == []
+    assert db.get_speakers(manifest, "meet-new") == {"SPEAKER_00": "Ruth"}
+
+
+def test_a_review_band_label_is_left_for_a_person(manifest):
+    """Everything short of the auto band is a question, and stays one."""
+    enroll(manifest, "Ali", vec(1.0, 0.0, 0.0))
+    add_pending(
+        manifest, "meet-new", "SPEAKER_00", vec(1.0, 0.0, 0.0),
+        speech_sec=120.0, band=voices.BAND_REVIEW, best_canonical="Ali",
+    )
+
+    assert voices.apply_auto(manifest, MODEL) == []
+    assert db.get_speakers(manifest, "meet-new") == {}
+
+
+def test_auto_apply_is_idempotent(manifest):
+    enroll(manifest, "Ali", vec(1.0, 0.0, 0.0))
+    add_pending(
+        manifest, "meet-new", "SPEAKER_00", vec(1.0, 0.0, 0.0),
+        speech_sec=120.0, band=voices.BAND_AUTO, best_canonical="Ali",
+    )
+
+    assert voices.apply_auto(manifest, MODEL) == ["meet-new"]
+    assert voices.apply_auto(manifest, MODEL) == []
+
+
 # ── Person deletion ───────────────────────────────────────────────────
 
 def test_forget_removes_every_sample(manifest):

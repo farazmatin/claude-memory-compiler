@@ -1159,6 +1159,14 @@ function promptDelete(meetingId, actionType, title) {
   modal.showModal();
 }
 
+function deleteMeetingAudio(meetingId, force) {
+  return fetch(`/api/meetings/${encodeURIComponent(meetingId)}/delete-audio`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ force }),
+  });
+}
+
 async function executePendingDelete() {
   const meetingId = $("delete-meeting-id").value;
   const actionType = $("delete-action-type").value;
@@ -1169,10 +1177,21 @@ async function executePendingDelete() {
   btn.disabled = true;
   btn.textContent = "Deleting...";
   try {
-    const res =
+    let res =
       actionType === "audio"
-        ? await fetch(`/api/meetings/${encodeURIComponent(meetingId)}/delete-audio`, { method: "POST" })
+        ? await deleteMeetingAudio(meetingId, false)
         : await fetch(`/api/meetings/${encodeURIComponent(meetingId)}`, { method: "DELETE" });
+    if (res.status === 409) {
+      // Unresolved voices still depend on this audio. Say what is lost and let
+      // the owner decide, rather than either destroying it silently or making
+      // the deletion impossible.
+      const data = await res.json().catch(() => ({}));
+      if (!confirm(`${data.error}\n\nDelete the audio anyway?`)) {
+        modal.close();
+        return;
+      }
+      res = await deleteMeetingAudio(meetingId, true);
+    }
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
       throw new Error(data.error || "Deletion failed");

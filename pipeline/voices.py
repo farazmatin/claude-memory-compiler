@@ -117,6 +117,26 @@ class Thresholds:
         )
 
 
+# ── Embedding namespace ───────────────────────────────────────────────
+
+def active_namespace(conn: sqlite3.Connection) -> str:
+    """The embedding namespace new work reads and writes.
+
+    Vectors from two different models are not comparable, so every match is
+    scoped to one namespace. The producer resolves `encoder@version` from the
+    remote provider and records it here the first time it runs; everything that
+    reads voice data - the stage, the dashboard queue, `doctor` - asks this
+    rather than assuming, so a re-pin to a new encoder starts a clean namespace
+    instead of silently scoring new vectors against old ones.
+
+    Falls back to VOICE_VECTOR_NAMESPACE, which is where the retired local
+    enroller's vectors live: a corpus with no remote producer configured keeps
+    reading exactly what it read before.
+    """
+    stored = (db.get_setting(conn, "voice.active_namespace") or "").strip()
+    return stored or VOICE_VECTOR_NAMESPACE
+
+
 @dataclass(frozen=True)
 class MatchResult:
     best: str | None = None
@@ -313,6 +333,10 @@ def rematch_pending(conn: sqlite3.Connection, model: str = VOICE_VECTOR_NAMESPAC
         if decided == BAND_AUTO and row["band"] != BAND_AUTO:
             promoted += 1
 
+    # A promotion that nobody applies is the old behaviour: the matcher decided
+    # and the name still waited on a human. Applying here is what makes effort
+    # compound without being asked for again.
+    apply_auto(conn, model)
     return promoted
 
 
@@ -449,6 +473,67 @@ def split_cluster(conn: sqlite3.Connection, cluster_id: str) -> list[str]:
 
 
 # ── Resolution ────────────────────────────────────────────────────────
+
+def apply_auto(conn: sqlite3.Connection, model: str | None = None) -> list[str]:
+    """Write the auto band's decision onto the meetings it belongs to.
+
+    Until this existed, `BAND_AUTO` was a flag with no consequence: the matcher
+    decided a label was safe to apply and then nothing applied it, so every name
+    still waited on a human. This closes that loop, and it is the only place in
+    the module that names a speaker without being asked to.
+
+    What it writes is deliberately weaker than what a person writes:
+
+      * confidence is `inferred`, never `confirmed`. `confirmed` means an ear
+        decided, and speakers.py treats that as un-degradable - an auto-applied
+        name must stay correctable by exactly the review flow that already
+        exists.
+      * the embeddings stay on the row, so a later correction rewrites the
+        voiceprint through the normal `forget` path rather than leaving a
+        poisoned print behind.
+
+    The guards are `band()`'s, not new ones: this applies what was already
+    banded. The two checks here are re-checks, because `band` is a stored column
+    and the world can move under it - a `speakers` re-run can change `llm_name`,
+    and a human can confirm a label between the banding and this call. Both
+    resolve toward leaving the row alone.
+
+    Returns the meeting ids whose minutes were queued for refresh.
+    """
+    from pipeline.speakers import CONFIDENCE_CONFIRMED, CONFIDENCE_INFERRED
+
+    namespace = model or active_namespace(conn)
+    touched: list[str] = []
+
+    for row in db.pending_matches(conn, model=namespace):
+        canonical = row["best_canonical"]
+        if row["band"] != BAND_AUTO or not canonical:
+            continue
+        # Two independent signals disagreeing is information; band() refuses on
+        # it, and so does this, in case the transcript pass ran again since.
+        if row["llm_name"] and row["llm_name"] != canonical:
+            continue
+        existing = conn.execute(
+            "SELECT confidence FROM speakers WHERE meeting_id = ? AND label = ?",
+            (row["meeting_id"], row["label"]),
+        ).fetchone()
+        if existing and existing["confidence"] == CONFIDENCE_CONFIRMED:
+            continue
+
+        db.set_speaker(conn, row["meeting_id"], row["label"], canonical, CONFIDENCE_INFERRED)
+        db.upsert_speaker_match(
+            conn,
+            row["meeting_id"],
+            row["label"],
+            state=STATE_RESOLVED,
+            resolved_as=canonical,
+        )
+        touched.append(row["meeting_id"])
+
+    if touched:
+        db.queue_minutes_refresh(conn, touched)
+    return touched
+
 
 def confirm(
     conn: sqlite3.Connection,

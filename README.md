@@ -6,8 +6,8 @@ and bounded historical context for Product Manager.
 ## Architecture
 
     Drive audio -> capture -> ingest -> Replicate transcription -> speakers
-    -> subscription-authored minutes/entities/relations -> graph-sync
-    -> bounded ContextProvider
+    -> voice embedding -> subscription-authored minutes/entities/relations
+    -> graph-sync -> bounded ContextProvider
 
 Meeting Memory owns recordings, transcripts, speaker/person resolution, minutes,
 entities, relations, graph publication, and the authenticated loopback dashboard.
@@ -25,7 +25,8 @@ retrieval but cannot establish or override Product Manager facts. See
 
 ## Providers
 
-- Replicate is the required transcription provider.
+- Replicate is the required transcription provider, and the optional
+  speaker-embedding provider. No model weights run on this machine.
 - Codex, Claude, then Antigravity subscription CLIs author minutes, speaker
   resolution, entities, relations, and answer synthesis.
 - LightRAG/Postgres store and traverse the derived graph.
@@ -63,6 +64,7 @@ If it reports authorization failure, run:
     pipeline ingest
     pipeline transcribe
     pipeline speakers --owner "Name"
+    pipeline voice
     pipeline minutes
     pipeline graph-sync
     pipeline watch --owner "Name"

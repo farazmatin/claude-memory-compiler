@@ -42,6 +42,26 @@ def test_diarization_waits_for_replicate(monkeypatch):
     assert "Replicate" in checks[0].detail
 
 
+def test_voice_embedding_off_is_reported_as_a_state_not_a_problem(monkeypatch):
+    """The configuration every install starts in. A WARN here would train the
+    owner to ignore doctor's warnings."""
+    monkeypatch.setattr(doctor, "REMOTE_VOICE_MODEL", "")
+    checks = doctor.check_voice_embedding()
+    assert [c.status for c in checks] == [doctor.OK]
+    assert "off" in checks[0].detail
+    assert "MMC_REMOTE_VOICE_MODEL" in checks[0].fix
+
+
+def test_a_voice_model_without_a_token_fails(monkeypatch):
+    """Configured but unusable is a misconfiguration, not a preference: every
+    run would pay the planning cost and fail at the call."""
+    monkeypatch.setattr(doctor, "REMOTE_VOICE_MODEL", "farazmatin/speaker-embed")
+    monkeypatch.setattr(doctor, "REPLICATE_API_TOKEN", "")
+    checks = doctor.check_voice_embedding()
+    assert checks[0].status == doctor.FAIL
+    assert "REPLICATE_API_TOKEN" in checks[0].detail
+
+
 def test_replicate_diarization_check(monkeypatch):
     monkeypatch.setattr(doctor, "REPLICATE_API_TOKEN", "r8_fake")
     checks = doctor.check_diarization()

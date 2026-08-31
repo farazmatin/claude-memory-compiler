@@ -38,6 +38,7 @@ from pipeline.config import (
     INBOX_DIR,
     MINUTES_DIR,
     OWNER_NAME,
+    REMOTE_VOICE_MODEL,
     SNIPPET_SEC,
     SNIPPETS_DIR,
     TEMPLATE_VERSION,
@@ -435,7 +436,10 @@ def get_voice_clusters() -> list[dict[str, Any]]:
     """Return pending voice review clusters with member meeting details."""
     db.init_db()
     with db.connect() as conn:
-        voices.cluster_pending(conn)
+        # Cluster the namespace the producer is actually writing, not the
+        # module default: a re-pin to a new encoder would otherwise rebuild the
+        # queue from the retired vectors and show cards nobody can act on.
+        voices.cluster_pending(conn, model=voices.active_namespace(conn))
         clusters = db.pending_clusters(conn)
 
         result = []
@@ -1117,13 +1121,87 @@ def export_product_manager() -> dict[str, Any]:
     return {"ok": True, "synced": synced, "quarantined_personal": quarantined}
 
 
-def delete_meeting_audio(meeting_id: str) -> bool:
-    """Delete a meeting's local audio while preserving its compiled archive."""
+class AudioEvidenceInUse(RuntimeError):
+    """Raised when deleting audio would destroy the only evidence for a voice.
+
+    Report, do not destroy - the same rule the merge workflow follows for a
+    missing file.
+    """
+
+    def __init__(self, labels: list[str]) -> None:
+        self.labels = labels
+        super().__init__(
+            f"{len(labels)} unresolved speaker(s) still need this audio: "
+            f"{', '.join(labels)}. Embedding or clipping them first keeps them "
+            f"labellable after the audio is gone."
+        )
+
+
+def audio_evidence_gaps(conn, meeting_id: str) -> list[str]:
+    """Unresolved labels that would become unanswerable if the audio went now.
+
+    A voice card is built from two things cut from the source audio: the
+    embedding that matches a person across meetings, and the clips a human
+    listens to. Both are produced once, by the voice stage, and the audio is the
+    only place either can come from. Deleting it first does not degrade the
+    card - it removes the possibility of ever having one.
+
+    Only unresolved labels count. A label a person already named needs no card,
+    and one the voice stage enrolled from a confirmed name keeps its vector
+    whether or not clips were ever cut for it.
+
+    Empty when no embedding provider is configured: with the stage off there is
+    no future card to protect, and refusing would break a deletion that has
+    always been allowed.
+    """
+    if not REMOTE_VOICE_MODEL:
+        return []
+
+    namespace = voices.active_namespace(conn)
+    rows = conn.execute(
+        """
+        SELECT s.label, s.name, s.confidence,
+               m.embedding, m.model, m.snippet_paths, m.state
+        FROM speakers s
+        LEFT JOIN speaker_matches m
+               ON m.meeting_id = s.meeting_id AND m.label = s.label
+        WHERE s.meeting_id = ?
+        ORDER BY s.label
+        """,
+        (meeting_id,),
+    ).fetchall()
+
+    gaps: list[str] = []
+    for row in rows:
+        if row["confidence"] == "confirmed" and row["name"]:
+            continue
+        if row["state"] in (voices.STATE_RESOLVED, voices.STATE_DISMISSED):
+            continue
+        embedded = row["embedding"] is not None and row["model"] == namespace
+        try:
+            snippets = json.loads(row["snippet_paths"] or "[]")
+        except (TypeError, ValueError):
+            snippets = []
+        if not embedded or not snippets:
+            gaps.append(row["label"])
+    return gaps
+
+
+def delete_meeting_audio(meeting_id: str, *, force: bool = False) -> bool:
+    """Delete a meeting's local audio while preserving its compiled archive.
+
+    Refuses while unresolved voices still depend on that audio, unless the caller
+    says explicitly to go ahead anyway.
+    """
     db.init_db()
     with db.connect() as conn:
         meeting = db.get_meeting(conn, meeting_id)
         if not meeting:
             return False
+        if not force:
+            gaps = audio_evidence_gaps(conn, meeting_id)
+            if gaps:
+                raise AudioEvidenceInUse(gaps)
         audio_path = Path(meeting.audio_path) if meeting.audio_path else None
         if audio_path and audio_path.is_file():
             audio_path.unlink()
@@ -1593,7 +1671,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if path.startswith("/api/meetings/") and path.endswith("/delete-audio"):
             meeting_id = path.split("/")[3]
-            if delete_meeting_audio(meeting_id):
+            try:
+                payload = self._payload()
+            except ValueError:
+                payload = {}
+            try:
+                deleted = delete_meeting_audio(meeting_id, force=bool(payload.get("force")))
+            except AudioEvidenceInUse as exc:
+                self._json(
+                    HTTPStatus.CONFLICT,
+                    {"error": str(exc), "labels": exc.labels, "override": "force"},
+                )
+                return
+            if deleted:
                 self._json(HTTPStatus.OK, {"meeting_id": meeting_id, "deleted": "audio"})
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "Meeting not found."})

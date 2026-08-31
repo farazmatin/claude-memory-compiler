@@ -147,9 +147,39 @@ VOICE_MIN_ENROLL_MEETINGS = int(os.environ.get("MMC_VOICE_MIN_ENROLL_MEETINGS", 
 # auto-match threshold: a contaminated cluster enrolls a poisoned voiceprint from
 # a single confirmation, which is the most damaging wrong answer available.
 VOICE_CLUSTER_THRESHOLD = float(os.environ.get("MMC_VOICE_CLUSTER", "0.72"))
-# Existing vector records are retained for audit only. New enrollment is retired,
-# so the active namespace deliberately contains no locally generated vectors.
+# Fallback namespace, and the quarantine for the vectors the retired local
+# enroller produced. Vectors from different models are not comparable, so every
+# read and write is namespaced; the ACTIVE namespace is `encoder@version`,
+# resolved from the remote provider and stored in the manifest as
+# `voice.active_namespace` (see voices.active_namespace). This value is what a
+# corpus with no remote producer configured still reads, so the retired vectors
+# stay inspectable without ever being mixed into new matching.
 VOICE_VECTOR_NAMESPACE = os.environ.get("MMC_VOICE_VECTOR_NAMESPACE", "historical")
+
+# ── Remote voice embedding ────────────────────────────────────────────
+# The producer for everything above. Embeddings are generated on Replicate, like
+# transcription: this repository never loads speaker-embedding weights locally.
+#
+# A second paid provider is added explicitly, never silently. Left unset, the
+# voice stage no-ops and the pipeline is exactly the pipeline without it.
+REMOTE_VOICE_MODEL = os.environ.get("MMC_REMOTE_VOICE_MODEL", "").strip()
+# Pinned by version hash once the benchmark picks an encoder. Left unset, the
+# stage resolves the model's current version and namespaces its vectors by
+# whatever it actually ran - a namespace that misreports which weights produced a
+# vector is worse than no namespace at all.
+REMOTE_VOICE_VERSION = os.environ.get("MMC_REMOTE_VOICE_VERSION", "").strip()
+# Which encoder the model serves. Three ship behind one interface; the winner is
+# chosen by a benchmark against human-confirmed labels, not by reputation.
+REMOTE_VOICE_ENCODER = os.environ.get(
+    "MMC_REMOTE_VOICE_ENCODER", "wespeaker-resnet34-lm"
+).strip()
+REMOTE_VOICE_TIMEOUT_SEC = float(os.environ.get("MMC_REMOTE_VOICE_TIMEOUT", "900"))
+REMOTE_VOICE_POLL_INTERVAL_SEC = float(os.environ.get("MMC_REMOTE_VOICE_POLL", "3"))
+# Bounds how much of one label's audio is sent for embedding. A recurring
+# colleague can speak for twenty minutes in a planning meeting; the model needs a
+# robust sample, not the whole thing, and VOICE_MIN_SPEECH_SEC is already the
+# floor for that. Taken in chronological order from the label's own regions.
+VOICE_MAX_EMBED_SEC = float(os.environ.get("MMC_VOICE_MAX_EMBED_SEC", "90"))
 
 # Retained voice clips, so speakers stay labellable by ear after the source audio
 # is deleted. ~30 KB per speaker against 2-4 MB per audio-hour.
@@ -170,6 +200,10 @@ SNIPPET_MIN_WORD_COVERAGE = 0.5
 # Minimum separation between chosen clips, so three clips are not three slices of
 # one sentence.
 SNIPPET_MIN_SEPARATION_SEC = 60.0
+# Opus: the format the per-speaker budget above is written against - small clips
+# that still sound like speech.
+SNIPPET_EXT = ".opus"
+SNIPPET_BITRATE = "24k"
 
 ALL_DIRS.append(SNIPPETS_DIR)
 

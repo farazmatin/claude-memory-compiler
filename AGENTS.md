@@ -21,17 +21,31 @@ Run processing on demand with:
 uv run pipeline run --owner "Faraz"
 ```
 
-The supported transcription backend is Replicate. Codex, Claude, and Antigravity
-subscription CLIs author minutes, speaker resolution, entities, relations, and
-answer synthesis. LightRAG/Postgres store and traverse the derived graph.
+The supported transcription backend is Replicate, which is also the supported
+speaker-embedding backend. No model weights are loaded on this machine. Codex,
+Claude, and Antigravity subscription CLIs author minutes, speaker resolution,
+entities, relations, and answer synthesis. LightRAG/Postgres store and traverse
+the derived graph.
 
 The sequence is:
 
 ```text
 Drive audio -> capture -> ingest -> Replicate transcription -> speakers
--> subscription-authored minutes/entities/relations -> graph-sync
--> bounded ContextProvider
+-> voice embedding -> subscription-authored minutes/entities/relations
+-> graph-sync -> bounded ContextProvider
 ```
+
+Voice embedding is off unless `MMC_REMOTE_VOICE_MODEL` is set, and it joins
+`run`/`watch` only once the manifest setting `voice.stage_in_run` is on. Until
+then it runs explicitly:
+
+```powershell
+uv run pipeline voice
+```
+
+A voice match is applied only when every guard in `voices.band()` passes, and it
+is written with confidence `inferred` so the existing review workflow can correct
+it. Everything else becomes a review card.
 
 ## Context contract
 

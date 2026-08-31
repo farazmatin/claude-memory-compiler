@@ -35,6 +35,8 @@ from pipeline.config import (
     LIGHTRAG_URL,
     LLM_PROVIDER_ORDER,
     MINUTES_DIR,
+    REMOTE_VOICE_ENCODER,
+    REMOTE_VOICE_MODEL,
     REPLICATE_API_TOKEN,
     REPLICATE_MODEL,
     TRANSCRIPTS_DIR,
@@ -133,6 +135,110 @@ def check_diarization() -> list[Check]:
     if not REPLICATE_API_TOKEN:
         return [Check("diarization", WARN, "unavailable until Replicate is configured")]
     return [Check("diarization", OK, "supplied remotely with transcription")]
+
+
+def check_voice_embedding() -> list[Check]:
+    """The optional second Replicate provider: speaker embeddings.
+
+    Report-only, and deliberately not a prediction. It says whether the model id
+    resolves with the token this machine holds; whether the encoder is any good
+    at telling these particular people apart is a benchmark question, and no
+    preflight can answer it.
+    """
+    if not REMOTE_VOICE_MODEL:
+        return [
+            Check(
+                "voice embedding",
+                OK,
+                "off - names are resolved per meeting and do not carry across",
+                "set MMC_REMOTE_VOICE_MODEL to enable voice labelling",
+            )
+        ]
+    if not REPLICATE_API_TOKEN:
+        return [
+            Check(
+                "voice embedding",
+                FAIL,
+                f"{REMOTE_VOICE_MODEL} is configured but REPLICATE_API_TOKEN is unset",
+                "add REPLICATE_API_TOKEN=r8_... to .env, or unset MMC_REMOTE_VOICE_MODEL",
+            )
+        ]
+
+    checks: list[Check] = []
+    try:
+        import httpx
+
+        resp = httpx.get(
+            f"https://api.replicate.com/v1/models/{REMOTE_VOICE_MODEL}",
+            headers={"Authorization": f"Bearer {REPLICATE_API_TOKEN}"},
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            version = (resp.json().get("latest_version") or {}).get("id", "")
+            checks.append(
+                Check(
+                    "voice embedding",
+                    OK,
+                    f"{REMOTE_VOICE_MODEL} ({REMOTE_VOICE_ENCODER}) resolves"
+                    + (f" at {version[:12]}" if version else ""),
+                )
+            )
+        elif resp.status_code == 404:
+            checks.append(
+                Check(
+                    "voice embedding",
+                    FAIL,
+                    f"{REMOTE_VOICE_MODEL} not found or not visible to this token",
+                    "check MMC_REMOTE_VOICE_MODEL, and that the token can see a private model",
+                )
+            )
+        else:
+            checks.append(
+                Check(
+                    "voice embedding",
+                    FAIL,
+                    f"Replicate rejected the lookup ({resp.status_code}): {resp.text[:60]}",
+                    "check REPLICATE_API_TOKEN at replicate.com/account/api-tokens",
+                )
+            )
+    except Exception as exc:
+        checks.append(
+            Check(
+                "voice embedding",
+                WARN,
+                f"{REMOTE_VOICE_MODEL} configured; connectivity check failed ({exc})",
+                "verify internet access to api.replicate.com",
+            )
+        )
+
+    # Which namespace new vectors land in, and whether the unattended loop runs
+    # the stage at all. Both are stored decisions, and neither is discoverable
+    # from the environment alone.
+    try:
+        with db.connect() as conn:
+            namespace = db.get_setting(conn, "voice.active_namespace")
+            in_run = (db.get_setting(conn, "voice.stage_in_run") or "").strip().lower()
+    except Exception as exc:
+        return [*checks, Check("voice namespace", WARN, f"manifest unreadable ({exc})")]
+
+    checks.append(
+        Check(
+            "voice namespace",
+            OK,
+            namespace or "not yet resolved - set on the stage's first run",
+        )
+    )
+    checks.append(
+        Check(
+            "voice in run/watch",
+            OK,
+            "yes" if in_run in ("1", "true", "on", "yes")
+            else "no - runs only as `pipeline voice`",
+            "" if in_run in ("1", "true", "on", "yes")
+            else "flip voice.stage_in_run in pipeline_settings once the cards look right",
+        )
+    )
+    return checks
 
 
 def check_providers() -> list[Check]:
@@ -467,6 +573,7 @@ ALL_CHECKS = (
     check_ffmpeg,
     check_asr,
     check_diarization,
+    check_voice_embedding,
     check_providers,
     check_dashboard_auth,
     check_alerting,

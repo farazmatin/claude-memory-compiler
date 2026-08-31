@@ -25,7 +25,7 @@ cross-repository writes.
 
     Google Drive audio
       -> capture -> ingest -> Replicate transcription -> speaker resolution
-      -> subscription-authored minutes, entities, and relations
+      -> voice embedding -> subscription-authored minutes, entities, and relations
       -> graph-sync -> bounded ContextProvider -> Product Manager background
 
 The watcher polls the approved private Drive folder every 60 seconds and starts
@@ -42,11 +42,41 @@ For a one-time operational catch-up (including the current queue):
 
     uv run pipeline watch --owner "Faraz" --catch-up
 
+## Voice identity
+
+Diarization separates voices inside one recording; it does not carry a name from
+one recording to the next. The voice stage embeds each diarization label's own
+speech remotely and matches it against the people already enrolled, so a person
+named once by ear is labelled automatically thereafter:
+
+    uv run pipeline voice
+
+It runs after speaker resolution, because the transcript pass's guess is consumed
+as a veto signal - a voice match that contradicts it is queued for review rather
+than applied. An auto-applied name is written with confidence `inferred`, never
+`confirmed`, so it stays correctable through the review workflow that already
+exists. Everything short of the auto band becomes a review card in the dashboard.
+
+Two gates keep the paid call deliberate. The stage no-ops entirely while
+`MMC_REMOTE_VOICE_MODEL` is unset, and it joins `run`/`watch` only once the
+manifest setting `voice.stage_in_run` is switched on; until then it runs as an
+explicit command. `--no-voice` skips it for a single invocation, and `doctor`
+reports the model, the active namespace, and whether the unattended loop includes
+it.
+
+Vectors are namespaced by `encoder@version`. Two encoders produce incomparable
+vectors, so re-pinning starts a clean namespace rather than scoring new vectors
+against old ones. Deleting a meeting's audio is refused while an unresolved
+speaker still needs it for an embedding or clips, with an explicit override.
+
 ## Provider policy
 
-Replicate is the sole transcription provider. Codex, Claude, and Antigravity
-subscription CLIs author minutes, speaker resolution, entities, relations, and
-answer synthesis. LightRAG backed by Postgres stores and traverses the
+Replicate is the sole transcription provider, and the sole speaker-embedding
+provider. No ASR, alignment, diarization, or speaker-embedding weights are ever
+loaded on this machine; local audio handling is limited to ffmpeg decode, clip
+cutting, and upload normalization. Codex, Claude, and Antigravity subscription
+CLIs author minutes, speaker resolution, entities, relations, and answer
+synthesis. LightRAG backed by Postgres stores and traverses the
 subscription-authored graph; it does not author facts.
 
 ## Context contract
@@ -92,6 +122,7 @@ uv run ruff check . for broad Python validation.
 
 - Keep callers behind the bounded ContextProvider seam.
 - Do not add direct Product Manager reads of Meeting Memory files or Postgres.
-- Do not silently substitute a different transcription provider.
+- Do not silently substitute a different transcription or embedding provider.
+- Do not load model weights locally; every model runs remotely.
 - Do not hand-edit generated minutes, graph, or merge state.
 - Merge repair remains preview-first and digest-bound.

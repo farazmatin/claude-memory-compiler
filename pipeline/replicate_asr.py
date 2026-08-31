@@ -112,6 +112,164 @@ def normalize_audio_for_upload(src: Path, dest: Path) -> Path:
     )
 
 
+TOKEN_HELP = (
+    "REPLICATE_API_TOKEN is unset. Add your Replicate token to .env: "
+    "REPLICATE_API_TOKEN=r8_..."
+)
+
+
+# ── Shared transport ──────────────────────────────────────────────────
+#
+# Upload, submit and poll are the same three calls for every Replicate model,
+# and the retry policy below was measured, not guessed (see
+# REPLICATE_UPLOAD_ATTEMPTS). A second provider re-implementing it would drift
+# from it, so it lives here once and both providers call it.
+
+def api_headers(api_token: str) -> dict[str, str]:
+    if not (api_token or "").strip():
+        raise ReplicateError(TOKEN_HELP)
+    return {
+        "Authorization": f"Bearer {api_token.strip()}",
+        "User-Agent": "meeting-minutes-compiler/1.0",
+    }
+
+
+def upload_file(client: httpx.Client, headers: dict[str, str], audio_path: Path) -> str:
+    """Upload audio to Replicate's temporary files store, retrying on network error.
+
+    Retry hard rather than briefly. Large bodies are reset mid-transfer at a rate
+    that climbs with payload size (see the measurements on
+    ``REPLICATE_UPLOAD_ATTEMPTS``), so a long recording can lose several attempts
+    in a row on an otherwise healthy connection. Giving up early parks the
+    meeting at ``failed`` and no minutes are ever compiled for it.
+    """
+    upload_url = f"{REPLICATE_API_BASE}/files"
+    last_exc: Exception | None = None
+    attempts = max(1, REPLICATE_UPLOAD_ATTEMPTS)
+
+    for attempt in range(1, attempts + 1):
+        try:
+            with open(audio_path, "rb") as f:
+                files = {
+                    "content": (
+                        audio_path.name, f, upload_content_type(audio_path),
+                    )
+                }
+                resp = client.post(
+                    upload_url,
+                    headers=headers,
+                    files=files,
+                    timeout=300.0,
+                )
+
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                file_url = data.get("urls", {}).get("get") or data.get("url")
+                if file_url:
+                    return str(file_url)
+
+            if resp.status_code == 429:
+                retry_after = int(resp.json().get("retry_after", 8))
+                print(f"    rate limited on upload, waiting {retry_after}s...")
+                time.sleep(retry_after + 1)
+                continue
+
+            raise ReplicateError(
+                f"Failed to upload audio to Replicate ({resp.status_code}): {resp.text}"
+            )
+        except (httpx.RemoteProtocolError, httpx.NetworkError, httpx.TimeoutException) as exc:
+            last_exc = exc
+            if attempt < attempts:
+                delay = min(
+                    REPLICATE_UPLOAD_BACKOFF_SEC * (2 ** (attempt - 1)),
+                    REPLICATE_UPLOAD_BACKOFF_MAX_SEC,
+                )
+                print(
+                    f"    upload network retry ({attempt}/{attempts}), "
+                    f"waiting {delay:.0f}s..."
+                )
+                time.sleep(delay)
+
+    raise ReplicateError(
+        f"Audio upload failed after {attempts} attempts: {last_exc}",
+        transient=True,
+    )
+
+
+def submit_prediction(
+    client: httpx.Client, headers: dict[str, str], payload: dict[str, Any]
+) -> dict[str, Any]:
+    """POST one prediction, absorbing rate limits."""
+    create_url = f"{REPLICATE_API_BASE}/predictions"
+    post_headers = {**headers, "Content-Type": "application/json"}
+
+    for _attempt in range(1, 4):
+        resp = client.post(create_url, headers=post_headers, json=payload, timeout=30.0)
+        if resp.status_code in (200, 201):
+            return resp.json()
+
+        if resp.status_code == 429:
+            retry_after = int(resp.json().get("retry_after", 8))
+            print(f"    rate limited by Replicate, waiting {retry_after}s...")
+            time.sleep(retry_after + 1)
+            continue
+
+        raise ReplicateError(
+            f"Failed to create Replicate prediction ({resp.status_code}): {resp.text}"
+        )
+
+    raise ReplicateError("Replicate prediction creation rate limited after retries")
+
+
+def poll_prediction(
+    client: httpx.Client,
+    headers: dict[str, str],
+    prediction_id: str,
+    *,
+    timeout_sec: float,
+    poll_interval_sec: float,
+) -> dict[str, Any]:
+    """Poll one prediction until it completes, or cancel it at the timeout."""
+    poll_url = f"{REPLICATE_API_BASE}/predictions/{prediction_id}"
+    start_time = time.time()
+
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed > timeout_sec:
+            with contextlib.suppress(Exception):
+                client.post(f"{poll_url}/cancel", headers=headers, timeout=10.0)
+            raise TimeoutError(
+                f"Replicate prediction {prediction_id} timed out after {timeout_sec:.0f}s"
+            )
+
+        resp = client.get(poll_url, headers=headers, timeout=30.0)
+        if resp.status_code != 200:
+            raise ReplicateError(
+                f"Failed to poll prediction {prediction_id} ({resp.status_code}): {resp.text}"
+            )
+
+        data = resp.json()
+        status = data.get("status")
+
+        if status == "succeeded":
+            return data
+        if status in ("failed", "canceled"):
+            error_msg = data.get("error") or f"Prediction ended with status: {status}"
+            raise ReplicateError(f"Replicate prediction failed: {error_msg}")
+
+        time.sleep(poll_interval_sec)
+
+
+def prediction_output(client: httpx.Client, data: dict[str, Any]) -> Any:
+    """A prediction's output, following the URL form some models return."""
+    raw_output = data.get("output")
+    if isinstance(raw_output, str) and raw_output.startswith("http"):
+        out_resp = client.get(raw_output, timeout=60.0)
+        out_resp.raise_for_status()
+        return out_resp.json()
+    return raw_output
+
+
 class ReplicateBackend:
     """Serverless GPU transcription via Replicate."""
 
@@ -140,15 +298,7 @@ class ReplicateBackend:
         self._cached_version: str | None = None
 
     def _headers(self) -> dict[str, str]:
-        if not self.api_token:
-            raise ReplicateError(
-                "REPLICATE_API_TOKEN is unset. Add your Replicate token to .env: "
-                "REPLICATE_API_TOKEN=r8_..."
-            )
-        return {
-            "Authorization": f"Bearer {self.api_token}",
-            "User-Agent": "meeting-minutes-compiler/1.0",
-        }
+        return api_headers(self.api_token)
 
     def _resolve_version(self, client: httpx.Client) -> str:
         """Resolve model version hash from model name or cache."""
@@ -174,72 +324,13 @@ class ReplicateBackend:
         return DEFAULT_VERSION
 
     def _upload_file(self, client: httpx.Client, audio_path: Path) -> str:
-        """Upload audio to Replicate's temporary files store with retry on network error.
-
-        Retry hard rather than briefly. Large bodies are reset mid-transfer at a
-        rate that climbs with payload size (see the measurements on
-        ``REPLICATE_UPLOAD_ATTEMPTS``), so a long recording can lose several
-        attempts in a row on an otherwise healthy connection. Giving up early
-        parks the meeting at ``failed`` and no minutes are ever compiled for it.
-        """
-        upload_url = f"{REPLICATE_API_BASE}/files"
-        last_exc: Exception | None = None
-        attempts = max(1, REPLICATE_UPLOAD_ATTEMPTS)
-
-        for attempt in range(1, attempts + 1):
-            try:
-                with open(audio_path, "rb") as f:
-                    files = {
-                        "content": (
-                            audio_path.name, f, upload_content_type(audio_path),
-                        )
-                    }
-                    resp = client.post(
-                        upload_url,
-                        headers=self._headers(),
-                        files=files,
-                        timeout=300.0,
-                    )
-
-                if resp.status_code in (200, 201):
-                    data = resp.json()
-                    file_url = data.get("urls", {}).get("get") or data.get("url")
-                    if file_url:
-                        return str(file_url)
-
-                if resp.status_code == 429:
-                    retry_after = int(resp.json().get("retry_after", 8))
-                    print(f"    rate limited on upload, waiting {retry_after}s...")
-                    time.sleep(retry_after + 1)
-                    continue
-
-                raise ReplicateError(
-                    f"Failed to upload audio to Replicate ({resp.status_code}): {resp.text}"
-                )
-            except (httpx.RemoteProtocolError, httpx.NetworkError, httpx.TimeoutException) as exc:
-                last_exc = exc
-                if attempt < attempts:
-                    delay = min(
-                        REPLICATE_UPLOAD_BACKOFF_SEC * (2 ** (attempt - 1)),
-                        REPLICATE_UPLOAD_BACKOFF_MAX_SEC,
-                    )
-                    print(
-                        f"    upload network retry ({attempt}/{attempts}), "
-                        f"waiting {delay:.0f}s..."
-                    )
-                    time.sleep(delay)
-
-        raise ReplicateError(
-            f"Audio upload failed after {attempts} attempts: {last_exc}",
-            transient=True,
-        )
+        return upload_file(client, self._headers(), audio_path)
 
     def _create_prediction(
         self, client: httpx.Client, audio_url: str, initial_prompt: str
     ) -> dict[str, Any]:
         """Submit an ASR prediction job to Replicate with rate-limit handling."""
         version_id = self._resolve_version(client)
-        create_url = f"{REPLICATE_API_BASE}/predictions"
 
         input_payload: dict[str, Any] = {
             "audio_file": audio_url,
@@ -259,66 +350,23 @@ class ReplicateBackend:
         if REMOTE_ASR_HF_TOKEN:
             input_payload["huggingface_access_token"] = REMOTE_ASR_HF_TOKEN
 
-        payload = {"version": version_id, "input": input_payload}
-        headers = {**self._headers(), "Content-Type": "application/json"}
-
-        for _attempt in range(1, 4):
-            resp = client.post(create_url, headers=headers, json=payload, timeout=30.0)
-            if resp.status_code in (200, 201):
-                return resp.json()
-
-            if resp.status_code == 429:
-                retry_after = int(resp.json().get("retry_after", 8))
-                print(f"    rate limited by Replicate, waiting {retry_after}s...")
-                time.sleep(retry_after + 1)
-                continue
-
-            raise ReplicateError(
-                f"Failed to create Replicate prediction ({resp.status_code}): {resp.text}"
-            )
-
-        raise ReplicateError("Replicate prediction creation rate limited after retries")
+        return submit_prediction(
+            client, self._headers(), {"version": version_id, "input": input_payload}
+        )
 
     def _poll_prediction(self, client: httpx.Client, prediction_id: str) -> dict[str, Any]:
-        """Poll prediction until completion or timeout."""
-        poll_url = f"{REPLICATE_API_BASE}/predictions/{prediction_id}"
-        headers = self._headers()
-        start_time = time.time()
-        interval = self.poll_interval_sec
-
-        while True:
-            elapsed = time.time() - start_time
-            if elapsed > self.timeout_sec:
-                with contextlib.suppress(Exception):
-                    client.post(f"{poll_url}/cancel", headers=headers, timeout=10.0)
-                raise TimeoutError(
-                    f"Replicate prediction {prediction_id} timed out after {self.timeout_sec:.0f}s"
-                )
-
-            resp = client.get(poll_url, headers=headers, timeout=30.0)
-            if resp.status_code != 200:
-                raise ReplicateError(
-                    f"Failed to poll prediction {prediction_id} ({resp.status_code}): {resp.text}"
-                )
-
-            data = resp.json()
-            status = data.get("status")
-
-            if status == "succeeded":
-                return data
-            if status in ("failed", "canceled"):
-                error_msg = data.get("error") or f"Prediction ended with status: {status}"
-                raise ReplicateError(f"Replicate prediction failed: {error_msg}")
-
-            time.sleep(interval)
+        return poll_prediction(
+            client,
+            self._headers(),
+            prediction_id,
+            timeout_sec=self.timeout_sec,
+            poll_interval_sec=self.poll_interval_sec,
+        )
 
     def transcribe(self, audio_path: Path, meeting_id: str, initial_prompt: str) -> Transcript:
         """Transcribe meeting audio using Replicate GPU worker."""
         if not self.api_token:
-            raise ReplicateError(
-                "REPLICATE_API_TOKEN is unset. Add your Replicate token to .env: "
-                "REPLICATE_API_TOKEN=r8_..."
-            )
+            raise ReplicateError(TOKEN_HELP)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             # 1. Compress to a small 16 kHz mono body for fast, reliable upload
@@ -351,11 +399,7 @@ class ReplicateBackend:
                     if last_pred_error:
                         raise last_pred_error
 
-                raw_output = (result_data or {}).get("output")
-                if isinstance(raw_output, str) and raw_output.startswith("http"):
-                    out_resp = client.get(raw_output, timeout=60.0)
-                    out_resp.raise_for_status()
-                    raw_output = out_resp.json()
+                raw_output = prediction_output(client, result_data or {})
 
                 if not isinstance(raw_output, dict):
                     raw_output = {"segments": raw_output if isinstance(raw_output, list) else []}

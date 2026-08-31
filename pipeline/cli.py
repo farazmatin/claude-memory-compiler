@@ -11,6 +11,7 @@ minutes compilation loses minutes of work rather than hours.
     pipeline ingest                discover + dedup new audio
     pipeline transcribe            ASR + align + diarize      (the expensive one)
     pipeline speakers              resolve SPEAKER_xx -> names
+    pipeline voice                 embed voices so names carry across meetings
     pipeline minutes               compile structured minutes
     pipeline graph-sync            publish subscription-authored graph records
     pipeline graph-sync            author the graph from the manifest
@@ -60,8 +61,14 @@ from pipeline.config import (
 # Stage names as recorded in stage_runs, for timing analysis.
 STAGE_TRANSCRIBE = "transcribe"
 STAGE_SPEAKERS = "speakers"
+STAGE_VOICE = "voice"
 STAGE_MINUTES = "minutes"
 STAGE_INDEX = "index"
+
+# The voice stage joins `run`/`watch` only once this manifest setting is on.
+# Explicit-first: a new paid provider proves itself under `pipeline voice`, with
+# the owner watching the cards it produces, before it runs unattended.
+VOICE_STAGE_IN_RUN = "voice.stage_in_run"
 
 
 # ── init / status ─────────────────────────────────────────────────────
@@ -376,6 +383,61 @@ def cmd_speakers(args: argparse.Namespace) -> int:
 
     return 1 if failures else 0
 
+
+
+def cmd_voice(args: argparse.Namespace) -> int:
+    """Embed each meeting's voices, then apply what that resolves.
+
+    Off by default: with no embedding model configured this prints why and exits
+    zero, because a pipeline without voice labelling is the pipeline that has
+    been running all along, not a broken one.
+    """
+    from pipeline import voice_embed
+
+    ensure_dirs()
+    db.init_db()
+
+    try:
+        result = voice_embed.run(
+            limit=args.limit,
+            force=args.force,
+            meeting_id=getattr(args, "meeting", None),
+        )
+    except voice_embed.VoiceEmbeddingError as exc:
+        # A provider that cannot be reached or resolved is a configuration
+        # failure the operator has to see, not a traceback.
+        print(f"Voice embedding unavailable: {exc}", file=sys.stderr)
+        print("Run `pipeline doctor` for the provider's state.", file=sys.stderr)
+        return 1
+    if result.disabled:
+        print(
+            "Voice embedding is not configured - skipping.\n"
+            "    Set MMC_REMOTE_VOICE_MODEL to enable it; `pipeline doctor` reports its state."
+        )
+        return 0
+
+    print(f"Namespace: {result.namespace}")
+    if not result.meetings:
+        print("Nothing to embed.")
+
+    for position, meeting in enumerate(result.meetings, 1):
+        print(f"[{position}/{len(result.meetings)}] {meeting.meeting_id[:12]}")
+        if meeting.failed:
+            print(f"    FAILED {meeting.failed}")
+            continue
+        print(
+            f"    {meeting.embedded} embedded, {meeting.skipped} already done"
+            + (f", enrolled {', '.join(meeting.bootstrapped)}" if meeting.bootstrapped else "")
+        )
+        for label in meeting.labels:
+            if label.outcome in (voice_embed.OUTCOME_ERROR, voice_embed.OUTCOME_NO_AUDIO):
+                print(f"    {label.label}: {label.outcome} - {label.detail}")
+
+    print(
+        f"\nVoice review: {result.promoted} auto-matched, "
+        f"{result.backfilled} backfilled, {result.clusters} card(s) pending."
+    )
+    return 1 if result.failures else 0
 
 
 def cmd_minutes(args: argparse.Namespace) -> int:
@@ -713,6 +775,22 @@ def cmd_index_repair_preview(args: argparse.Namespace) -> int:
     return 0
 
 
+def _voice_stage_enabled(args: argparse.Namespace) -> bool:
+    """Whether `run`/`watch` should include the voice stage this invocation.
+
+    Two gates, both off by default. `--no-voice` skips it once; the manifest
+    setting is the standing choice, switched on only after the cards it produces
+    have been watched for a while. Until then the stage exists as an explicit
+    command and the unattended loop opens exactly one paid gate, as it does today.
+    """
+    if getattr(args, "no_voice", False):
+        return False
+    with db.connect() as conn:
+        return (db.get_setting(conn, VOICE_STAGE_IN_RUN) or "").strip().lower() in (
+            "1", "true", "on", "yes",
+        )
+
+
 def _run_all(args: argparse.Namespace, include_ingest: bool = True) -> int:
     """Walk every stage in order, oldest meeting first.
 
@@ -744,6 +822,15 @@ def _run_all(args: argparse.Namespace, include_ingest: bool = True) -> int:
         ("speakers", cmd_speakers, argparse.Namespace(
             limit=args.limit, owner=getattr(args, "owner", None),
             no_llm=args.no_llm, traceback=False)),
+    ]
+    # After speakers, because band() consumes the transcript pass's guess as a
+    # veto signal - a voice match that contradicts it must not be applied.
+    if _voice_stage_enabled(args):
+        stages.append(
+            ("voice", cmd_voice, argparse.Namespace(
+                limit=args.limit, force=False, meeting=None))
+        )
+    stages += [
         ("minutes", cmd_minutes, argparse.Namespace(
             limit=args.limit, recompile=False, traceback=False, force=False)),
         ("graph-sync", cmd_graph_sync, argparse.Namespace(limit=args.limit)),
@@ -789,7 +876,10 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     def process_pending() -> int:
         return _run_all(
-            argparse.Namespace(limit=args.limit, no_llm=False, owner=args.owner),
+            argparse.Namespace(
+                limit=args.limit, no_llm=False, owner=args.owner,
+                no_voice=getattr(args, "no_voice", False),
+            ),
             include_ingest=False,
         )
 
@@ -1151,6 +1241,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_speakers.set_defaults(func=cmd_speakers)
 
+    p_voice = subparsers.add_parser(
+        "voice", help="embed voices so a name given once carries across meetings"
+    )
+    p_voice.add_argument("--limit", type=int, default=None)
+    p_voice.add_argument("--meeting", default=None, help="embed one meeting by id")
+    p_voice.add_argument(
+        "--force", action="store_true",
+        help="re-embed labels that already carry a vector (costs a provider call)",
+    )
+    p_voice.set_defaults(func=cmd_voice)
+
     p_minutes = subparsers.add_parser("minutes", help="compile structured minutes")
     add_common(p_minutes)
     p_minutes.add_argument(
@@ -1197,6 +1298,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--limit", type=int, default=None)
     p_run.add_argument("--owner", default=OWNER_NAME or None)
     p_run.add_argument("--no-llm", action="store_true")
+    p_run.add_argument(
+        "--no-voice", action="store_true", help="skip voice embedding for this run"
+    )
     p_run.set_defaults(func=cmd_run)
 
     p_watch = subparsers.add_parser(
@@ -1211,6 +1315,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument(
         "--catch-up", action="store_true",
         help="also process recordings already pending when the watcher starts",
+    )
+    p_watch.add_argument(
+        "--no-voice", action="store_true", help="skip voice embedding for this run"
     )
     p_watch.add_argument("--once", action="store_true", help="run one capture poll and exit")
     p_watch.set_defaults(func=cmd_watch)

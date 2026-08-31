@@ -1,7 +1,10 @@
 # Voiceprint auto-labeling, remote-only
 
 Date: 2026-08-27
-Status: design, awaiting owner approval of the embedding provider
+Status: implemented (`pipeline/voice_embed.py`, `pipeline/replicate_voice.py`).
+The encoder benchmark is still outstanding: `MMC_REMOTE_VOICE_MODEL` stays unset
+until the cog is deployed and an encoder wins, and the whole stage no-ops until
+then.
 Supersedes: `docs/VOICE_LABELLING_PLAN.md` and the 2026-08-16 enrollment specs
 (deleted in 972abe1). Reuses their review model; replaces their mechanism.
 

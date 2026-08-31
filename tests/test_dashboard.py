@@ -847,7 +847,7 @@ def test_cluster_members_expose_clip_count_and_inferred_name(manifest, monkeypat
     """
     import json as _json
 
-    monkeypatch.setattr(dashboard.voices, "cluster_pending", lambda conn: None)
+    monkeypatch.setattr(dashboard.voices, "cluster_pending", lambda conn, model=None: None)
     monkeypatch.setattr(db, "pending_clusters", lambda conn, limit=50: [
         {
             "id": "cluster-1",
@@ -920,7 +920,7 @@ def test_cluster_offers_the_transcript_name_as_a_second_suggestion(manifest, mon
     so that second, independent signal was collected and never offered - which
     is exactly the case where the voiceprint is weakest.
     """
-    monkeypatch.setattr(dashboard.voices, "cluster_pending", lambda conn: None)
+    monkeypatch.setattr(dashboard.voices, "cluster_pending", lambda conn, model=None: None)
     monkeypatch.setattr(db, "pending_clusters", lambda conn, limit=50: [
         {
             "id": "cluster-2",
@@ -979,7 +979,7 @@ def test_cluster_payload_exposes_runner_up_score(manifest, monkeypatch):
     The margin is the whole signal for triage order, so the score has to cross
     the wire alongside the name that already does.
     """
-    monkeypatch.setattr(dashboard.voices, "cluster_pending", lambda conn: None)
+    monkeypatch.setattr(dashboard.voices, "cluster_pending", lambda conn, model=None: None)
     monkeypatch.setattr(db, "pending_clusters", lambda conn, limit=50: [
         {
             "id": "cluster-margin",
@@ -1088,3 +1088,88 @@ def test_one_off_payload_exposes_band(manifest, monkeypatch):
     monkeypatch.setattr(dashboard, "get_voice_clusters", lambda: [])
 
     assert dashboard.speaker_resolution_queue()["one_offs"][0]["band"] == "review"
+
+
+# ── Audio deletion and voice evidence ─────────────────────────────────
+#
+# Audio is the only place a voice card's two ingredients come from: the
+# embedding that recognises a person across meetings, and the clips a human
+# listens to. Deleting it before those exist does not degrade the card - it
+# removes the possibility of ever having one.
+
+def staged_unresolved_meeting(manifest, tmp_path, meeting_id="audio-guard"):
+    audio = tmp_path / f"{meeting_id}.m4a"
+    audio.write_bytes(b"audio bytes")
+    make_meeting(manifest, meeting_id, "2026-08-14", status=db.TRANSCRIBED)
+    manifest.execute(
+        "UPDATE meetings SET audio_path = ? WHERE id = ?", (str(audio), meeting_id)
+    )
+    db.set_speaker(manifest, meeting_id, "SPEAKER_00", None, "unknown")
+    manifest.commit()
+    return audio
+
+
+def test_deleting_audio_is_refused_while_a_voice_still_needs_it(
+    manifest, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(dashboard, "REMOTE_VOICE_MODEL", "farazmatin/speaker-embed")
+    audio = staged_unresolved_meeting(manifest, tmp_path)
+
+    with pytest.raises(dashboard.AudioEvidenceInUse) as excinfo:
+        dashboard.delete_meeting_audio("audio-guard")
+
+    assert excinfo.value.labels == ["SPEAKER_00"]
+    assert audio.exists(), "report, do not destroy"
+
+
+def test_the_refusal_can_be_overridden_explicitly(manifest, tmp_path, monkeypatch):
+    """The owner's disk, the owner's call - but they have to make it."""
+    monkeypatch.setattr(dashboard, "REMOTE_VOICE_MODEL", "farazmatin/speaker-embed")
+    audio = staged_unresolved_meeting(manifest, tmp_path)
+
+    assert dashboard.delete_meeting_audio("audio-guard", force=True) is True
+    assert not audio.exists()
+
+
+def test_an_embedded_and_clipped_label_no_longer_blocks_deletion(
+    manifest, tmp_path, monkeypatch
+):
+    from pipeline import voices
+
+    monkeypatch.setattr(dashboard, "REMOTE_VOICE_MODEL", "farazmatin/speaker-embed")
+    audio = staged_unresolved_meeting(manifest, tmp_path)
+    db.set_setting(manifest, "voice.active_namespace", "encoder@v1")
+    blob, dim = voices.pack([1.0, 0.0])
+    db.upsert_speaker_match(
+        manifest, "audio-guard", "SPEAKER_00",
+        embedding=blob, dim=dim, model="encoder@v1", speech_sec=120.0,
+        snippet_paths='["audio-guard/SPEAKER_00-0.opus"]', snippet_quality="ok",
+    )
+    manifest.commit()
+
+    assert dashboard.delete_meeting_audio("audio-guard") is True
+    assert not audio.exists()
+
+
+def test_a_name_a_person_already_gave_does_not_block_deletion(
+    manifest, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(dashboard, "REMOTE_VOICE_MODEL", "farazmatin/speaker-embed")
+    audio = staged_unresolved_meeting(manifest, tmp_path)
+    db.set_speaker(manifest, "audio-guard", "SPEAKER_00", "Ruth", "confirmed")
+    manifest.commit()
+
+    assert dashboard.delete_meeting_audio("audio-guard") is True
+    assert not audio.exists()
+
+
+def test_without_an_embedding_provider_deletion_behaves_as_it_always_has(
+    manifest, tmp_path, monkeypatch
+):
+    """With the stage off there is no future card to protect, and refusing would
+    break a deletion this dashboard has always allowed."""
+    monkeypatch.setattr(dashboard, "REMOTE_VOICE_MODEL", "")
+    audio = staged_unresolved_meeting(manifest, tmp_path)
+
+    assert dashboard.delete_meeting_audio("audio-guard") is True
+    assert not audio.exists()
