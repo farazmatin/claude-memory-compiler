@@ -1645,6 +1645,25 @@ def add_voice_sample(
     return int(cursor.lastrowid or 0)
 
 
+def voice_sample_exists(
+    conn: sqlite3.Connection, canonical: str, meeting_id: str, label: str, model: str
+) -> bool:
+    """Whether this exact (person, meeting, label, namespace) is already enrolled.
+
+    `add_voice_sample` has no unique constraint by design - each human
+    confirmation is meant to be able to add a fresh row - so the caller doing
+    automatic bootstrap enrollment owns not inserting the same evidence twice.
+    """
+    return (
+        conn.execute(
+            "SELECT 1 FROM voice_samples WHERE canonical = ? AND meeting_id = ? "
+            "AND label = ? AND model = ? LIMIT 1",
+            (canonical, meeting_id, label, model),
+        ).fetchone()
+        is not None
+    )
+
+
 def person_samples(
     conn: sqlite3.Connection, canonical: str, model: str | None = None
 ) -> list[sqlite3.Row]:

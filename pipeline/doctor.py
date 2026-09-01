@@ -347,6 +347,29 @@ def check_voice_namespace() -> list[Check]:
     ]
 
 
+def check_voice_producer() -> list[Check]:
+    """Whether new meetings can get voice vectors at all.
+
+    Without a producer the voice prongs cover only whatever was embedded before
+    the local stage was retired: the review queue looks healthy while silently
+    covering none of the recent corpus.
+    """
+    from pipeline import voice_embed
+
+    if not voice_embed.configured():
+        return [
+            Check(
+                "voice producer",
+                WARN,
+                "unset - new meetings get no voice vectors and never reach review",
+                "set MMC_REMOTE_VOICE_MODEL, then `pipeline voice --embed`",
+            )
+        ]
+    from pipeline.config import REMOTE_VOICE_MODEL
+
+    return [Check("voice producer", OK, REMOTE_VOICE_MODEL)]
+
+
 def check_glossary() -> list[Check]:
     """Not required, but the cheapest accuracy win available."""
     if not GLOSSARY_FILE.exists():
@@ -528,6 +551,7 @@ ALL_CHECKS = (
     check_storage,
     check_manifest,
     check_voice_namespace,
+    check_voice_producer,
     check_glossary,
 )
 

@@ -45,6 +45,16 @@ a band nobody just computed.
 - Treat manually confirmed names and approved overrides as the correction record.
 - Review ownership before relying on an assigned action.
 
+## Where voice cards come from
+
+`pipeline voice --embed` produces the voiceprints the cards are built from. It
+needs `MMC_REMOTE_VOICE_MODEL` set to a pinned model; without it the stage does
+nothing and `pipeline doctor` says so. Meetings whose local audio was already
+deleted are restored from Drive automatically.
+
+Run it before `--rematch`: a meeting with no vector cannot appear in the queue,
+however many unresolved labels it has.
+
 ## If the review queue is empty
 
 Run `pipeline doctor`. Voice vectors are namespaced by the encoder that produced

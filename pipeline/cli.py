@@ -1060,7 +1060,7 @@ def cmd_voice(args: argparse.Namespace) -> int:
     from pipeline.config import TZ
 
     db.init_db()
-    if not (args.rematch or args.apply_auto):
+    if not (args.rematch or args.apply_auto or args.embed):
         args.apply_auto = True
     # Committing a band nobody just computed is how a stale band becomes a name.
     # The preview stays write-free, so only the committing path re-bands first.
@@ -1075,6 +1075,33 @@ def cmd_voice(args: argparse.Namespace) -> int:
             return 2
         print(f"namespace: {namespace}")
 
+    if args.embed:
+        from pipeline import voice_embed
+
+        if not voice_embed.configured():
+            print(
+                "no embedding provider configured; set MMC_REMOTE_VOICE_MODEL. "
+                "This is the only paid call in the voice path, so it has no default.",
+                file=sys.stderr,
+            )
+            return 2
+        from pipeline.voice_embed_replicate import ReplicateVoiceBackend
+
+        embedded = voice_embed.run(
+            backend=ReplicateVoiceBackend(),
+            namespace=namespace,
+            meeting_id=args.meeting,
+            limit=args.limit,
+            force=args.force,
+        )
+        print(
+            f"embed: {embedded.meetings} meeting(s), {embedded.embedded} labels embedded, "
+            f"{embedded.bootstrapped} bootstrapped, {embedded.skipped} skipped"
+        )
+        for failure in embedded.failures[:10]:
+            print(f"  FAILED {failure}")
+
+    with db.connect() as conn:
         if args.rematch:
             promoted = voices.rematch_pending(conn, namespace)
             clusters = voices.cluster_pending(conn, namespace)
@@ -1394,7 +1421,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="commit --apply-auto instead of previewing; implies --rematch, so a "
              "stale band is never committed as a name",
     )
-    p_voice.add_argument("--limit", type=int, help="cap the rows considered")
+    p_voice.add_argument(
+        "--embed", action="store_true",
+        help="produce voice vectors for meetings that have none (the only paid call)",
+    )
+    p_voice.add_argument("--meeting", help="restrict --embed to one meeting id")
+    p_voice.add_argument(
+        "--force", action="store_true", help="re-embed labels that already have a vector",
+    )
+    p_voice.add_argument("--limit", type=int, help="cap the rows or meetings considered")
     p_voice.set_defaults(func=cmd_voice)
 
     subparsers.add_parser(

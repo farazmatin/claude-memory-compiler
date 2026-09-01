@@ -181,6 +181,22 @@ SNIPPET_MIN_WORD_COVERAGE = 0.5
 # one sentence.
 SNIPPET_MIN_SEPARATION_SEC = 60.0
 
+# Retained clip encoding. Opus at 24k keeps a 6-second clip near 18 KB, so a
+# whole corpus of review snippets stays smaller than one hour of source audio.
+SNIPPET_EXT = ".opus"
+SNIPPET_BITRATE = "24k"
+
+# Cap on the audio sent to the embedding provider for one label. A chronological
+# truncation, not a quality selection: VOICE_MIN_SPEECH_SEC is already the floor
+# for a robust sample, and this only bounds cost on someone who talks for twenty
+# minutes.
+VOICE_MAX_EMBED_SEC = float(os.environ.get("MMC_VOICE_MAX_EMBED_SEC", "90"))
+
+# The remote speaker-embedding model. Unset by default and the voice stage
+# no-ops without it: this is the only paid call in the stage, and a model that
+# silently starts running because a default existed is a bill nobody approved.
+REMOTE_VOICE_MODEL = os.environ.get("MMC_REMOTE_VOICE_MODEL", "").strip()
+
 ALL_DIRS.append(SNIPPETS_DIR)
 
 

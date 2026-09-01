@@ -63,6 +63,23 @@ nothing, `cluster_pending` rebuilds the review queue as empty, and no error is
 raised anywhere. `pipeline doctor` fails when the active namespace is not one the
 stored vectors actually use.
 
+## Voice vectors
+
+`pipeline/voice_embed.py` is the only module that talks to an embedding
+provider. It plans every label first, makes ONE provider call per meeting, then
+persists - so a dry run is pure and a provider failure leaves a meeting either
+fully embedded or untouched. `voices.py` consumes the vectors and never produces
+them.
+
+Audio is fetched rather than required. Transcription deletes the local copy of a
+Drive-backed recording, but Drive holds the original and `capture.rehydrate_audio`
+restores it when the checksum still matches, so the stage is not limited to
+meetings that happen to have a local file.
+
+The stage no-ops when `MMC_REMOTE_VOICE_MODEL` is unset, and `pipeline doctor`
+warns when it is - without a producer, new meetings never reach voice review at
+all while the queue still looks healthy.
+
 ## Context contract
 
 The authenticated loopback dashboard, normally on port 8765, exposes:

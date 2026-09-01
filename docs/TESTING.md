@@ -18,6 +18,10 @@ For a broader check:
 - An over-segmented meeting never yields an auto-applied name.
 - Auto-apply never downgrades a label a human confirmed.
 - Auto-apply is a dry run unless `--apply` is given.
+- The voice producer imports no local model weights.
+- Every label of a meeting is embedded in one provider call.
+- A provider failure leaves the manifest untouched.
+- A malformed vector is refused at the provider boundary.
 - Drive capture dry-run remains non-mutating.
 - Graph context remains bounded and provenance-bearing.
 
