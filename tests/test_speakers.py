@@ -527,3 +527,45 @@ def test_resolve_does_not_manufacture_match_rows(manifest, monkeypatch, tmp_path
     spk.resolve(manifest, meeting, two_speaker_transcript())
 
     assert manifest.execute("SELECT COUNT(*) AS n FROM speaker_matches").fetchone()["n"] == 0
+
+
+def _synthetic(labels: int, segments: int, words: int = 5) -> Transcript:
+    return Transcript(
+        meeting_id="x", model="m", language="en", duration_sec=segments * 3.0,
+        segments=[
+            Segment(start=i * 3.0, end=i * 3.0 + 2.0, text=" ".join(["word"] * words),
+                    speaker=f"SPEAKER_{i % labels:02d}")
+            for i in range(segments)
+        ],
+    )
+
+
+def test_a_normal_meeting_is_shown_in_full():
+    """Measured against 37 confirmed labels: sampling cost the resolver 18% vs
+    73% correct, because most misses were names spoken outside the window."""
+    assert len(spk.dialogue_excerpt(_synthetic(5, 600)).splitlines()) == 600
+
+
+def test_a_crowded_meeting_is_still_sampled():
+    """Past eight labels the full transcript bought each extra correct answer
+    with an extra wrong one; at nine or more it was net negative."""
+    assert len(spk.dialogue_excerpt(_synthetic(12, 600)).splitlines()) < 600
+
+
+def test_the_gate_sits_below_the_measured_crossover():
+    """Six labels is the last count measured clean; eight is where wrong answers
+    started matching correct ones, so the gate must not sit at eight."""
+    assert len(spk.dialogue_excerpt(_synthetic(6, 600)).splitlines()) == 600
+    assert len(spk.dialogue_excerpt(_synthetic(7, 600)).splitlines()) < 600
+    assert len(spk.dialogue_excerpt(_synthetic(8, 600)).splitlines()) < 600
+
+
+def test_an_over_budget_transcript_falls_back_to_the_sample():
+    """The sample, not a truncation - cutting the tail drops the end of the
+    meeting silently, and that is where a late joiner introduces themselves."""
+    lines = len(spk.dialogue_excerpt(_synthetic(5, 600, words=400)).splitlines())
+    assert lines < 600
+
+
+def test_a_short_meeting_is_shown_in_full_however_crowded():
+    assert len(spk.dialogue_excerpt(_synthetic(12, 40)).splitlines()) == 40

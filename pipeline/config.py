@@ -302,6 +302,36 @@ MINUTES_PROMPT_TOKEN_BUDGET = int(os.environ.get("MMC_MINUTES_TOKEN_BUDGET", "60
 # Window size for the map pass, in tokens of dialogue.
 MINUTES_MAP_WINDOW_TOKENS = int(os.environ.get("MMC_MINUTES_MAP_WINDOW", "20000"))
 
+# Dialogue budget for the speaker-resolution prompt. The resolver used to see a
+# ~100-line sample of the meeting; measured against 37 human-confirmed labels,
+# the whole transcript took it from 18% to 73% correct on meetings with a
+# plausible speaker count. Over this budget it falls back to the sample rather
+# than truncating - a truncated transcript loses the END of the meeting
+# silently, and that is where a late joiner introduces themselves.
+RESOLUTION_PROMPT_TOKEN_BUDGET = int(
+    os.environ.get("MMC_RESOLUTION_TOKEN_BUDGET", "40000")
+)
+
+# Above this many diarized labels the resolver goes back to the sample.
+# Deliberately stricter than IMPLAUSIBLE_SPEAKER_COUNT (8): that one asks whether
+# the diarizer over-segmented, this asks a different question - how many
+# label-to-person assignments the model can hold at once before it starts
+# inventing them. Measured over 66 human-confirmed labels across 20 meetings:
+#
+#   labels   sample (right/wrong)   full transcript (right/wrong)
+#    2-5          6 / 1                    19 / 0
+#    6-7          4 / 0                     6 / 1
+#      8          5 / 2                    10 / 4
+#     9+          3 / 2                     4 / 6
+#
+# The full transcript is an unambiguous win up to five speakers and buys every
+# further correct answer with a wrong one after eight. A confident wrong name is
+# the failure this pipeline cannot fix, so the gate sits below the crossover
+# rather than at it.
+RESOLUTION_FULL_DIALOGUE_MAX_SPEAKERS = int(
+    os.environ.get("MMC_RESOLUTION_MAX_SPEAKERS", "6")
+)
+
 # ── LightRAG ──────────────────────────────────────────────────────────
 LIGHTRAG_URL = os.environ.get("MMC_LIGHTRAG_URL", "http://localhost:9621")
 LIGHTRAG_API_KEY = os.environ.get("MMC_LIGHTRAG_API_KEY", "")

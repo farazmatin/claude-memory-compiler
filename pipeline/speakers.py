@@ -29,11 +29,17 @@ from pathlib import Path
 
 from pipeline import db
 from pipeline.asr import Transcript, format_timestamp
-from pipeline.config import GLOSSARY_FILE, SPEAKER_OVERRIDES_FILE
+from pipeline.config import (
+    GLOSSARY_FILE,
+    RESOLUTION_FULL_DIALOGUE_MAX_SPEAKERS,
+    RESOLUTION_PROMPT_TOKEN_BUDGET,
+    SPEAKER_OVERRIDES_FILE,
+)
 from pipeline.llm import LLMError, complete, extract_fenced_block
 
-# How much of the opening to show the model. Introductions happen early, and
-# sending the whole hour would be slow and add nothing.
+# How much of the opening the SAMPLE covers. Only the over-segmented and
+# over-budget paths use it now: see dialogue_excerpt for the measurement that
+# retired sampling as the default.
 INTRO_WINDOW_SEC = 240
 
 CONFIDENCE_CONFIRMED = "confirmed"
@@ -250,15 +256,37 @@ def fold_into_existing_person(conn, name: str) -> str:
 def dialogue_excerpt(transcript: Transcript, max_lines: int = 100) -> str:
     """Representative labeled dialogue across the meeting.
 
-    The opening slice covers at least INTRO_WINDOW_SEC of wall-clock time, not
-    just a fixed segment count: self-introductions happen in the first few
-    minutes regardless of how choppy the turn-taking is, and a fast back-and-
-    forth exchange can burn through 50 segments in under a minute - cutting
-    the introductions off before they happen and starving the LLM pass of the
-    one thing it most needs to see.
+    Measured against 37 labels a human had already confirmed by ear. On meetings
+    with a plausible speaker count, replacing the ~100-line sample with the full
+    dialogue took the resolver from 18% to 73% correct AND lowered its wrong
+    answers, 2 to 1: most of what it missed was a name spoken outside the sampled
+    window, and a name it never saw is a decline rather than a mistake.
+
+    Two cases still take the sample.
+
+    Too many speakers, because the same experiment showed the benefit inverting
+    as the label count rises: unambiguous up to five speakers (6 right/1 wrong
+    becoming 19 right/0 wrong), but past eight every extra correct answer came
+    with an extra WRONG one, and at nine or more it was net negative. More text
+    is more rope for confidently mis-assigning labels that may not even be
+    distinct people. See RESOLUTION_FULL_DIALOGUE_MAX_SPEAKERS for the table;
+    the gate is deliberately below the crossover, not at it.
+
+    And a transcript over the token budget, where the sample is the honest
+    fallback: truncating would drop the end of the meeting silently, and that is
+    where a late joiner introduces themselves.
+
+    The sample's opening slice covers at least INTRO_WINDOW_SEC of wall-clock
+    time rather than a fixed segment count, because self-introductions happen in
+    the first few minutes however choppy the turn-taking is, and a fast exchange
+    can burn 50 segments in under a minute.
     """
     segs = transcript.segments
-    if len(segs) <= max_lines:
+    whole_meeting = (
+        len(transcript.speaker_labels) <= RESOLUTION_FULL_DIALOGUE_MAX_SPEAKERS
+        and _within_budget(segs)
+    )
+    if whole_meeting or len(segs) <= max_lines:
         chosen = segs
     else:
         intro_count = sum(1 for s in segs if s.start <= INTRO_WINDOW_SEC)
@@ -270,6 +298,13 @@ def dialogue_excerpt(transcript: Transcript, max_lines: int = 100) -> str:
         who = seg.speaker or "UNKNOWN"
         lines.append(f"[{format_timestamp(seg.start)}] {who}: {seg.text}")
     return "\n".join(lines)
+
+
+def _within_budget(segments) -> bool:
+    """Whether the full dialogue fits the resolution prompt's token budget."""
+    from pipeline.compile_minutes import estimate_tokens
+
+    return estimate_tokens(" ".join(s.text for s in segments)) <= RESOLUTION_PROMPT_TOKEN_BUDGET
 
 
 def build_resolution_prompt(
