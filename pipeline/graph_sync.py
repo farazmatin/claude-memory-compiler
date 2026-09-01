@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -47,6 +48,16 @@ DUPLICATE = "duplicate"
 DROPPED = "dropped"
 FAILED = "failed"
 
+# A 5xx that the graph nevertheless committed. LightRAG writes the node or edge
+# first and then upserts a vector for it; this deployment deliberately points the
+# embedding binding at a closed port (docker-compose.yml: "Model-backed routes
+# are disabled"), so the vector step always fails and the API answers HTTP 500 -
+# after the graph write has already landed. Reporting those as refused told the
+# operator "the graph still holds the PREVIOUS corpus" when it did not, and made
+# `pipeline run` exit non-zero and alert on every single sync. Verified against
+# the live service: 293 writes reported as refused, all 293 present in the graph.
+VERIFIED = "verified"
+
 # Refusals a later run cannot fix, because the payload itself is unacceptable.
 # 401/403/429 are deliberately absent: a dead key or a rate limit is recoverable,
 # and silently dropping those would publish a corpus with holes in it.
@@ -55,6 +66,8 @@ _PERMANENT_REFUSAL = frozenset({400, 409, 422})
 
 @dataclass
 class SyncReport:
+    entities_verified: int = 0
+    relations_verified: int = 0
     entities_written: int = 0
     entities_skipped: int = 0
     entities_dropped: int = 0
@@ -69,6 +82,11 @@ class SyncReport:
             f"{self.entities_written} entities, {self.relations_written} relations written; "
             f"{self.entities_skipped} entities and {self.relations_skipped} relations skipped"
         )
+        verified = self.entities_verified + self.relations_verified
+        if verified:
+            # Named separately from `written` so a rise in these is visible: they
+            # are writes the service reported as failed and the graph kept.
+            line += f"; {verified} landed despite a 5xx (verified present)"
         dropped = self.entities_dropped + self.relations_dropped
         if dropped:
             line += f"; {dropped} unpublishable record(s) dropped"
@@ -165,8 +183,21 @@ def collect(conn: sqlite3.Connection) -> tuple[dict[str, dict[str, Any]], list[d
     return entities, relations
 
 
-def _post(client: httpx.Client, path: str, payload: dict[str, Any]) -> tuple[str, str]:
-    """Write one record. Returns the outcome and a detail string for reporting."""
+def _post(
+    client: httpx.Client,
+    path: str,
+    payload: dict[str, Any],
+    verify: Callable[[], bool] | None = None,
+) -> tuple[str, str]:
+    """Write one record. Returns the outcome and a detail string for reporting.
+
+    `verify` is asked, and only on a 5xx, whether the record is in the graph
+    anyway. LightRAG commits the node or edge before upserting its vector, and
+    this deployment has no embedder, so the write lands and the response is still
+    a 500. Trusting the status code alone reported a corpus-wide failure that had
+    not happened. Asking the graph is the only honest answer, and it costs one
+    request per failure rather than one per write.
+    """
     try:
         resp = client.post(
             f"{LIGHTRAG_URL}{path}", headers=_headers(), json=payload, timeout=REQUEST_TIMEOUT_SEC
@@ -181,7 +212,67 @@ def _post(client: httpx.Client, path: str, payload: dict[str, Any]) -> tuple[str
         return DUPLICATE, ""
     if resp.status_code in _PERMANENT_REFUSAL:
         return DROPPED, f"HTTP {resp.status_code}: {body}"
+    if resp.status_code >= 500 and verify is not None and verify():
+        return VERIFIED, ""
     return FAILED, f"HTTP {resp.status_code}: {body}"
+
+
+class _GraphVerifier:
+    """Asks the graph whether a write the service reported as failed is present.
+
+    Entities have a dedicated existence route. Relations do not, so their answer
+    comes from one neighbourhood fetch per source entity, cached for the run - a
+    failing sync tends to fail on many edges out of the same few nodes, so the
+    cache turns a per-edge cost into a per-node one.
+
+    Every probe is read-only, and a probe that itself fails answers False: the
+    fallback is to report the write as failed, which is the pre-existing
+    behaviour and never overstates success.
+    """
+
+    def __init__(self, client: httpx.Client) -> None:
+        self._client = client
+        self._neighbours: dict[str, set[str]] = {}
+
+    def entity(self, name: str) -> bool:
+        try:
+            resp = self._client.get(
+                f"{LIGHTRAG_URL}/graph/entity/exists",
+                headers=_headers(),
+                params={"name": name},
+                timeout=REQUEST_TIMEOUT_SEC,
+            )
+        except httpx.HTTPError:
+            return False
+        if resp.status_code != 200:
+            return False
+        body = resp.json()
+        return bool(body.get("exists")) if isinstance(body, dict) else bool(body)
+
+    def relation(self, source: str, target: str) -> bool:
+        return target in self._targets(source)
+
+    def _targets(self, source: str) -> set[str]:
+        if source in self._neighbours:
+            return self._neighbours[source]
+        found: set[str] = set()
+        try:
+            resp = self._client.get(
+                f"{LIGHTRAG_URL}/graphs",
+                headers=_headers(),
+                params={"label": source, "max_depth": 1, "max_nodes": 1000},
+                timeout=REQUEST_TIMEOUT_SEC,
+            )
+            if resp.status_code == 200:
+                for edge in resp.json().get("edges", []):
+                    if edge.get("source") == source:
+                        found.add(str(edge.get("target")))
+                    elif edge.get("target") == source:
+                        found.add(str(edge.get("source")))
+        except (httpx.HTTPError, ValueError):
+            found = set()
+        self._neighbours[source] = found
+        return found
 
 
 def sync(conn: sqlite3.Connection | None = None) -> SyncReport:
@@ -193,6 +284,7 @@ def sync(conn: sqlite3.Connection | None = None) -> SyncReport:
     report = SyncReport()
     entities, relations = collect(conn)
     with httpx.Client() as client:
+        verifier = _GraphVerifier(client)
         for name, data in entities.items():
             payload = {
                 "entity_name": name,
@@ -203,9 +295,14 @@ def sync(conn: sqlite3.Connection | None = None) -> SyncReport:
                     "source_id": "|".join(sorted(data["meetings"])),
                 },
             }
-            outcome, detail = _post(client, "/graph/entity/create", payload)
+            outcome, detail = _post(
+                client, "/graph/entity/create", payload,
+                verify=lambda name=name: verifier.entity(name),
+            )
             if outcome == WRITTEN:
                 report.entities_written += 1
+            elif outcome == VERIFIED:
+                report.entities_verified += 1
             elif outcome == DROPPED:
                 report.entities_dropped += 1
                 report.drops.append(f"entity {name}: {detail}")
@@ -225,10 +322,15 @@ def sync(conn: sqlite3.Connection | None = None) -> SyncReport:
                     "source_id": rel["meeting_id"],
                 },
             }
-            outcome, detail = _post(client, "/graph/relation/create", payload)
+            outcome, detail = _post(
+                client, "/graph/relation/create", payload,
+                verify=lambda s=rel["source"], t=rel["target"]: verifier.relation(s, t),
+            )
             label = f"relation {rel['source']}->{rel['target']}"
             if outcome == WRITTEN:
                 report.relations_written += 1
+            elif outcome == VERIFIED:
+                report.relations_verified += 1
             elif outcome == DROPPED:
                 report.relations_dropped += 1
                 report.drops.append(f"{label}: {detail}")

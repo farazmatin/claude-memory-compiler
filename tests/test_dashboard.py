@@ -847,7 +847,7 @@ def test_cluster_members_expose_clip_count_and_inferred_name(manifest, monkeypat
     """
     import json as _json
 
-    monkeypatch.setattr(dashboard.voices, "cluster_pending", lambda conn: None)
+    monkeypatch.setattr(dashboard.voices, "cluster_pending", lambda conn, model: None)
     monkeypatch.setattr(db, "pending_clusters", lambda conn, limit=50: [
         {
             "id": "cluster-1",
@@ -920,7 +920,7 @@ def test_cluster_offers_the_transcript_name_as_a_second_suggestion(manifest, mon
     so that second, independent signal was collected and never offered - which
     is exactly the case where the voiceprint is weakest.
     """
-    monkeypatch.setattr(dashboard.voices, "cluster_pending", lambda conn: None)
+    monkeypatch.setattr(dashboard.voices, "cluster_pending", lambda conn, model: None)
     monkeypatch.setattr(db, "pending_clusters", lambda conn, limit=50: [
         {
             "id": "cluster-2",
@@ -979,7 +979,7 @@ def test_cluster_payload_exposes_runner_up_score(manifest, monkeypatch):
     The margin is the whole signal for triage order, so the score has to cross
     the wire alongside the name that already does.
     """
-    monkeypatch.setattr(dashboard.voices, "cluster_pending", lambda conn: None)
+    monkeypatch.setattr(dashboard.voices, "cluster_pending", lambda conn, model: None)
     monkeypatch.setattr(db, "pending_clusters", lambda conn, limit=50: [
         {
             "id": "cluster-margin",
@@ -1088,3 +1088,13 @@ def test_one_off_payload_exposes_band(manifest, monkeypatch):
     monkeypatch.setattr(dashboard, "get_voice_clusters", lambda: [])
 
     assert dashboard.speaker_resolution_queue()["one_offs"][0]["band"] == "review"
+
+
+def test_a_stale_cluster_id_is_a_conflict_not_a_silent_success(manifest):
+    """HTTP 200 with confirmed=0 made a discarded confirmation look successful."""
+    import pytest
+
+    with pytest.raises(dashboard.StaleClusterError):
+        dashboard.confirm_voice_cluster("an-id-that-no-longer-exists", "Ruth")
+    with pytest.raises(dashboard.StaleClusterError):
+        dashboard.dismiss_voice_cluster("an-id-that-no-longer-exists")

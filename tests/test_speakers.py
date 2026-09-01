@@ -469,3 +469,61 @@ def test_resolve_folds_a_fuller_name_and_registers_the_alias(manifest, monkeypat
         "SELECT canonical FROM person_aliases WHERE alias = 'faraz matin'"
     ).fetchone()
     assert alias["canonical"] == "Faraz"
+
+
+def test_merge_label_never_downgrades_a_confirmed_row(manifest):
+    """The single-label wrapper carries the same guard as the whole-meeting pass.
+
+    `db.set_speaker` is an unconditional upsert, so a machine pass reaching for
+    it directly would quietly replace a name a human confirmed by ear.
+    """
+    make_meeting(manifest, "m1", "2026-08-10")
+    db.set_speaker(manifest, "m1", "SPEAKER_00", "Ali", spk.CONFIDENCE_CONFIRMED)
+
+    stored = spk.merge_label(manifest, "m1", "SPEAKER_00", "Alison", spk.CONFIDENCE_INFERRED)
+
+    assert stored == ("Ali", spk.CONFIDENCE_CONFIRMED)
+    row = manifest.execute(
+        "SELECT name, confidence FROM speakers WHERE meeting_id = 'm1'"
+    ).fetchone()
+    assert (row["name"], row["confidence"]) == ("Ali", spk.CONFIDENCE_CONFIRMED)
+
+
+def test_merge_label_fills_an_empty_label(manifest):
+    make_meeting(manifest, "m1", "2026-08-10")
+    assert spk.merge_label(manifest, "m1", "SPEAKER_00", "Ali", spk.CONFIDENCE_INFERRED) == (
+        "Ali", spk.CONFIDENCE_INFERRED
+    )
+
+
+def test_resolve_records_its_conclusion_as_the_voice_matchers_cross_check(
+    manifest, monkeypatch, tmp_path
+):
+    """`band()` reads a missing llm_name as "no disagreement", so the LLM veto
+    on auto-applying a name is absent wherever this is unset - which was every
+    row, because only the retired local enrollment stage ever wrote it.
+    """
+    monkeypatch.setattr(spk, "load_overrides", lambda: {})
+    monkeypatch.setattr(spk, "glossary_people", list)
+    monkeypatch.setattr(
+        spk, "resolve_with_llm", lambda *a, **k: {"SPEAKER_00": "Ali", "SPEAKER_01": "Ruth"}
+    )
+    meeting = make_meeting(manifest, "m1", "2026-08-10")
+    db.upsert_speaker_match(manifest, "m1", "SPEAKER_00", embedding=b"x" * 4, dim=1)
+
+    spk.resolve(manifest, meeting, two_speaker_transcript())
+
+    assert db.get_speaker_match(manifest, "m1", "SPEAKER_00")["llm_name"] == "Ali"
+
+
+def test_resolve_does_not_manufacture_match_rows(manifest, monkeypatch, tmp_path):
+    """A match row with no embedding is invisible to matching, clustering and
+    the review queue alike, so creating one would be pure table pollution."""
+    monkeypatch.setattr(spk, "load_overrides", lambda: {})
+    monkeypatch.setattr(spk, "glossary_people", list)
+    monkeypatch.setattr(spk, "resolve_with_llm", lambda *a, **k: {"SPEAKER_00": "Ali"})
+    meeting = make_meeting(manifest, "m1", "2026-08-10")
+
+    spk.resolve(manifest, meeting, two_speaker_transcript())
+
+    assert manifest.execute("SELECT COUNT(*) AS n FROM speaker_matches").fetchone()["n"] == 0

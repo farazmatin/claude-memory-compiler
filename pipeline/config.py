@@ -147,9 +147,19 @@ VOICE_MIN_ENROLL_MEETINGS = int(os.environ.get("MMC_VOICE_MIN_ENROLL_MEETINGS", 
 # auto-match threshold: a contaminated cluster enrolls a poisoned voiceprint from
 # a single confirmation, which is the most damaging wrong answer available.
 VOICE_CLUSTER_THRESHOLD = float(os.environ.get("MMC_VOICE_CLUSTER", "0.72"))
-# Existing vector records are retained for audit only. New enrollment is retired,
-# so the active namespace deliberately contains no locally generated vectors.
-VOICE_VECTOR_NAMESPACE = os.environ.get("MMC_VOICE_VECTOR_NAMESPACE", "historical")
+# The encoder that produced every stored vector. Vectors from different encoders
+# are not comparable, so this string namespaces voice_samples and speaker_matches.
+#
+# This is only the fallback. The live value is the manifest setting
+# voice.active_namespace, read through voices.active_namespace() - so swapping
+# encoders is one row rather than a deploy. The default was "historical" while
+# local enrollment was retired; because nothing was ever written under that name,
+# every namespaced read came back empty and cluster_pending() deleted the review
+# queue on each dashboard load. A default that no stored row uses is not a
+# quarantine, it is an outage.
+VOICE_VECTOR_NAMESPACE = os.environ.get(
+    "MMC_VOICE_VECTOR_NAMESPACE", "pyannote/wespeaker-voxceleb-resnet34-LM"
+)
 
 # Retained voice clips, so speakers stay labellable by ear after the source audio
 # is deleted. ~30 KB per speaker against 2-4 MB per audio-hour.

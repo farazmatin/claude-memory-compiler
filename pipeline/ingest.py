@@ -19,7 +19,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from pipeline import db
@@ -139,16 +139,27 @@ def _mask(text: str, span: tuple[int, int] | None) -> str:
     return text[: span[0]] + " " * (span[1] - span[0]) + text[span[1] :]
 
 
-def parse_filename(path: Path, mtime: datetime) -> ParsedName:
+def parse_filename(
+    path: Path, mtime: datetime, duration_sec: float | None = None
+) -> ParsedName:
     """Pull date, time, and a title hint out of a filename.
 
     Handles both the Pixel Recorder convention ("Ali Aug 10 at 11-12 a.m..m4a")
     and the ISO-ish patterns a configurable recorder can be told to emit
     ("2026-08-10T1100_standup.m4a"). Falls back to file mtime for anything
     missing, so an unparseable name still lands with a usable date.
+
+    A meeting is filed by when it STARTED. mtime is when the recording ended:
+    the recorder writes the file on stop, and a Drive capture stamps the copy
+    with Drive's createdTime, which is the upload that follows the stop. So the
+    mtime fallback rewinds by the measured duration - without it a 60-minute
+    call that began at 16:32 was filed at 17:32, and the Drive-captured names
+    ("My_recording_74.mp3") carry no time of their own to correct it. A time
+    encoded in the filename is already a start time and is used unchanged.
     """
     stem = path.stem
-    date, date_span = _parse_date(stem, mtime.year)
+    started = mtime - timedelta(seconds=duration_sec) if duration_sec else mtime
+    date, date_span = _parse_date(stem, started.year)
 
     # Search for the time only outside the date. In "2026-08-10T1100" the "T"
     # separator is legitimately preceded by a digit, which the compact-time
@@ -164,8 +175,8 @@ def parse_filename(path: Path, mtime: datetime) -> ParsedName:
     leftover = re.sub(r"\s+", " ", leftover).strip(" .,")
 
     return ParsedName(
-        date=date or mtime.strftime("%Y-%m-%d"),
-        time=time or mtime.strftime("%H:%M"),
+        date=date or started.strftime("%Y-%m-%d"),
+        time=time or started.strftime("%H:%M"),
         title_hint=leftover or None,
     )
 
@@ -252,8 +263,10 @@ def run(inbox: Path | None = None, verbose: bool = True) -> dict[str, int]:
                     continue
 
                 mtime = datetime.fromtimestamp(stat.st_mtime, tz=TZ)
-                parsed = parse_filename(path, mtime)
+                # Probe first: the mtime fallback needs the duration to rewind
+                # from the recording's end to its start.
                 duration = probe_duration(path)
+                parsed = parse_filename(path, mtime, duration)
 
                 # Copy, never move: the inbox is likely a cloud-synced folder and
                 # removing the file would delete the upstream original.

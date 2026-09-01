@@ -295,6 +295,58 @@ def check_manifest() -> list[Check]:
     return checks
 
 
+def check_voice_namespace() -> list[Check]:
+    """The active voice namespace must be the one the stored vectors actually use.
+
+    Drift here is silent and total: every namespaced read returns nothing, the
+    review queue empties itself on each dashboard load, and no error is raised
+    anywhere. This check exists because that is exactly what happened.
+    """
+    if not DB_PATH.exists():
+        return [Check("voice namespace", WARN, "no manifest yet", "pipeline init")]
+    from pipeline import voices
+
+    try:
+        db.init_db()
+        with db.connect() as conn:
+            try:
+                active = voices.active_namespace(conn)
+            except ValueError as exc:
+                return [
+                    Check(
+                        "voice namespace",
+                        FAIL,
+                        str(exc),
+                        "set voice.active_namespace in pipeline_settings",
+                    )
+                ]
+            stored = {
+                str(row["model"])
+                for row in conn.execute(
+                    "SELECT DISTINCT model FROM speaker_matches WHERE model IS NOT NULL "
+                    "UNION SELECT DISTINCT model FROM voice_samples WHERE model IS NOT NULL"
+                )
+            }
+    except Exception as exc:
+        return [Check("voice namespace", WARN, f"{type(exc).__name__}: {exc}")]
+
+    if not stored:
+        return [Check("voice namespace", OK, f"{active} (no vectors stored yet)")]
+    if active in stored:
+        others = sorted(stored - {active})
+        detail = active + (f" (also stored: {', '.join(others)})" if others else "")
+        return [Check("voice namespace", OK, detail)]
+    return [
+        Check(
+            "voice namespace",
+            FAIL,
+            f"active is {active!r} but every stored vector uses {sorted(stored)} - "
+            "voice review will be empty",
+            "set voice.active_namespace to the namespace the vectors use",
+        )
+    ]
+
+
 def check_glossary() -> list[Check]:
     """Not required, but the cheapest accuracy win available."""
     if not GLOSSARY_FILE.exists():
@@ -475,6 +527,7 @@ ALL_CHECKS = (
     check_drive,
     check_storage,
     check_manifest,
+    check_voice_namespace,
     check_glossary,
 )
 

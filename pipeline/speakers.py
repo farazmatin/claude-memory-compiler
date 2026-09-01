@@ -377,6 +377,41 @@ def _existing_speakers(conn, meeting_id: str) -> dict[str, tuple[str | None, str
     return {r["label"]: (r["name"], r["confidence"]) for r in rows}
 
 
+def merge_label(
+    conn,
+    meeting_id: str,
+    label: str,
+    name: str | None,
+    confidence: str,
+) -> tuple[str | None, str]:
+    """Persist one label's name through the merge rules. Returns what was stored.
+
+    The single-label read-decide-write wrapper around `_merge_with_existing`,
+    for callers holding one label rather than a whole meeting - `voices.apply_auto`
+    above all. It exists so no caller outside this module has to reach for
+    `db.set_speaker`, which is an unconditional upsert and will happily overwrite
+    a name a human confirmed by ear.
+
+    `resolve()` keeps calling `_merge_with_existing` directly against its one
+    bulk `_existing_speakers` read: it loops over every label in the meeting, and
+    a per-label read there would be one query per speaker for no benefit.
+    """
+    row = conn.execute(
+        "SELECT name, confidence FROM speakers WHERE meeting_id = ? AND label = ?",
+        (meeting_id, label),
+    ).fetchone()
+    existing = (row["name"], row["confidence"] or CONFIDENCE_UNKNOWN) if row else None
+    merged = _merge_with_existing(existing, name, confidence)
+    # An identical rewrite changes nothing but makes a refusal look like a write.
+    # The `existing is not None` half is load-bearing: a brand-new label with no
+    # name still needs its NULL row, or it never reaches the dashboard's
+    # unresolved queue, which selects on `s.name IS NULL`.
+    if existing is not None and merged == existing:
+        return merged
+    db.set_speaker(conn, meeting_id, label, merged[0], merged[1])
+    return merged
+
+
 def _merge_with_existing(
     existing: tuple[str | None, str] | None,
     new_name: str | None,
@@ -467,6 +502,20 @@ def resolve(
             # Register the surface form as an alias so the next lookup is an
             # exact hit instead of walking the registry again.
             db.add_person(conn, canonical, aliases=[original])
+
+    # Hand the voice matcher this pass's conclusion, so its LLM veto has
+    # something to disagree with. `band()` treats a missing llm_name as "no
+    # disagreement", so the second guard on auto-applying a name is silently
+    # absent wherever this is unset - which was every row, because the only
+    # thing that ever wrote it was the retired local enrollment stage.
+    #
+    # This is independent evidence by construction: `resolved` comes from the
+    # transcript, the overrides and the glossary, never from a voiceprint. Do
+    # NOT source it from the `speakers` table instead - `voices.apply_auto`
+    # writes the matcher's own answer there, so that would be the matcher
+    # confirming itself.
+    for label in labels:
+        db.set_match_llm_name(conn, meeting.id, label, resolved.get(label))
 
     existing = _existing_speakers(conn, meeting.id)
     for label in labels:

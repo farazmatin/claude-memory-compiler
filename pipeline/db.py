@@ -689,6 +689,24 @@ def reset_to(conn: sqlite3.Connection, meeting_id: str, status: str) -> None:
     advance(conn, meeting_id, status, retryable=0, retry_count=0)
 
 
+def refreshable_meetings(conn: sqlite3.Connection, meeting_ids: list[str]) -> int:
+    """How many of these `queue_minutes_refresh` would actually requeue.
+
+    The read-only half of the pair, so a dry run can report the real recompile
+    cost before anything is committed rather than guessing at it.
+    """
+    ids = sorted({meeting_id for meeting_id in meeting_ids if meeting_id})
+    if not ids:
+        return 0
+    placeholders = ", ".join("?" for _ in ids)
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM meetings WHERE id IN ({placeholders}) "
+        "AND status IN (?, ?)",
+        (*ids, MINUTES_COMPILED, INDEXED),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
 def queue_minutes_refresh(conn: sqlite3.Connection, meeting_ids: list[str]) -> int:
     """Requeue completed meetings whose confirmed speaker names changed.
 
@@ -751,6 +769,35 @@ def set_speaker(
         """,
         (meeting_id, label, name, confidence, name, confidence),
     )
+
+
+def label_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Diarized label count per meeting, in one query.
+
+    `speakers` holds a row per label whether or not it was ever named, so this
+    is the label count without touching a transcript. Callers use it to spot
+    over-segmentation across a whole rematch run rather than per row.
+
+    The union with `speaker_matches` is what makes the answer independent of
+    which pass ran first. Both tables carry one row per (meeting, label), and on
+    the current corpus they agree on every meeting - but a meeting known only to
+    `speaker_matches` would otherwise count zero labels, and `over_segmented(0)`
+    is False, so the veto would switch itself off silently rather than fail.
+    `UNION` rather than `UNION ALL`, so a label both tables know is counted once.
+    """
+    return {
+        r["meeting_id"]: int(r["n"])
+        for r in conn.execute(
+            """
+            SELECT meeting_id, COUNT(*) AS n FROM (
+                SELECT meeting_id, label FROM speakers
+                UNION
+                SELECT meeting_id, label FROM speaker_matches
+            ) AS labels
+            GROUP BY meeting_id
+            """
+        )
+    }
 
 
 def get_speakers(conn: sqlite3.Connection, meeting_id: str) -> dict[str, str]:
@@ -1446,6 +1493,23 @@ def upsert_speaker_match(conn: sqlite3.Connection, meeting_id: str, label: str, 
     )
 
 
+def set_match_llm_name(
+    conn: sqlite3.Connection, meeting_id: str, label: str, name: str | None
+) -> None:
+    """Record the transcript pass's conclusion against an existing match row.
+
+    An UPDATE rather than `upsert_speaker_match`, because that would CREATE a row
+    for every diarized label. A row with no embedding is invisible to matching,
+    clustering and the review queue alike, so manufacturing them would fill the
+    table with records nothing can ever act on.
+    """
+    conn.execute(
+        "UPDATE speaker_matches SET llm_name = ?, updated_at = ? "
+        "WHERE meeting_id = ? AND label = ?",
+        (name, now_iso(), meeting_id, label),
+    )
+
+
 def get_speaker_match(conn: sqlite3.Connection, meeting_id: str, label: str):
     return conn.execute(
         "SELECT * FROM speaker_matches WHERE meeting_id = ? AND label = ?",
@@ -1478,11 +1542,31 @@ def cluster_labels(conn: sqlite3.Connection, cluster_id: str) -> list[sqlite3.Ro
     )
 
 
-def replace_clusters(conn: sqlite3.Connection, clusters: list[dict[str, object]]) -> None:
-    """Rebuild voice_clusters wholesale. Idempotent and safe on demand."""
+def replace_clusters(
+    conn: sqlite3.Connection, clusters: list[dict[str, object]], *, model: str
+) -> None:
+    """Rebuild one namespace's voice_clusters. Idempotent and safe on demand.
+
+    Scoped to `model` because the unscoped version destroyed every namespace's
+    clusters whenever any one of them was reclustered - which is how an empty
+    namespace came to wipe the live review queue on each dashboard load.
+    `voice_clusters` carries no model column and needs none: membership lives in
+    speaker_matches, which does.
+    """
     ts = now_iso()
-    conn.execute("DELETE FROM voice_clusters")
-    conn.execute("UPDATE speaker_matches SET cluster_id = NULL WHERE state = 'pending'")
+    conn.execute(
+        """
+        DELETE FROM voice_clusters WHERE id IN (
+            SELECT DISTINCT cluster_id FROM speaker_matches
+            WHERE model = ? AND cluster_id IS NOT NULL
+        )
+        """,
+        (model,),
+    )
+    conn.execute(
+        "UPDATE speaker_matches SET cluster_id = NULL WHERE state = 'pending' AND model = ?",
+        (model,),
+    )
     for cluster in clusters:
         conn.execute(
             """
@@ -1504,6 +1588,18 @@ def replace_clusters(conn: sqlite3.Connection, clusters: list[dict[str, object]]
                 "WHERE meeting_id = ? AND label = ?",
                 (cluster["id"], ts, meeting_id, label),
             )
+
+    # Sweep clusters no row points at any more. Without this the wreckage of an
+    # earlier unscoped rebuild would sit in the queue forever, offering cards
+    # whose members cannot be loaded.
+    conn.execute(
+        """
+        DELETE FROM voice_clusters WHERE id NOT IN (
+            SELECT cluster_id FROM speaker_matches
+            WHERE cluster_id IS NOT NULL AND state = 'pending'
+        )
+        """
+    )
 
 
 def pending_clusters(

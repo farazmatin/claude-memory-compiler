@@ -129,3 +129,89 @@ def test_graph_sync_publishes_when_the_only_refusals_are_drops(manifest, monkeyp
         assert cli.db.get_meeting(conn, "m1").status == cli.db.INDEXED, (
             "a meeting whose minutes are on disk must not sit behind a junk entity"
         )
+
+
+def _client_returning(status: int, body: str = '{"detail":"Internal server error"}'):
+    import httpx
+
+    class _Resp:
+        status_code = status
+        text = body
+
+    client = httpx.Client(transport=httpx.MockTransport(lambda _r: httpx.Response(200)))
+    client.post = lambda *a, **k: _Resp()  # type: ignore[method-assign]
+    return client
+
+
+def test_a_500_the_graph_actually_kept_is_not_a_refusal():
+    """LightRAG commits the record, then fails upserting a vector it cannot embed.
+
+    This deployment points the embedding binding at a closed port on purpose, so
+    every graph write answers 500 after landing. Counting those as refused made
+    graph-sync report "the graph still holds the PREVIOUS corpus" when all 293
+    writes were present, and made `pipeline run` exit non-zero on every sync.
+    """
+    from pipeline import graph_sync
+
+    outcome, detail = graph_sync._post(
+        _client_returning(500), "/graph/entity/create", {}, verify=lambda: True
+    )
+    assert outcome == graph_sync.VERIFIED
+    assert detail == ""
+
+
+def test_a_500_the_graph_did_not_keep_is_still_a_refusal():
+    """The verifier may only ever downgrade a failure it can actually disprove."""
+    from pipeline import graph_sync
+
+    outcome, detail = graph_sync._post(
+        _client_returning(500), "/graph/entity/create", {}, verify=lambda: False
+    )
+    assert outcome == graph_sync.FAILED
+    assert "500" in detail
+
+
+def test_a_permanent_refusal_is_never_verified_away():
+    """A 400 is the payload being unacceptable, not a half-completed write."""
+    from pipeline import graph_sync
+
+    outcome, _ = graph_sync._post(
+        _client_returning(400, '{"detail":"bad name"}'),
+        "/graph/entity/create", {}, verify=lambda: True,
+    )
+    assert outcome == graph_sync.DROPPED
+
+
+def test_graph_sync_publishes_when_every_write_landed_despite_a_500(
+    manifest, monkeypatch, capsys
+):
+    """Verified writes must satisfy the wrote-nothing guard, or nothing publishes.
+
+    The live corpus produced exactly this shape: 293 writes answered 500, all 293
+    present in the graph, and the run still refused to advance a single meeting.
+    """
+    from pipeline import cli, graph_sync, index
+
+    report = graph_sync.SyncReport(
+        entities_verified=293,
+        entities_skipped=1383,
+        relations_skipped=1785,
+    )
+    monkeypatch.setattr(index, "health", lambda: None)
+    monkeypatch.setattr(graph_sync, "graph_labels", lambda: ["a"] * 1640)
+    monkeypatch.setattr(graph_sync, "sync", lambda: report)
+
+    from .conftest import make_meeting
+
+    make_meeting(manifest, "m1", "2026-08-10")
+    cli.db.advance(manifest, "m1", cli.db.MINUTES_COMPILED, minutes_path="/m.md")
+    manifest.commit()
+
+    rc = cli.cmd_graph_sync(argparse.Namespace(limit=None))
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "wrote nothing" not in out
+    assert "landed despite a 5xx" in out, "a verified write must stay visible, not read as clean"
+    with cli.db.connect() as conn:
+        assert cli.db.get_meeting(conn, "m1").status == cli.db.INDEXED

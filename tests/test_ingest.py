@@ -46,6 +46,26 @@ def test_parse_filename(filename, date, time, hint):
     assert parsed.title_hint == hint
 
 
+def test_mtime_fallback_rewinds_to_the_start_of_the_recording():
+    """mtime is when the recording ended, so the fallback subtracts the duration.
+
+    Drive-captured names carry no time at all, so every one of them took the
+    fallback and was filed an hour late.
+    """
+    parsed = ingest.parse_filename(
+        Path("1tvJe0G9u_My_recording_74.mp3"), MTIME, duration_sec=3600
+    )
+    assert parsed.date == "2026-08-10"
+    assert parsed.time == "13:30"
+
+
+def test_filename_time_is_already_a_start_and_is_not_rewound():
+    parsed = ingest.parse_filename(
+        Path("Ali Aug 10 at 11-12 a.m..m4a"), MTIME, duration_sec=3600
+    )
+    assert parsed.time == "11:12"
+
+
 def test_month_name_date_uses_mtime_year():
     """Month-name dates carry no year, so mtime supplies it."""
     parsed = ingest.parse_filename(

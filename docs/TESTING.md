@@ -14,6 +14,10 @@ For a broader check:
 - Replicate is the sole backend constructor.
 - A missing Replicate token fails before transcription.
 - The pipeline contains no voice-enrollment stage.
+- Clustering one voice namespace never deletes another's clusters.
+- An over-segmented meeting never yields an auto-applied name.
+- Auto-apply never downgrades a label a human confirmed.
+- Auto-apply is a dry run unless `--apply` is given.
 - Drive capture dry-run remains non-mutating.
 - Graph context remains bounded and provenance-bearing.
 

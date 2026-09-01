@@ -435,7 +435,7 @@ def get_voice_clusters() -> list[dict[str, Any]]:
     """Return pending voice review clusters with member meeting details."""
     db.init_db()
     with db.connect() as conn:
-        voices.cluster_pending(conn)
+        voices.cluster_pending(conn, voices.active_namespace(conn))
         clusters = db.pending_clusters(conn)
 
         result = []
@@ -563,11 +563,39 @@ def speaker_resolution_queue(limit: int | None = None) -> dict[str, Any]:
     return {"clusters": clusters, "one_offs": one_offs}
 
 
+class StaleClusterError(RuntimeError):
+    """The held cluster id no longer names a group of labels.
+
+    Clustering is rebuilt on demand, so a rebuild that genuinely regrouped the
+    labels retires the id the browser is holding. Answering HTTP 200 with
+    `{"confirmed": 0}` made a discarded human confirmation look like a
+    successful one, which is the single outcome the voice module is built to
+    prevent. The caller is told to reload the queue instead.
+    """
+
+
+def _require_cluster(cluster_id: str, result):
+    if not result:
+        raise StaleClusterError(
+            f"Cluster {cluster_id} is no longer in the review queue - it was "
+            "regrouped or already answered. Reload the queue and try again."
+        )
+    return result
+
+
 def confirm_voice_cluster(cluster_id: str, canonical: str) -> int:
     """Confirm all appearances in a voice cluster as a canonical person name."""
     db.init_db()
     with db.connect() as conn:
-        return voices.confirm(conn, cluster_id=cluster_id, canonical=canonical.strip())
+        return _require_cluster(
+            cluster_id,
+            voices.confirm(
+                conn,
+                cluster_id=cluster_id,
+                canonical=canonical.strip(),
+                model=voices.active_namespace(conn),
+            ),
+        )
 
 
 def confirm_confident_clusters(threshold: float = 0.85) -> dict[str, int]:
@@ -593,14 +621,19 @@ def dismiss_voice_cluster(cluster_id: str) -> int:
     """Dismiss a cluster as non-speaker noise or crosstalk."""
     db.init_db()
     with db.connect() as conn:
-        return voices.dismiss(conn, cluster_id=cluster_id)
+        return _require_cluster(cluster_id, voices.dismiss(conn, cluster_id=cluster_id))
 
 
 def split_voice_cluster(cluster_id: str) -> list[str]:
     """Split a cluster back into individual pending speaker matches."""
     db.init_db()
     with db.connect() as conn:
-        return voices.split_cluster(conn, cluster_id=cluster_id)
+        return _require_cluster(
+            cluster_id,
+            voices.split_cluster(
+                conn, cluster_id=cluster_id, model=voices.active_namespace(conn)
+            ),
+        )
 
 
 def decision_timeline(topic: str | None = None) -> dict[str, Any]:
@@ -1453,6 +1486,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     HTTPStatus.OK,
                     {"confirmed": count, "cluster_id": cluster_id, "canonical": canonical},
                 )
+            except StaleClusterError as exc:
+                self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
             except Exception as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
@@ -1474,6 +1509,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise ValueError("'cluster_id' is required.")
                 count = dismiss_voice_cluster(str(cluster_id))
                 self._json(HTTPStatus.OK, {"dismissed": count, "cluster_id": cluster_id})
+            except StaleClusterError as exc:
+                self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
             except Exception as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
@@ -1485,6 +1522,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise ValueError("'cluster_id' is required.")
                 result = split_voice_cluster(str(cluster_id))
                 self._json(HTTPStatus.OK, {"split": result, "cluster_id": cluster_id})
+            except StaleClusterError as exc:
+                self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
             except Exception as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return

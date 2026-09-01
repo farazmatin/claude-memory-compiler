@@ -11,6 +11,7 @@ minutes compilation loses minutes of work rather than hours.
     pipeline ingest                discover + dedup new audio
     pipeline transcribe            ASR + align + diarize      (the expensive one)
     pipeline speakers              resolve SPEAKER_xx -> names
+    pipeline voice                 re-band the voice queue; apply confident matches
     pipeline minutes               compile structured minutes
     pipeline graph-sync            publish subscription-authored graph records
     pipeline graph-sync            author the graph from the manifest
@@ -44,12 +45,14 @@ from pipeline import (
     ingest,
     people_merge,
     speakers,
+    voices,
 )
 from pipeline.config import (
     AUTO_REQUEUE_LIMIT,
     DASHBOARD_HOST,
     DASHBOARD_PORT,
     DB_DIR,
+    DB_PATH,
     MIN_MEETING_SEC,
     MIN_TRANSCRIPT_WORDS,
     OWNER_NAME,
@@ -500,7 +503,16 @@ def cmd_graph_sync(args: argparse.Namespace) -> int:
     # A populated graph is not evidence that THIS run worked. Reporting success
     # after every write was refused would leave the graph quietly describing a
     # previous corpus.
-    wrote = report.entities_written + report.relations_written
+    # A write the service reported as 5xx but the graph demonstrably kept counts
+    # as a write. It is the normal outcome on this deployment - LightRAG commits
+    # the record before upserting a vector it has no embedder for - and treating
+    # it as a refusal reported a corpus-wide failure that had not happened.
+    wrote = (
+        report.entities_written
+        + report.relations_written
+        + report.entities_verified
+        + report.relations_verified
+    )
     if not wrote and report.errors:
         print(
             f"graph-sync wrote nothing: {len(report.errors)} write(s) refused. "
@@ -1033,6 +1045,87 @@ def cmd_entities(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_voice(args: argparse.Namespace) -> int:
+    """Re-score the voice queue and apply what the matcher is confident about.
+
+    Two operations, deliberately separate. `--rematch` only re-bands and
+    re-clusters: it never touches a name, so it is safe to run any time. Naming
+    is `--apply-auto`, which is a dry run unless `--apply` is given, because the
+    first real invocation against a mature corpus requeues dozens of meetings
+    for a minutes recompile and a reindex.
+    """
+    from datetime import datetime
+
+    from pipeline import backup
+    from pipeline.config import TZ
+
+    db.init_db()
+    if not (args.rematch or args.apply_auto):
+        args.apply_auto = True
+    # Committing a band nobody just computed is how a stale band becomes a name.
+    # The preview stays write-free, so only the committing path re-bands first.
+    if args.apply:
+        args.rematch = True
+
+    with db.connect() as conn:
+        try:
+            namespace = voices.active_namespace(conn)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(f"namespace: {namespace}")
+
+        if args.rematch:
+            promoted = voices.rematch_pending(conn, namespace)
+            clusters = voices.cluster_pending(conn, namespace)
+            print(f"rematch: {promoted} promoted to auto, {clusters} review cluster(s)")
+
+        if not args.apply_auto:
+            return 0
+
+        preview = voices.apply_auto(
+            conn, namespace=namespace, dry_run=True, limit=args.limit
+        )
+        _print_auto_apply(preview, committed=False)
+        if not args.apply:
+            print()
+            print("Dry run. Re-run with --apply to commit.")
+            return 0
+
+    stamp = f"{datetime.now(TZ):%Y%m%d-%H%M%S}"
+    destination = DB_PATH.parent / "backups" / f"manifest-{stamp}-pre-auto-apply.db"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    backup.backup_sqlite(DB_PATH, destination)
+    print()
+    print(f"manifest backed up to {destination}")
+
+    with db.connect() as conn:
+        result = voices.apply_auto(
+            conn, namespace=namespace, dry_run=False, limit=args.limit
+        )
+        voices.cluster_pending(conn, namespace)
+    _print_auto_apply(result, committed=True)
+    if result.meetings_requeued:
+        print(f"Run `pipeline run` to recompile {result.meetings_requeued} meeting(s).")
+    return 0
+
+
+def _print_auto_apply(result: voices.AutoApplyResult, *, committed: bool) -> None:
+    verb = "applied" if committed else "would apply"
+    print(
+        f"{verb} {len(result.applied)}, skipped {len(result.skipped)}, "
+        f"demoted {len(result.demoted)}; "
+        f"{result.meetings_requeued} meeting(s) requeued for minutes + reindex"
+    )
+    names = Counter(canonical for _, _, canonical in result.applied)
+    if names:
+        print("  names: " + ", ".join(f"{n} x{c}" for n, c in names.most_common(8)))
+    for meeting_id, label, reason in result.skipped[:10]:
+        print(f"  skip  {meeting_id[:12]} {label}: {reason}")
+    for meeting_id, label, reason in result.demoted[:10]:
+        print(f"  review {meeting_id[:12]} {label}: {reason}")
+
+
 def cmd_doctor(_args: argparse.Namespace) -> int:
     """Preflight the environment.
 
@@ -1284,6 +1377,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_entities = subparsers.add_parser("entities", help="most-mentioned entities")
     p_entities.add_argument("--limit", type=int, default=50)
     p_entities.set_defaults(func=cmd_entities)
+
+    p_voice = subparsers.add_parser(
+        "voice", help="re-score the voice queue and apply confident matches"
+    )
+    p_voice.add_argument(
+        "--rematch", action="store_true",
+        help="re-score and re-cluster pending labels; never names anyone",
+    )
+    p_voice.add_argument(
+        "--apply-auto", action="store_true",
+        help="write auto-banded matches into the speakers table (the default)",
+    )
+    p_voice.add_argument(
+        "--apply", action="store_true",
+        help="commit --apply-auto instead of previewing; implies --rematch, so a "
+             "stale band is never committed as a name",
+    )
+    p_voice.add_argument("--limit", type=int, help="cap the rows considered")
+    p_voice.set_defaults(func=cmd_voice)
 
     subparsers.add_parser(
         "doctor", help="preflight the environment before a real batch"

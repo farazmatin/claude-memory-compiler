@@ -399,6 +399,7 @@ def test_merge_rewrites_every_person_bearing_record_and_queues_minutes(
         manifest,
         "m1",
         "SPEAKER_00",
+        model="test-embed-v1",
         best_canonical="Alice",
         best_score=0.9,
         next_canonical="Bob",
@@ -420,6 +421,7 @@ def test_merge_rewrites_every_person_bearing_record_and_queues_minutes(
                 "members": [("m1", "SPEAKER_00")],
             }
         ],
+        model="test-embed-v1",
     )
     db.add_voice_sample(
         manifest,

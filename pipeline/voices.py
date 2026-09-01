@@ -34,13 +34,14 @@ asking rather than guessing.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
-import uuid
 from dataclasses import dataclass
 
 from pipeline import db
 from pipeline.config import (
+    IMPLAUSIBLE_SPEAKER_COUNT,
     SNIPPET_COUNT,
     SNIPPET_MIN_SEPARATION_SEC,
     SNIPPET_MIN_WORD_COVERAGE,
@@ -65,6 +66,10 @@ STATE_DISMISSED = "dismissed"
 
 QUALITY_OK = "ok"
 QUALITY_LOW = "low"
+
+# The default namespace while local enrollment was retired. Nothing was ever
+# written under it, so resolving to it is an outage, not a quarantine.
+QUARANTINED_NAMESPACE = "historical"
 
 # How the sensitivity control maps onto the three thresholds. One dial the owner
 # understands, rather than three cosine values nobody should have to reason about.
@@ -129,6 +134,34 @@ class MatchResult:
         return self.best_score - self.next_score
 
 
+# ── Namespace ─────────────────────────────────────────────────────────
+
+def active_namespace(conn: sqlite3.Connection) -> str:
+    """The one namespace every voice read and write is keyed by.
+
+    Resolved here rather than defaulted at each call site. Seven default
+    arguments is seven chances to read an empty namespace silently, and that is
+    exactly what happened: the configured default named an encoder no stored row
+    used, so cluster_pending() found nothing, called replace_clusters([]), and
+    deleted the review queue on every dashboard load while 166 matches waited.
+    Every namespaced function now takes the value as a required parameter, so a
+    missed call site is a TypeError rather than a quiet wrong answer.
+
+    The manifest setting wins over the configured default so that swapping
+    encoders - the one change that legitimately moves the namespace - is one row
+    rather than a deploy.
+    """
+    name = (db.get_setting(conn, "voice.active_namespace") or "").strip()
+    if not name:
+        name = VOICE_VECTOR_NAMESPACE.strip()
+    if not name or name == QUARANTINED_NAMESPACE:
+        raise ValueError(
+            "no active voice namespace: set the manifest setting "
+            f"voice.active_namespace (resolved to {name!r})"
+        )
+    return name
+
+
 # ── Vector storage ────────────────────────────────────────────────────
 #
 # float32 little-endian, so a vector survives the round trip through SQLite
@@ -172,7 +205,7 @@ def cosine(a, b) -> float:
 
 # ── Voiceprints ───────────────────────────────────────────────────────
 
-def voiceprint(conn: sqlite3.Connection, canonical: str, model: str = VOICE_VECTOR_NAMESPACE):
+def voiceprint(conn: sqlite3.Connection, canonical: str, *, model: str):
     """A person's voiceprint: the duration-weighted mean of their samples.
 
     Weighted by speech duration because a thirty-second sample is better evidence
@@ -195,7 +228,7 @@ def voiceprint(conn: sqlite3.Connection, canonical: str, model: str = VOICE_VECT
     return normalize(weighted)
 
 
-def enrolled(conn: sqlite3.Connection, model: str = VOICE_VECTOR_NAMESPACE) -> dict[str, object]:
+def enrolled(conn: sqlite3.Connection, model: str) -> dict[str, object]:
     """Every enrolled person's voiceprint, keyed by canonical name."""
     prints: dict[str, object] = {}
     for name in db.enrolled_names(conn, model):
@@ -222,6 +255,17 @@ def match(vector, prints: dict[str, object]) -> MatchResult:
         return MatchResult(best=best, best_score=best_score)
     runner_up, runner_score = scored[1]
     return MatchResult(best=best, best_score=best_score, next=runner_up, next_score=runner_score)
+
+
+def over_segmented(label_count: int) -> bool:
+    """Whether a meeting's label count is too high to trust any single label.
+
+    Reuses the threshold `asr.Transcript.diarization_warning` already surfaces
+    to the owner, so the veto and the warning can never disagree. A high count
+    is the diarizer splitting one noisy speaker rather than a real crowd, which
+    makes every embedding from that meeting a fragment of someone.
+    """
+    return label_count > IMPLAUSIBLE_SPEAKER_COUNT
 
 
 def band(
@@ -264,13 +308,21 @@ def score_match(
     prints: dict[str, object],
     thresholds: Thresholds,
     *,
-    over_segmented: bool = False,
+    model: str,
+    over_segmented: bool,
 ) -> tuple[MatchResult, str]:
-    """Score one stored `speaker_matches` row and band it."""
+    """Score one stored `speaker_matches` row and band it.
+
+    `over_segmented` is required rather than defaulted. A default of False is
+    what kept this guard dead for the module's entire life: `band` accepted the
+    parameter, no caller ever passed it, and nothing could tell. Requiring it
+    makes the next caller that forgets a TypeError instead of a silent wrong
+    band.
+    """
     vector = unpack(row["embedding"], row["dim"])
     result = match(vector, prints)
     enroll_meetings = (
-        db.sample_meeting_count(conn, result.best, row["model"] or VOICE_VECTOR_NAMESPACE)
+        db.sample_meeting_count(conn, result.best, row["model"] or model)
         if result.best
         else 0
     )
@@ -285,7 +337,7 @@ def score_match(
     return result, decided
 
 
-def rematch_pending(conn: sqlite3.Connection, model: str = VOICE_VECTOR_NAMESPACE) -> int:
+def rematch_pending(conn: sqlite3.Connection, model: str) -> int:
     """Re-score every pending label against the current voiceprints.
 
     Run on demand. This is the job that makes effort compound downward: each label
@@ -296,10 +348,20 @@ def rematch_pending(conn: sqlite3.Connection, model: str = VOICE_VECTOR_NAMESPAC
     """
     thresholds = Thresholds.load(conn)
     prints = enrolled(conn, model)
+    # Fetched once for the whole run. Per row this would be one query per label,
+    # and the answer is a property of the meeting, not of the label.
+    counts = db.label_counts(conn)
     promoted = 0
 
     for row in db.pending_matches(conn, model=model):
-        result, decided = score_match(conn, row, prints, thresholds)
+        result, decided = score_match(
+            conn,
+            row,
+            prints,
+            thresholds,
+            model=model,
+            over_segmented=over_segmented(counts.get(row["meeting_id"], 0)),
+        )
         db.upsert_speaker_match(
             conn,
             row["meeting_id"],
@@ -318,7 +380,7 @@ def rematch_pending(conn: sqlite3.Connection, model: str = VOICE_VECTOR_NAMESPAC
 
 # ── Clustering ────────────────────────────────────────────────────────
 
-def cluster_pending(conn: sqlite3.Connection, model: str = VOICE_VECTOR_NAMESPACE) -> int:
+def cluster_pending(conn: sqlite3.Connection, model: str) -> int:
     """Group pending labels believed to be the same person.
 
     The unit of work has to be a voice, not a meeting. Grouping by meeting asks
@@ -336,7 +398,7 @@ def cluster_pending(conn: sqlite3.Connection, model: str = VOICE_VECTOR_NAMESPAC
     thresholds = Thresholds.load(conn)
     rows = [r for r in db.pending_matches(conn, model=model) if r["band"] != BAND_AUTO]
     if not rows:
-        db.replace_clusters(conn, [])
+        db.replace_clusters(conn, [], model=model)
         return 0
 
     vectors = [normalize(unpack(row["embedding"], row["dim"])) for row in rows]
@@ -348,7 +410,7 @@ def cluster_pending(conn: sqlite3.Connection, model: str = VOICE_VECTOR_NAMESPAC
         leader = max(rows_in, key=lambda r: float(r["speech_sec"] or 0.0))
         clusters.append(
             {
-                "id": uuid.uuid4().hex,
+                "id": _cluster_id([(r["meeting_id"], r["label"]) for r in rows_in]),
                 "size": len(rows_in),
                 "total_speech": sum(float(r["speech_sec"] or 0.0) for r in rows_in),
                 "best_canonical": leader["best_canonical"],
@@ -362,8 +424,27 @@ def cluster_pending(conn: sqlite3.Connection, model: str = VOICE_VECTOR_NAMESPAC
             }
         )
 
-    db.replace_clusters(conn, clusters)
+    db.replace_clusters(conn, clusters, model=model)
     return len(clusters)
+
+
+def _cluster_id(members) -> str:
+    """A cluster's id, derived from its membership rather than freshly minted.
+
+    Clustering is rebuilt on every dashboard load, and `uuid.uuid4()` gave every
+    rebuild a new id for an unchanged group. Measured on the live manifest: two
+    consecutive rebuilds of the same 63 clusters shared **zero** ids. The browser
+    holds the id it was served, so any Confirm that arrived after an intervening
+    read of the queue named nobody - and the route answered HTTP 200 with
+    `{"confirmed": 0}`. Silently discarding a human confirmation is the exact
+    outcome this module's docstring says must never happen.
+
+    An id that is a function of the group survives any rebuild that did not
+    change the group. A rebuild that genuinely regrouped the labels still
+    changes the id, which is a real conflict and is reported as one.
+    """
+    joined = "\x00".join(f"{meeting_id}/{label}" for meeting_id, label in sorted(members))
+    return hashlib.sha1(joined.encode("utf-8")).hexdigest()[:32]
 
 
 def _agglomerate(vectors: list, threshold: float) -> list[list[int]]:
@@ -396,7 +477,7 @@ def _average_linkage(vectors: list, left: list[int], right: list[int]) -> float:
     return total / (len(left) * len(right))
 
 
-def split_cluster(conn: sqlite3.Connection, cluster_id: str) -> list[str]:
+def split_cluster(conn: sqlite3.Connection, cluster_id: str, *, model: str) -> list[str]:
     """Dissolve a cluster into one single-label cluster per member.
 
     Clustering will occasionally group two people, and confirming such a group
@@ -409,7 +490,7 @@ def split_cluster(conn: sqlite3.Connection, cluster_id: str) -> list[str]:
 
     clusters = [
         {
-            "id": uuid.uuid4().hex,
+            "id": _cluster_id([(row["meeting_id"], row["label"])]),
             "size": 1,
             "total_speech": float(row["speech_sec"] or 0.0),
             "best_canonical": row["best_canonical"],
@@ -427,7 +508,11 @@ def split_cluster(conn: sqlite3.Connection, cluster_id: str) -> list[str]:
     for existing in db.pending_clusters(conn, limit=10_000):
         if existing["id"] == cluster_id:
             continue
-        rows = db.cluster_labels(conn, existing["id"])
+        # Only this namespace's clusters. replace_clusters deletes by namespace,
+        # so carrying another namespace's cluster across re-INSERTs a row that
+        # was never deleted - a UNIQUE violation the moment two namespaces
+        # coexist, which the benchmark phase guarantees.
+        rows = [r for r in db.cluster_labels(conn, existing["id"]) if r["model"] == model]
         if not rows:
             continue
         clusters.append(
@@ -444,18 +529,150 @@ def split_cluster(conn: sqlite3.Connection, cluster_id: str) -> list[str]:
             }
         )
 
-    db.replace_clusters(conn, clusters)
+    db.replace_clusters(conn, clusters, model=model)
     return [c["id"] for c in clusters[: len(members)]]  # type: ignore[misc]
 
 
 # ── Resolution ────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class AutoApplyResult:
+    applied: tuple[tuple[str, str, str], ...] = ()   # (meeting_id, label, canonical)
+    skipped: tuple[tuple[str, str, str], ...] = ()   # (meeting_id, label, reason)
+    demoted: tuple[tuple[str, str, str], ...] = ()   # (meeting_id, label, reason)
+    meetings_requeued: int = 0
+
+
+def apply_auto(
+    conn: sqlite3.Connection,
+    *,
+    namespace: str,
+    dry_run: bool = True,
+    limit: int | None = None,
+) -> AutoApplyResult:
+    """Write auto-banded matches into the speakers table.
+
+    Without this, a row banded `auto` is in limbo: `cluster_pending` filters it
+    out of the review cards, and nothing applies it. 92 rows across 46 meetings
+    sat in that gap - in neither the queue nor the transcript - which is most of
+    why speaker names looked worse than the matcher actually was.
+
+    Three rules, and each of them is a guard the archived reference lacked:
+
+      * Every write goes through `speakers.merge_label`. `db.set_speaker` is an
+        unconditional upsert, so a machine pass calling it directly would
+        downgrade names a human confirmed by ear.
+      * A label already `confirmed` is skipped outright, and its match resolves
+        to the confirmed name rather than to `best_canonical`. A human ear
+        outranks a cosine.
+      * A declined row is demoted to `review` rather than left `auto`, so it
+        lands on a card instead of disappearing back into the same limbo.
+
+    Applied rows keep `state = pending`: an inference is correctable by ear, and
+    resolving it would drop it out of the review queue for good. Only `confirm`
+    resolves a row.
+
+    Dry run by default. The first invocation against a mature corpus requeues
+    dozens of meetings for a minutes recompile and a reindex, which is not a
+    thing to do as a side effect.
+    """
+    from pipeline import speakers
+
+    rows = [r for r in db.pending_matches(conn, model=namespace) if r["band"] == BAND_AUTO]
+    # `pending_matches` orders on speech_sec alone, which is not a total order:
+    # two --limit runs could otherwise disagree on which rows they took.
+    rows.sort(key=lambda r: (-float(r["speech_sec"] or 0.0), r["meeting_id"], r["label"]))
+    if limit is not None:
+        rows = rows[:limit]
+
+    meetings = {row["meeting_id"] for row in rows}
+    placeholders = ", ".join("?" for _ in meetings) or "NULL"
+    existing = {
+        (r["meeting_id"], r["label"]): (r["name"], r["confidence"])
+        for r in conn.execute(
+            "SELECT meeting_id, label, name, confidence FROM speakers "
+            f"WHERE meeting_id IN ({placeholders})",
+            tuple(sorted(meetings)),
+        )
+    }
+    counts = db.label_counts(conn)
+
+    applied: list[tuple[str, str, str]] = []
+    skipped: list[tuple[str, str, str]] = []
+    demoted: list[tuple[str, str, str]] = []
+    # Only a meeting whose stored name actually changes needs its minutes
+    # rebuilt. Requeueing on every run would recompile the whole corpus each
+    # time the stage is invoked, for no change.
+    changed_meetings: set[str] = set()
+
+    for row in rows:
+        key = (row["meeting_id"], row["label"])
+        canonical = row["best_canonical"]
+        name, confidence = existing.get(key, (None, speakers.CONFIDENCE_UNKNOWN))
+
+        if confidence == speakers.CONFIDENCE_CONFIRMED:
+            skipped.append((*key, "already confirmed by a human"))
+            if not dry_run and name:
+                db.upsert_speaker_match(conn, *key, resolved_as=name)
+            continue
+
+        if not canonical:
+            demoted.append((*key, "no candidate above the review threshold"))
+            if not dry_run:
+                db.upsert_speaker_match(conn, *key, band=BAND_REVIEW)
+            continue
+
+        if row["resolved_as"] and row["resolved_as"] != canonical:
+            # This row was already auto-applied under a different name, and the
+            # matcher has since changed its mind - voiceprints shift every time
+            # the owner confirms a cluster. A machine silently overruling its own
+            # earlier machine decision, and recompiling the minutes under someone
+            # else's name, is precisely the confident-wrong-name failure the
+            # bands exist to prevent. The disagreement goes to a human.
+            demoted.append((*key, f"matcher changed its mind: {row['resolved_as']} -> {canonical}"))
+            if not dry_run:
+                db.upsert_speaker_match(conn, *key, band=BAND_REVIEW)
+            continue
+
+        # Re-derived here rather than trusted from the stored band. Banding
+        # happens in `rematch_pending`, which nothing in the pipeline calls yet,
+        # so every band on disk predates this veto - and an operator who runs
+        # the apply without a rematch first would name people in meetings the
+        # diarizer over-segmented. The guard belongs where the write happens.
+        if over_segmented(counts.get(row["meeting_id"], 0)):
+            demoted.append((*key, "meeting is over-segmented"))
+            if not dry_run:
+                db.upsert_speaker_match(conn, *key, band=BAND_REVIEW)
+            continue
+
+        applied.append((*key, canonical))
+        if name != canonical or confidence != speakers.CONFIDENCE_INFERRED:
+            changed_meetings.add(row["meeting_id"])
+        if not dry_run:
+            speakers.merge_label(
+                conn, row["meeting_id"], row["label"], canonical, speakers.CONFIDENCE_INFERRED
+            )
+            db.upsert_speaker_match(conn, *key, resolved_as=canonical)
+
+    if dry_run:
+        requeued = db.refreshable_meetings(conn, sorted(changed_meetings))
+    else:
+        requeued = db.queue_minutes_refresh(conn, sorted(changed_meetings))
+
+    return AutoApplyResult(
+        applied=tuple(applied),
+        skipped=tuple(skipped),
+        demoted=tuple(demoted),
+        meetings_requeued=requeued,
+    )
+
 
 def confirm(
     conn: sqlite3.Connection,
     cluster_id: str,
     canonical: str,
     *,
-    model: str = VOICE_VECTOR_NAMESPACE,
+    model: str,
 ) -> int:
     """Name every label in a cluster, enrolling each as a voice sample.
 

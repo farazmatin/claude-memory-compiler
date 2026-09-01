@@ -49,6 +49,20 @@ subscription CLIs author minutes, speaker resolution, entities, relations, and
 answer synthesis. LightRAG backed by Postgres stores and traverses the
 subscription-authored graph; it does not author facts.
 
+## Voice namespace
+
+Voice vectors are namespaced by the encoder that produced them, because vectors
+from different encoders are not comparable. Every voice read and write takes that
+namespace as a required parameter, resolved once by `voices.active_namespace()`
+from the manifest setting `voice.active_namespace`, falling back to
+`config.VOICE_VECTOR_NAMESPACE`.
+
+Nothing may default it per call site. A namespace that no stored row uses does
+not quarantine the corpus, it silently empties it: every namespaced read returns
+nothing, `cluster_pending` rebuilds the review queue as empty, and no error is
+raised anywhere. `pipeline doctor` fails when the active namespace is not one the
+stored vectors actually use.
+
 ## Context contract
 
 The authenticated loopback dashboard, normally on port 8765, exposes:
