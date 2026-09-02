@@ -331,7 +331,7 @@ class _GraphProbe:
             self._graph = graph_sync.retrieve_graph(
                 query, max_nodes=max_nodes, timeout_sec=self.timeout_sec
             )
-        except Exception as exc:  # noqa: BLE001 - a read-only search must not raise
+        except Exception as exc:  # a read-only search must not raise
             self._error = exc
 
     def result(self) -> tuple[dict[str, Any], str]:
@@ -391,8 +391,12 @@ def _entity_items(
     One per name rather than one per (name, meeting) pair, which is what makes
     the GC3 fix possible: a name that five meetings described used to become
     five items whose text was identical and whose citations disagreed. The
-    meeting chosen is the most recent that named it and is still eligible, since
-    the last thing said about a control is the thing an artifact needs.
+    meeting chosen is the most recent eligible one that actually described the
+    name, falling back to the most recent eligible meeting overall only if none
+    did - `entity["meetings"]` comes from `graph_sync.collect` before its own
+    description filter, so a meeting can name an entity and say nothing about
+    it, and the last meeting to do that is not the meeting an artifact should
+    cite.
     """
     descriptions = _entity_descriptions(conn)
     items: list[ContextItem] = []
@@ -406,7 +410,11 @@ def _entity_items(
                 for meeting_id in (str(value) for value in entity["meetings"])
                 if meeting_id in meetings and meeting_id not in excluded
             ),
-            key=lambda meeting_id: (meetings[meeting_id]["meeting_date"] or "", meeting_id),
+            key=lambda meeting_id: (
+                bool(descriptions.get((name, meeting_id))),
+                meetings[meeting_id]["meeting_date"] or "",
+                meeting_id,
+            ),
         )
         if not eligible:
             continue

@@ -382,6 +382,34 @@ def test_rrf_puts_a_hit_both_halves_found_above_one_only_either_found(manifest, 
     assert all(item.kind == "minute_excerpt" for item in result.items)
 
 
+def test_dedupe_keeps_the_longer_text_of_a_chunk_both_halves_found(manifest, monkeypatch):
+    """I-2. `_fuse` dedupes on `chunk_id`, keeping the longer text on a collision.
+
+    Both retrieval halves trim independently against their own running budget,
+    so the same chunk can arrive from both at different lengths - not a corner
+    case, a normal occurrence. Reranking a truncated excerpt scores the
+    truncation, not the passage, so the longer copy must be what the
+    cross-encoder is shown and what the wire item carries. Runs both orderings:
+    which half happened to find the long copy must not matter.
+    """
+    short = "Atlas depends on the Beacon launch."
+    long_text = short + " " + FILLER * 3
+
+    for lexical_text, semantic_text in ((short, long_text), (long_text, short)):
+        _halves(
+            monkeypatch,
+            lexical=[_hit("dup", text=lexical_text)],
+            semantic=[_hit("dup", text=semantic_text)],
+        )
+        flat = _reranker(monkeypatch)
+
+        result = _search(query="control inventory", limit=5, max_chars=20_000)
+
+        assert flat.documents == [long_text], f"reranker was shown {flat.documents!r}"
+        assert len(result.items) == 1
+        assert result.items[0].text == long_text
+
+
 def test_the_cross_encoder_reorders_the_fused_candidates(manifest, monkeypatch):
     """Step 4 is wired, not decorative: the rerank pass can overturn the fusion."""
     _halves(monkeypatch, lexical=[_hit("alpha"), _hit("omega")], semantic=[])
@@ -481,6 +509,29 @@ def test_an_entity_quotes_only_the_meeting_it_is_attributed_to(manifest, tmp_pat
     assert entities[0].meeting_id == "july"
     assert "sampling moved to the second line" in entities[0].text
     assert "owned by the first line" not in entities[0].text
+
+
+def test_an_entity_with_no_recent_description_falls_back_to_an_earlier_one(
+    manifest, tmp_path, monkeypatch
+):
+    """I-1. `entity["meetings"]` is populated before the description filter.
+
+    A meeting can name an entity and say nothing about it. If that meeting is
+    the most recent, it must not win over an earlier meeting that actually
+    described the entity - that would degrade the item to a bare name and
+    throw away real evidence the artifact needs.
+    """
+    _minutes(manifest, tmp_path, "june", "2026-06-09", _body("June"))
+    _minutes(manifest, tmp_path, "july", "2026-07-09", _body("July"))
+    _entity(manifest, "june", "Control inventory", "owned by the first line")
+    _entity(manifest, "july", "Control inventory", "")
+
+    result = _search(query="control inventory", limit=8, max_chars=20_000)
+
+    entities = [item for item in result.items if item.kind == "entity"]
+    assert len(entities) == 1
+    assert entities[0].meeting_id == "june"
+    assert "owned by the first line" in entities[0].text
 
 
 def test_exclude_meeting_ids_removes_the_meeting_grounding_the_request(
