@@ -28,6 +28,13 @@ FILLER = (
     "Ownership stays with the first line while the second line reviews sampling. "
 )
 
+# sha256 of the first chunk `_sample_minutes` produces, recorded at a known-good
+# state. Any change to chunk geometry moves it - which is the point: the hash is
+# what reindex compares to decide a meeting is unchanged, so it cannot drift
+# quietly. If a deliberate geometry change breaks this, re-derive it and say so
+# in the commit; the whole corpus needs a rebuild either way.
+GOLDEN_FIRST_CHUNK_HASH = "d0443224d5c3e48efa712e822d98ed3df02b835477933a9fbbdf83c30de9ec77"
+
 
 def _write_minutes(path: Path, body: str) -> Path:
     path.write_text(body, encoding="utf-8")
@@ -98,6 +105,34 @@ def test_chunker_is_deterministic(tmp_path):
     assert [c.text for c in first] == [c.text for c in second]
     assert [c.ordinal for c in first] == list(range(len(first)))
     assert first[0].chunk_id == "m1:0000"
+
+    # A literal, not a re-derivation. Two calls in one interpreter would agree
+    # even if the chunker were nondeterministic across runs; only a value
+    # written down at a known-good state makes this a cross-run assertion.
+    assert first[0].content_hash == GOLDEN_FIRST_CHUNK_HASH
+
+
+def test_a_crlf_checkout_hashes_the_same_as_an_lf_one(tmp_path):
+    """Otherwise every chunk churns on the first reindex after a Windows clone.
+
+    The guarantee comes from `read_text` applying universal newlines, not from
+    any normalising this module does. It is pinned here so a future switch to
+    `read_bytes().decode()` fails loudly instead of silently rewriting 2,809
+    rows and invalidating everything keyed on their hashes.
+    """
+    # write_bytes, not write_text: on Windows text mode already translates \n to
+    # \r\n on the way out, so a "LF fixture" written with write_text is not one.
+    body = _sample_minutes(tmp_path, "seed.md").read_text(encoding="utf-8")
+    lf = tmp_path / "lf.md"
+    crlf = tmp_path / "crlf.md"
+    lf.write_bytes(body.encode("utf-8"))
+    crlf.write_bytes(body.replace("\n", "\r\n").encode("utf-8"))
+    assert b"\r\n" not in lf.read_bytes()
+    assert b"\r\n" in crlf.read_bytes()
+
+    assert [c.content_hash for c in chunk_index.chunk_minutes(crlf, meeting_id="m1")] == [
+        c.content_hash for c in chunk_index.chunk_minutes(lf, meeting_id="m1")
+    ]
 
 
 # ── 2. No fragments ───────────────────────────────────────────────────
@@ -210,7 +245,10 @@ def test_bm25_ranks_the_exact_proper_noun_above_a_topical_match(manifest, tmp_pa
         )
     chunk_index.reindex_all(manifest)
 
-    hits = chunk_index.search_chunks(manifest, "USC control inventory")
+    # max_chars is deliberately huge: with ten matching meetings the default
+    # 4,000 admits only the first six or seven hits, and this test would then
+    # fail as a ranking regression when the real cause was the budget.
+    hits = chunk_index.search_chunks(manifest, "USC control inventory", max_chars=100_000)
 
     assert hits, "expected both meetings to match"
     assert hits[0].meeting_id == "exact"
@@ -279,6 +317,46 @@ def test_one_verbose_meeting_cannot_fill_the_result_set(manifest, tmp_path):
 
 # ── 8. max_chars ──────────────────────────────────────────────────────
 
+def test_a_hit_that_does_not_fit_is_marked_or_dropped_never_silently_severed(
+    manifest, tmp_path
+):
+    """A partial quote must announce itself, and a scrap must not be quoted at all.
+
+    `_split_section` refuses to cut a chunk mid-line because a severed sentence
+    reads as a misquote. The same holds at the budget boundary, and harder: this
+    text goes out as background evidence with a citation attached to it.
+    """
+    for n in range(3):
+        _add_meeting(
+            manifest,
+            f"m{n}",
+            f"2026-06-0{n + 1}",
+            _write_minutes(
+                tmp_path / f"m{n}.md",
+                f"# Meeting {n}\n\nThe control inventory was discussed. " + FILLER * 2,
+            ),
+        )
+    chunk_index.reindex_all(manifest)
+
+    whole = chunk_index.search_chunks(manifest, "control inventory", max_chars=100_000)
+    assert len(whole) == 3
+    top = len(whole[0].text)
+    assert all(len(hit.text) > chunk_index.MIN_CHUNK_CHARS + 50 for hit in whole)
+
+    # 300 characters left over: enough for an honest partial quote.
+    marked = chunk_index.search_chunks(manifest, "control inventory", max_chars=top + 300)
+    assert sum(len(hit.text) for hit in marked) <= top + 300
+    assert marked[0].text == whole[0].text
+    assert marked[-1].text.endswith("…")
+    assert len(marked[-1].text) >= chunk_index.MIN_CHUNK_CHARS
+    assert marked[-1].text[:-1] in whole[1].text
+
+    # 50 characters left over: not evidence. Dropped, not severed.
+    dropped = chunk_index.search_chunks(manifest, "control inventory", max_chars=top + 50)
+    assert [hit.text for hit in dropped] == [whole[0].text]
+    assert not any(hit.text.endswith("…") for hit in dropped)
+
+
 def test_max_chars_is_honoured(manifest, tmp_path):
     for n in range(6):
         path = _write_minutes(
@@ -325,8 +403,46 @@ def test_a_missing_minutes_file_is_counted_not_raised(manifest, tmp_path):
     assert stats["meetings"] == 2
     assert stats["unreadable"] == 1
     assert stats["reindexed"] == 1
-    assert chunk_index.reindex_meeting(manifest, "absent") == 0
+    assert stats["unchanged"] == 0
+    # A meeting with no row and one with no minutes are genuinely nothing to do.
+    # A meeting whose file will not read is not, and raises for the single-
+    # meeting caller rather than being reported as "nothing to do".
     assert chunk_index.reindex_meeting(manifest, "no-such-meeting") == 0
+    with pytest.raises(OSError):
+        chunk_index.reindex_meeting(manifest, "absent")
+
+
+def test_an_undecodable_file_is_unreadable_not_unchanged(manifest, tmp_path, capsys):
+    """The file exists and opens; it just is not UTF-8.
+
+    This is the case an `is_file()` pre-check waves through. It used to reach
+    `reindex_meeting`, come back 0, and be tallied as "unchanged" - so the
+    operator was told nothing was wrong while the meeting sat unsearchable.
+    """
+    _add_meeting(manifest, "present", "2026-06-09", _sample_minutes(tmp_path, "a.md"))
+    broken = tmp_path / "broken.md"
+    broken.write_bytes(b"# Meeting\n\nControl inventory \xff\xfe not utf-8 \x80\x81\n")
+    _add_meeting(manifest, "broken", "2026-06-10", broken)
+
+    stats = chunk_index.reindex_all(manifest)
+
+    assert stats["unreadable"] == 1
+    assert stats["unchanged"] == 0
+    assert stats["reindexed"] == 1
+    assert manifest.execute(
+        "SELECT COUNT(*) FROM minute_chunks WHERE meeting_id = 'broken'"
+    ).fetchone()[0] == 0
+    with pytest.raises(UnicodeDecodeError):
+        chunk_index.reindex_meeting(manifest, "broken")
+
+    # The operator has to be able to see it from the exit code alone.
+    manifest.commit()
+    from pipeline import cli
+
+    assert cli.main(["chunk-index"]) == 1
+    assert "1 unreadable" in capsys.readouterr().out
+    assert cli.main(["chunk-index", "--meeting", "broken"]) == 1
+    assert "cannot read" in capsys.readouterr().err
 
 
 # ── Consumer contract ─────────────────────────────────────────────────
@@ -376,6 +492,91 @@ def test_an_oversized_paragraph_splits_on_line_boundaries(tmp_path):
     # in exactly one chunk, and none is cut in half.
     emitted = [line for chunk in chunks for line in chunk.text.splitlines()]
     assert emitted == lines
+
+
+def test_a_pulled_forward_section_keeps_its_heading(tmp_path):
+    """Chunk 0 has no predecessor, so it absorbs forward - heading line included.
+
+    Without it the second section's heading survives in neither the merged text
+    nor the `heading` column, and its content reads as part of the first
+    section: a mis-attributed excerpt, and a term lost from the index.
+    """
+    chunks = chunk_index.chunk_minutes(
+        _write_minutes(
+            tmp_path / "short-open.md",
+            "# Standup\n\nQuick sync.\n\n## Quagga Migration\n\n" + FILLER * 3,
+        ),
+        meeting_id="m1",
+    )
+
+    assert len(chunks) >= 1
+    assert "Quick sync." in chunks[0].text
+    assert "## Quagga Migration" in chunks[0].text
+
+
+def test_a_pulled_forward_heading_is_still_searchable(manifest, tmp_path):
+    _add_meeting(
+        manifest,
+        "m1",
+        "2026-06-09",
+        _write_minutes(
+            tmp_path / "short-open.md",
+            "# Standup\n\nQuick sync.\n\n## Quagga Migration\n\n" + FILLER * 3,
+        ),
+    )
+    chunk_index.reindex_all(manifest)
+
+    hits = chunk_index.search_chunks(manifest, "Quagga")
+
+    assert [hit.meeting_id for hit in hits] == ["m1"]
+
+
+# ── Atomicity ─────────────────────────────────────────────────────────
+
+class _ExplodesOnWrite:
+    """A connection that fails exactly where a replace is half-finished.
+
+    sqlite3.Connection is a C type and its methods cannot be monkeypatched, so
+    the failure is injected by proxy. `reindex_meeting` reaches this only after
+    its DELETE has run.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def execute(self, *args, **kwargs):
+        return self._conn.execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+
+def test_a_failed_replace_leaves_the_old_chunks_intact(manifest, tmp_path):
+    """Half a meeting in the index is worse than a stale one.
+
+    A stale meeting answers with last week's text under an honest citation. A
+    half-replaced one answers with part of its own minutes and nothing says the
+    rest is missing.
+    """
+    _add_meeting(manifest, "m1", "2026-06-09", _sample_minutes(tmp_path, "a.md"))
+    chunk_index.reindex_all(manifest)
+
+    def snapshot() -> list[tuple]:
+        return [
+            tuple(row)
+            for row in manifest.execute(
+                "SELECT chunk_id, ordinal, content_hash FROM minute_chunks ORDER BY ordinal"
+            )
+        ]
+
+    before = snapshot()
+    assert before
+
+    with pytest.raises(sqlite3.OperationalError):
+        chunk_index.reindex_meeting(_ExplodesOnWrite(manifest), "m1", force=True)
+
+    assert snapshot() == before
+    manifest.execute("INSERT INTO minute_chunks_fts(minute_chunks_fts) VALUES('integrity-check')")
 
 
 # ── Cascade ───────────────────────────────────────────────────────────

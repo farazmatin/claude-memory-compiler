@@ -71,10 +71,6 @@ BM25_HALF_SCORE = 2.0
 # are short, and BM25 already rewards a match in a short field.
 _BM25_WEIGHTS = (1.0, 0.5, 0.5)
 
-# A hit smaller than this cannot be usefully truncated to fit the remaining
-# character budget, so the budget is called spent instead.
-_MIN_TRUNCATED_HIT = 200
-
 # YAML frontmatter is machine metadata - template version, the local transcript
 # path, a Drive URL for the source audio. Indexing it would make private links
 # searchable text and let one surface as an "excerpt"; the meeting content it
@@ -138,11 +134,14 @@ def chunk_minutes(path: Path, meeting_id: str | None = None) -> list[Chunk]:
     walk the whole corpus catch that and count the meeting as skipped (GC5).
     """
     meeting_id = meeting_id or Path(path).stem
-    # Line endings are normalised before anything is hashed: the same minutes
-    # checked out on Windows and Linux must produce the same content_hash, or
-    # every chunk churns on the first reindex after a clone.
-    raw = Path(path).read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
-    body = _FRONTMATTER.sub("", raw)
+    # read_text opens in text mode with newline=None, so Python's universal
+    # newlines collapse CRLF to LF before anything here sees the text. That is
+    # what makes content_hash identical for the same minutes checked out on
+    # Windows and on Linux; without it every chunk would churn on the first
+    # reindex after a clone. The guarantee comes from how this file is read, so
+    # a test pins it rather than trusting the next edit not to reach for
+    # read_bytes().
+    body = _FRONTMATTER.sub("", Path(path).read_text(encoding="utf-8"))
 
     pieces: list[tuple[str | None, str | None, str]] = []  # heading, heading_line, text
     for section in _SECTION_BREAK.split(body):
@@ -206,35 +205,46 @@ def _pack(units: list[str], separator: str) -> list[str]:
     return out
 
 
+def _with_heading(heading_line: str | None, text: str) -> str:
+    """Text with the heading line that opened its section put back in front."""
+    return f"{heading_line}\n\n{text}" if heading_line else text
+
+
 def _merge_fragments(
     pieces: list[tuple[str | None, str | None, str]],
 ) -> list[tuple[str | None, str]]:
     """Fold anything under the floor into its neighbour.
 
-    A fragment that opens a new section keeps its heading line, so the reader of
-    the excerpt still sees "## Open Questions" above the question that merged
-    in, rather than finding it filed silently under "Decisions".
+    Absorbed text keeps the heading line that opened its section, in both
+    directions - folding back and pulling forward. The `heading` column can only
+    hold one value and it belongs to the chunk's own first section, so a section
+    swallowed into a neighbour would otherwise vanish from the index entirely
+    and its text be filed under the wrong heading. Keeping the line in `text`
+    puts it on the 1.0-weighted FTS column, and the reader of the excerpt sees
+    "## Open Questions" above the question rather than reading it as a decision.
 
     Merged text is a faithful regrouping of the source lines, not a byte-exact
     slice of the file: the join is always a blank line, where the source may
     have had a single newline. About 1% of the corpus differs this way.
     """
-    merged: list[tuple[str | None, str]] = []
+    merged: list[tuple[str | None, str | None, str]] = []
     for heading, heading_line, text in pieces:
-        prefixed = f"{heading_line}\n\n{text}" if heading_line else text
         if merged and len(text) < MIN_CHUNK_CHARS:
-            previous_heading, previous_text = merged[-1]
-            merged[-1] = (previous_heading, f"{previous_text}\n\n{prefixed}")
+            previous_heading, previous_line, previous_text = merged[-1]
+            joined = f"{previous_text}\n\n{_with_heading(heading_line, text)}"
+            merged[-1] = (previous_heading, previous_line, joined)
         else:
-            merged.append((heading, text))
+            merged.append((heading, heading_line, text))
 
-    # The opening chunk has no predecessor to fold into. Everything after it is
-    # at least MIN_CHUNK_CHARS by construction, so pulling one forward is enough.
-    if len(merged) > 1 and len(merged[0][1]) < MIN_CHUNK_CHARS:
-        heading, text = merged[0]
-        merged[0] = (heading, f"{text}\n\n{merged[1][1]}")
+    # The opening chunk has no predecessor to fold into, so the next one is
+    # pulled forward instead. Everything after the first is at least
+    # MIN_CHUNK_CHARS by construction, so one is always enough.
+    if len(merged) > 1 and len(merged[0][2]) < MIN_CHUNK_CHARS:
+        heading, heading_line, text = merged[0]
+        _, next_line, next_text = merged[1]
+        merged[0] = (heading, heading_line, f"{text}\n\n{_with_heading(next_line, next_text)}")
         del merged[1]
-    return merged
+    return [(heading, text) for heading, _line, text in merged]
 
 
 def _finalise(meeting_id: str, merged: list[tuple[str | None, str]]) -> list[Chunk]:
@@ -275,8 +285,14 @@ def _savepoint(conn: sqlite3.Connection, name: str) -> Iterator[None]:
 def reindex_meeting(conn: sqlite3.Connection, meeting_id: str, *, force: bool = False) -> int:
     """Re-chunk one meeting. Returns the number of chunk rows written.
 
-    Zero means nothing needed doing: no such meeting, no minutes yet, the file
-    could not be read, or every chunk hashed the same as the stored one.
+    Zero means nothing needed doing: no such meeting, no minutes yet, or every
+    chunk hashed the same as the stored one.
+
+    An unreadable minutes file **raises** OSError / UnicodeDecodeError. Only
+    `reindex_all` may turn that into a count, because only a corpus-wide sweep
+    has other meetings to protect. Swallowing it here would report a meeting
+    that is silently unsearchable as "unchanged", which is the GC5 failure this
+    module exists to avoid.
     """
     row = conn.execute(
         "SELECT id, meeting_date, minutes_path FROM meetings WHERE id = ?", (meeting_id,)
@@ -284,10 +300,7 @@ def reindex_meeting(conn: sqlite3.Connection, meeting_id: str, *, force: bool = 
     if row is None or not row["minutes_path"]:
         return 0
 
-    try:
-        chunks = chunk_minutes(Path(row["minutes_path"]), meeting_id=meeting_id)
-    except (OSError, UnicodeDecodeError):
-        return 0
+    chunks = chunk_minutes(Path(row["minutes_path"]), meeting_id=meeting_id)
 
     if not force and _unchanged(conn, meeting_id, chunks):
         return 0
@@ -332,6 +345,11 @@ def reindex_all(conn: sqlite3.Connection, *, force: bool = False) -> dict[str, i
     `unreadable`, `chunks` (rows written). An unreadable minutes file is
     counted and stepped over, never raised: one deleted file must not stop the
     other 116 meetings from indexing (GC5).
+
+    This one `except` is the only place a read failure becomes a number, and
+    `unreadable` is the count that matters - a meeting in it is silently
+    unsearchable until someone fixes the file, which is why `pipeline
+    chunk-index` exits non-zero when it is not zero.
     """
     stats = {"meetings": 0, "reindexed": 0, "unchanged": 0, "unreadable": 0, "chunks": 0}
     rows = conn.execute(
@@ -339,12 +357,12 @@ def reindex_all(conn: sqlite3.Connection, *, force: bool = False) -> dict[str, i
     ).fetchall()
     for row in rows:
         stats["meetings"] += 1
-        if not Path(row["minutes_path"]).is_file():
-            stats["unreadable"] += 1
-            continue
         try:
             written = reindex_meeting(conn, str(row["id"]), force=force)
         except (OSError, UnicodeDecodeError):
+            # Missing, unreadable, and undecodable all land here. There is no
+            # is_file() pre-check: it would catch only the first, and the other
+            # two would fall through to be miscounted as "unchanged".
             stats["unreadable"] += 1
             continue
         if written:
@@ -423,13 +441,27 @@ def _normalise_score(raw: float, term_count: int) -> float:
     return relevance / (relevance + BM25_HALF_SCORE)
 
 
-def _fit(text: str, limit: int) -> str:
-    """`text` trimmed to `limit`, backing up to a word break when it has to cut."""
+def _fit(text: str, limit: int) -> str | None:
+    """`text` for a `limit`-character budget, or None when it cannot fit honestly.
+
+    A chunk that fits comes back untouched. One that does not is cut at a word
+    break and marked with an ellipsis, so anything quoting it downstream can see
+    the quote is partial - the same reasoning as `_split_section`'s refusal to
+    cut mid-line, and it binds harder here, because this text is served as
+    background evidence with a citation attached to it.
+
+    Below MIN_CHUNK_CHARS of retained text the hit is dropped instead of
+    trimmed. A forty-character tail of somebody's paragraph is not evidence, and
+    that floor is the one this module already uses to decide so.
+    """
     if len(text) <= limit:
         return text
-    clipped = text[:limit]
+    if limit < MIN_CHUNK_CHARS:
+        return None
+    clipped = text[: limit - 1]  # one character reserved for the ellipsis
     cut = clipped.rfind(" ")
-    return (clipped[:cut] if cut > limit // 2 else clipped).rstrip()
+    kept = (clipped[:cut] if cut >= MIN_CHUNK_CHARS else clipped).rstrip()
+    return f"{kept}…"
 
 
 def search_chunks(
@@ -443,14 +475,21 @@ def search_chunks(
 ) -> list[ChunkHit]:
     """Best-matching chunks, best first, bounded three ways.
 
-    `as_of` keeps the answer to what was known on a date; `exclude_meeting_ids`
-    drops the meeting that already grounds the artifact being written, so the
-    result is prior context rather than the same minutes read back.
+    `as_of` keeps the answer to what was known on a date. It also excludes every
+    meeting with no `meeting_date` at all, which is a deliberate narrowing: an
+    undated meeting cannot be shown to precede the cutoff, and quietly including
+    it would let a later conversation answer a question asked about an earlier
+    one.
+
+    `exclude_meeting_ids` drops the meeting that already grounds the artifact
+    being written, so the result is prior context rather than the same minutes
+    read back.
 
     `max_chars` is a budget over the returned text, not a per-hit cap: hits are
-    taken in rank order until it is spent, and the one that straddles the
-    boundary is trimmed at a word break rather than dropped. Call
-    `index_status` when an empty list needs explaining.
+    taken in rank order until it is spent. A chunk too large for what is left is
+    trimmed at a word break and marked with an ellipsis, or dropped outright if
+    the trim would leave less than MIN_CHUNK_CHARS. Call `index_status` when an
+    empty list needs explaining.
     """
     match, term_count = _match_expression(query)
     if not match or not _tables_present(conn):
@@ -506,12 +545,14 @@ def search_chunks(
     hits: list[ChunkHit] = []
     used = 0
     for row in rows:
-        if len(hits) >= limit:
+        if len(hits) >= limit or used >= max_chars:
             break
-        remaining = max_chars - used
-        if remaining < _MIN_TRUNCATED_HIT:
-            break
-        text = _fit(row["text"], remaining)
+        text = _fit(row["text"], max_chars - used)
+        if text is None:
+            # Too little budget left to quote this chunk honestly. Keep going
+            # rather than stopping: a smaller lower-ranked chunk may still fit
+            # whole, and a whole chunk is better evidence than a severed one.
+            continue
         hits.append(
             ChunkHit(
                 chunk_id=row["chunk_id"],

@@ -494,7 +494,12 @@ def cmd_chunk_index(args: argparse.Namespace) -> int:
             if not meeting.minutes_path:
                 print(f"{meeting.label}: no minutes compiled yet.", file=sys.stderr)
                 return 1
-            written = chunk_index.reindex_meeting(conn, args.meeting, force=args.rebuild)
+            try:
+                written = chunk_index.reindex_meeting(conn, args.meeting, force=args.rebuild)
+            except (OSError, UnicodeDecodeError) as exc:
+                print(f"{meeting.label}: cannot read {meeting.minutes_path}: {exc}",
+                      file=sys.stderr)
+                return 1
             if written:
                 print(f"{meeting.label}: indexed {written} chunk(s).")
             else:
