@@ -448,19 +448,33 @@ def test_an_undecodable_file_is_unreadable_not_unchanged(manifest, tmp_path, cap
 # ── Consumer contract ─────────────────────────────────────────────────
 
 def test_hits_carry_the_provenance_of_their_own_meeting(manifest, tmp_path):
-    """GC3: a citation names the meeting the text actually came from."""
+    """GC3: a citation names the meeting the text actually came from.
+
+    Ten meetings, not two, and an explicit budget. With the default 4,000 the
+    corpus below overflows it and the last hit comes back trimmed, so the
+    line-by-line check would fail on the ellipsis - the property under test
+    would be hostage to the budget rather than to provenance.
+    """
+    dates = {}
     paths = {}
-    for meeting_id, date in (("m1", "2026-06-09"), ("m2", "2026-06-10")):
+    for n in range(10):
+        meeting_id = f"m{n}"
+        dates[meeting_id] = f"2026-06-{n + 1:02d}"
         paths[meeting_id] = _write_minutes(
             tmp_path / f"{meeting_id}.md",
             f"# {meeting_id}\n\nThe control inventory was discussed. " + FILLER * 2,
         )
-        _add_meeting(manifest, meeting_id, date, paths[meeting_id])
+        _add_meeting(manifest, meeting_id, dates[meeting_id], paths[meeting_id])
     chunk_index.reindex_all(manifest)
+    assert sum(
+        row[0] for row in manifest.execute("SELECT char_count FROM minute_chunks")
+    ) > 4_000, "fixtures must overflow the default budget or this proves nothing"
 
-    for hit in chunk_index.search_chunks(manifest, "control inventory"):
+    hits = chunk_index.search_chunks(manifest, "control inventory", max_chars=100_000)
+    assert len(hits) == 10
+    for hit in hits:
         assert hit.source_path == str(paths[hit.meeting_id])
-        assert hit.meeting_date == {"m1": "2026-06-09", "m2": "2026-06-10"}[hit.meeting_id]
+        assert hit.meeting_date == dates[hit.meeting_id]
         assert hit.chunk_id.startswith(f"{hit.meeting_id}:")
         # Lines are never rewritten, only regrouped: the text came out of this
         # meeting's file and no other. (Whole-chunk equality is not asserted -
