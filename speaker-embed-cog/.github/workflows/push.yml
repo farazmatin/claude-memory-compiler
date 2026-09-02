@@ -9,12 +9,25 @@ on:
 # Pinned rather than tracking latest: a cog release changes how the image is
 # built, and the pipeline pins its stored vectors to the version hash a build
 # produces.
+#
+# v0.21.0, not v0.22.0. Under v0.22.0 the image itself built and exported
+# cleanly every time, and then the "Adding labels to image" pass - a second,
+# tiny build that bakes the predictor's OpenAPI schema in as a label - died with
+# `no access allowed to dir "context"`. v0.22.0 reworked exactly that path
+# (static schema generation, input validation against it), and nothing in this
+# repo's Dockerfile or context is involved in that pass.
 env:
-  COG_VERSION: v0.22.0
+  COG_VERSION: v0.21.0
 
 jobs:
   push:
-    runs-on: ubuntu-latest
+    # ubuntu-22.04, not ubuntu-latest. Six builds failed on ubuntu-latest at
+    # cog's "Adding labels to image" pass with `no access allowed to dir
+    # "context"`, across cog v0.21.0 and v0.22.0 and both buildx drivers. The
+    # one thing common to all of them is the runner's BuildKit v0.20.2 (Docker
+    # 28). 22.04 ships an older Docker, which makes this a single-variable test
+    # of a cog/BuildKit protocol mismatch rather than another guess at our code.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -35,10 +48,13 @@ jobs:
           pip install --quiet huggingface_hub
           python scripts/fetch_weights.py
 
-      # Keep an explicit BuildKit builder on the hosted runner. This does not
-      # enable Cog's optional separate-weights mode; the push below explicitly
-      # disables that mode so the checkpoint stays inside the model image.
-      - uses: docker/setup-buildx-action@v3
+      # No setup-buildx-action here on purpose. It installs a `docker-container`
+      # driver and makes it the default, which cog has a standing bug against
+      # (replicate/cog#1026), and adding it changed nothing: the build failed
+      # identically with and without it. The runner's stock builder is what cog
+      # expects.
+      - name: use the stock docker builder
+        run: docker buildx use default && docker buildx inspect
 
       - name: install cog
         run: |
