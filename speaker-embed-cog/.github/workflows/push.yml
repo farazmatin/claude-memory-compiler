@@ -6,6 +6,12 @@ name: build and push cog
 on:
   workflow_dispatch:
 
+# Pinned rather than tracking latest: a cog release changes how the image is
+# built, and the pipeline pins its stored vectors to the version hash a build
+# produces.
+env:
+  COG_VERSION: v0.22.0
+
 jobs:
   push:
     runs-on: ubuntu-latest
@@ -29,16 +35,22 @@ jobs:
           pip install --quiet huggingface_hub
           python scripts/fetch_weights.py
 
+      # Keep an explicit BuildKit builder on the hosted runner. This does not
+      # enable Cog's optional separate-weights mode; the push below explicitly
+      # disables that mode so the checkpoint stays inside the model image.
+      - uses: docker/setup-buildx-action@v3
+
       - name: install cog
         run: |
-          sudo curl -o /usr/local/bin/cog -L \
-            https://github.com/replicate/cog/releases/latest/download/cog_linux_x86_64
+          sudo curl --fail --show-error --location -o /usr/local/bin/cog \
+            https://github.com/replicate/cog/releases/download/${COG_VERSION}/cog_Linux_x86_64
           sudo chmod +x /usr/local/bin/cog
+          cog --version
 
       - name: push
         env:
           REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
-        run: cog push r8.im/${{ vars.REPLICATE_MODEL }}
+        run: cog push r8.im/${{ vars.REPLICATE_MODEL }} --separate-weights=false
 
       - name: report the pinned version
         env:

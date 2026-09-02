@@ -1,4 +1,9 @@
 torch==2.5.1
 torchaudio==2.5.1
-pyannote.audio==3.3.2
+# Hyphenated, not `pyannote.audio`: cog splits a dotted distribution name and
+# asks pip for a package called `audio`, which exists and is unrelated. PEP 503
+# normalises both spellings to this one, so it installs the same distribution.
+# The import in predict.py stays `from pyannote.audio import ...` - the module
+# name is unaffected.
+pyannote-audio==3.3.2
 numpy==1.26.4

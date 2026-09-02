@@ -6,12 +6,14 @@ build:
   python_version: "3.11"
   system_packages:
     - ffmpeg
-  # A requirements file, not build.python_packages: that field is deprecated and
-  # its parser splits a dotted distribution name, turning `pyannote.audio==3.3.2`
-  # into a request for a package called `audio`.
+  # A requirements file, because build.python_packages is deprecated. Note that
+  # switching alone did not fix the dotted-name bug - cog mangles
+  # `pyannote.audio` into `audio` from either source - so requirements.txt uses
+  # the PEP 503 normalised spelling `pyannote-audio`.
   python_requirements: requirements.txt
   # Weights are fetched into ./weights by CI before the build and copied in, so
   # a cold start never reaches Hugging Face and no token exists at run time.
   # Baking them is also what makes the pushed version hash mean something: it
-  # pins the weights, not just the code.
+  # pins the weights, not just the code. The workflow explicitly disables Cog's
+  # optional separate-weights mode, so this remains a normal single image.
 predict: "predict.py:Predictor"

@@ -13,6 +13,10 @@ from pathlib import Path
 from huggingface_hub import hf_hub_download
 
 # repo id -> local filename. Each entry must match a key in predict.WEIGHTS.
+# pyannote.audio 3.3.2 loads a local checkpoint directly: its architecture and
+# Lightning hyperparameters are embedded in pytorch_model.bin. The repository's
+# config.yaml is fetched only for Hugging Face download counters and is not used
+# by Model.from_pretrained for a local file, so there is nothing else to bake.
 CHECKPOINTS = {
     "wespeaker-resnet34-lm": ("pyannote/wespeaker-voxceleb-resnet34-LM", "pytorch_model.bin"),
 }
