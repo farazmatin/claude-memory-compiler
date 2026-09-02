@@ -360,22 +360,25 @@ def _search(**kwargs):
 def test_rrf_puts_a_hit_both_halves_found_above_one_only_either_found(manifest, monkeypatch):
     """Two reciprocal ranks beat one, which is the whole point of fusing on rank.
 
-    "z-both" is *second* in the lexical list and first in the dense one, so it
-    is behind on either half alone and ahead once they are summed: 1/62 + 1/61
-    against "a-lex"'s 1/61. The ids fight the answer on purpose - equal RRF
-    scores break alphabetically, so a fusion that took the better single rank
-    instead of the sum would tie these two and put "a-lex" first.
+    "z-both" is *second* in both the lexical and the dense list, so on either
+    half alone it is behind the half's own rank-1 hit - "a-win" in lexical,
+    "b-other" in semantic - and never holds the best single rank anywhere.
+    Summed, it still wins: 1/62 + 1/62 = 0.03226 against 1/61 = 0.01639 for
+    each of the other two. A fusion that took the better single rank instead
+    of the sum would score "z-both" at 1/62, the worst of the three, and put
+    it last - not merely tied, so no tie-break could rescue the assertion.
     """
     _halves(
         monkeypatch,
-        lexical=[_hit("a-lex"), _hit("z-both")],
-        semantic=[_hit("z-both"), _hit("m-dense")],
+        lexical=[_hit("a-win"), _hit("z-both")],
+        semantic=[_hit("b-other"), _hit("z-both")],
     )
     _reranker(monkeypatch)
 
     result = _search(query="control inventory", limit=5, max_chars=20_000)
 
-    assert [item.meeting_id for item in result.items] == ["z-both", "a-lex", "m-dense"]
+    assert result.items[0].meeting_id == "z-both"
+    assert {item.meeting_id for item in result.items} == {"z-both", "a-win", "b-other"}
     assert all(item.kind == "minute_excerpt" for item in result.items)
 
 
