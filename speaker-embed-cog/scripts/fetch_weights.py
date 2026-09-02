@@ -1,6 +1,6 @@
 """Download the encoder checkpoints into ./weights before `cog build`.
 
-Run in CI with HF_TOKEN in the environment. Kept out of the image build so the
+Kept out of the image build so the
 gated download happens once, with credentials that never reach the published
 image, and so the built version hash pins an exact checkpoint.
 """
@@ -8,7 +8,6 @@ image, and so the built version hash pins an exact checkpoint.
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download
@@ -20,10 +19,10 @@ CHECKPOINTS = {
 
 
 def main() -> int:
-    token = os.environ.get("HF_TOKEN")
-    if not token:
-        print("HF_TOKEN is unset; the pyannote checkpoints are gated", file=sys.stderr)
-        return 2
+    # Optional: pyannote/wespeaker-voxceleb-resnet34-LM is not gated (verified
+    # against the HF API). Passed when present so a checkpoint that later
+    # becomes gated, or a private one added to CHECKPOINTS, still resolves.
+    token = os.environ.get("HF_TOKEN") or None
 
     out = Path("weights")
     out.mkdir(parents=True, exist_ok=True)

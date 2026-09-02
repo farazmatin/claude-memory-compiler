@@ -29,10 +29,12 @@ recordings. `pipeline run` remains the explicit catch-up/recovery command.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 import traceback
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import asdict
 from pathlib import Path
 
@@ -725,6 +727,35 @@ def cmd_index_repair_preview(args: argparse.Namespace) -> int:
     return 0
 
 
+@contextlib.contextmanager
+def pipeline_lease() -> Iterator[None]:
+    """Serialize pipeline runs across the watcher, the dashboard, and the CLI.
+
+    Three things start the same stages: `pipeline run`, the dashboard's Sync &
+    Process Recordings button, and the watcher.  Nothing used to stop two of
+    them working the same queue, and a second run re-compiling a meeting the
+    first had already retitled is how minutes get orphaned on disk.
+
+    Deliberately a different lease than the watcher's own: that one is held for
+    the watcher's whole life, so sharing it would refuse every run for as long
+    as the watcher stayed up.
+    """
+    from pipeline import watcher
+
+    with watcher.WatchLease(DB_DIR / "pipeline-run.lock", label="A pipeline run"):
+        yield
+
+
+def run_all_stages(args: argparse.Namespace, include_ingest: bool = True) -> int:
+    """Every stage in order, for a caller that already holds pipeline_lease().
+
+    The dashboard takes the lease around its whole worker so a single-stage
+    button and a full run cannot interleave, and then needs a way in that does
+    not try to take it a second time.
+    """
+    return _run_all(args, include_ingest=include_ingest)
+
+
 def _run_all(args: argparse.Namespace, include_ingest: bool = True) -> int:
     """Walk every stage in order, oldest meeting first.
 
@@ -787,9 +818,16 @@ def _run_all(args: argparse.Namespace, include_ingest: bool = True) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    from pipeline import watcher
+
     ensure_dirs()
     db.init_db()
-    return _run_all(args)
+    try:
+        with pipeline_lease():
+            return _run_all(args)
+    except watcher.WatcherAlreadyRunning as exc:
+        print(f"{exc} Wait for it to finish, or stop it first.", file=sys.stderr)
+        return 1
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
@@ -800,10 +838,17 @@ def cmd_watch(args: argparse.Namespace) -> int:
     db.init_db()
 
     def process_pending() -> int:
-        return _run_all(
-            argparse.Namespace(limit=args.limit, no_llm=False, owner=args.owner),
-            include_ingest=False,
-        )
+        # The dashboard button can be pressed mid-cycle, so the watcher takes the
+        # run lease per cycle rather than assuming it is the only caller.
+        try:
+            with pipeline_lease():
+                return _run_all(
+                    argparse.Namespace(limit=args.limit, no_llm=False, owner=args.owner),
+                    include_ingest=False,
+                )
+        except watcher.WatcherAlreadyRunning as exc:
+            print(f"{exc} Leaving this cycle to it.", file=sys.stderr)
+            return 0
 
     def cycle() -> watcher.CycleResult:
         try:

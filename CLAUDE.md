@@ -17,7 +17,14 @@ Its context routes are GET /api/context/health and POST /api/context/search.
 
 ## Rules
 
-- Processing is started on demand; do not add automatic batch scheduling.
+- Processing is started on demand; do not add automatic batch scheduling. The
+  operator starts it from the dashboard's Sync & Process Recordings button, or
+  with `pipeline run`. Only one run at a time: the dashboard's guard is
+  in-process, so it cannot see a run started from a shell or by the watcher.
+- The continuous Drive watcher (scripts\install-drive-watcher.ps1, log
+  logs\drive-watcher.log) is the only sanctioned always-on path and is not
+  installed by default. It reacts to a newly staged recording; it never sweeps
+  on a timer.
 - Replicate is the only transcription backend.
 - Codex, Claude, and Antigravity subscription CLIs author synthesis.
 - LightRAG/Postgres provide deterministic graph storage and traversal only.

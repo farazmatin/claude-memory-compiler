@@ -73,6 +73,30 @@ If it reports authorization failure, run:
     pipeline entities
     pipeline backup --to /path/to/backup
 
+## Processing recordings
+
+Processing is operator-started. Open the dashboard and click
+**Sync & Process Recordings**; it runs capture, ingest, transcription, speaker
+resolution, minutes, and graph-sync in the background and streams progress into
+the page. The equivalent from a shell is:
+
+    uv run pipeline run --owner "Faraz"
+
+Only run one at a time. The dashboard tracks its own run in process, so it does
+not know about a run started from a shell, and two runs will both work the same
+queue.
+
+A continuous Drive watcher also exists for hands-off processing, but is not
+installed by default:
+
+    .\scripts\install-drive-watcher.ps1 -IntervalSec 60 -StartNow
+
+It reacts to a newly staged recording rather than sweeping on a timer, logs to
+logs\drive-watcher.log, and restarts itself if it stops. Registering its
+scheduled task needs an elevated shell; without one the installer falls back to
+a Startup entry. Do not use the watcher and the dashboard button at the same
+time.
+
 ## Dashboard
 
 Start the local authenticated dashboard:

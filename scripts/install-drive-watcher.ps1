@@ -44,15 +44,27 @@ if (-not (Test-Path -LiteralPath $runner)) {
     throw "Watcher runner not found at $runner."
 }
 
-# Fail here rather than inside the task, where the error would be invisible.
-$null = Get-Command uv -ErrorAction Stop
+# Resolve uv here rather than inside the task: a scheduled task may not inherit
+# the interactive PATH, and a failure there would be invisible.  Prefer the
+# per-user install over whatever is first on PATH, because PATH may be pointing
+# at a tool-bundled copy that belongs to the current shell rather than the
+# sign-in session the watcher will actually run in.
+$uv = $null
+$preferredUv = Join-Path $env:USERPROFILE '.local\bin\uv.exe'
+if (Test-Path -LiteralPath $preferredUv) {
+    $uv = (Resolve-Path -LiteralPath $preferredUv).Path
+}
+else {
+    $uv = (Get-Command uv -ErrorAction Stop).Source
+    Write-Warning "uv not found at $preferredUv; using $uv."
+}
 
 $shell = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
 if (-not $shell) {
     $shell = (Get-Command powershell -ErrorAction Stop).Source
 }
 
-$runnerArguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -IntervalSec $IntervalSec"
+$runnerArguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -IntervalSec $IntervalSec -UvPath `"$uv`""
 if ($CatchUp) {
     $runnerArguments += ' -CatchUp'
 }
@@ -78,23 +90,62 @@ $settings = New-ScheduledTaskSettingsSet `
     -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 5)
 
-Register-ScheduledTask `
-    -TaskName $taskName `
-    -Action $action `
-    -Trigger $logonTrigger, $supervisorTrigger `
-    -Settings $settings `
-    -Description "Continuous Drive watcher; no timed or nightly processing. The repeating trigger only restarts the watcher when it is not running. Log: logs\drive-watcher.log" `
-    -Force | Out-Null
+$log = Join-Path $root 'logs\drive-watcher.log'
 
-Write-Host "Installed $taskName."
-Write-Host "  Polls Drive every $IntervalSec seconds; starts at sign-in."
-Write-Host "  Restarted within $SupervisorMinutes minutes if it stops."
-Write-Host "  Log: $(Join-Path $root 'logs\drive-watcher.log')"
+# Registering a scheduled task needs elevation on a managed machine, and this
+# script previously failed outright there - which is one way the watcher ends up
+# never installed and minutes quietly stop.  Fall back to a Startup entry, the
+# same way install-dashboard-task.ps1 does, and say which path was taken.
+$installedAsTask = $false
+try {
+    Register-ScheduledTask `
+        -TaskName $taskName `
+        -Action $action `
+        -Trigger $logonTrigger, $supervisorTrigger `
+        -Settings $settings `
+        -Description "Continuous Drive watcher; no timed or nightly processing. The repeating trigger only restarts the watcher when it is not running. Log: logs\drive-watcher.log" `
+        -Force `
+        -ErrorAction Stop | Out-Null
+    $installedAsTask = $true
+}
+catch {
+    Write-Warning "Scheduled task registration failed ($($_.Exception.Message.Trim())); installing a Startup entry instead."
+}
 
-if ($StartNow) {
-    Start-ScheduledTask -TaskName $taskName
-    Write-Host 'Started the Drive watcher now.'
-    if (-not $CatchUp) {
-        Write-Host 'Recordings already staged locally are left alone; re-run with -CatchUp to process them.'
+if ($installedAsTask) {
+    Write-Host "Installed scheduled task '$taskName'."
+    Write-Host "  Polls Drive every $IntervalSec seconds; starts at sign-in."
+    Write-Host "  Restarted within $SupervisorMinutes minutes if it stops."
+    Write-Host "  Log: $log"
+
+    if ($StartNow) {
+        Start-ScheduledTask -TaskName $taskName
+        Write-Host 'Started the Drive watcher now.'
     }
+}
+else {
+    $shortcutPath = Join-Path ([Environment]::GetFolderPath('Startup')) 'Meeting Memory Drive Watcher.lnk'
+    $wscript = New-Object -ComObject WScript.Shell
+    $shortcut = $wscript.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = $shell
+    $shortcut.Arguments = $runnerArguments
+    $shortcut.WorkingDirectory = $root
+    $shortcut.WindowStyle = 7
+    $shortcut.Description = 'Continuous Drive watcher for Meeting Memory.'
+    $shortcut.Save()
+
+    Write-Host "Installed Startup entry: $shortcutPath"
+    Write-Host "  Polls Drive every $IntervalSec seconds; starts at sign-in."
+    Write-Host '  The runner restarts the watcher itself if it stops.'
+    Write-Host "  Log: $log"
+    Write-Host 'Run this script from an elevated shell for OS-level supervision instead.'
+
+    if ($StartNow) {
+        Start-Process -FilePath $shell -ArgumentList $runnerArguments -WorkingDirectory $root -WindowStyle Hidden
+        Write-Host 'Started the Drive watcher now.'
+    }
+}
+
+if ($StartNow -and -not $CatchUp) {
+    Write-Host 'Recordings already staged locally are left alone; re-run with -CatchUp to process them.'
 }

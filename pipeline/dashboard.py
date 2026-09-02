@@ -106,6 +106,55 @@ def trigger_pipeline_run(stage: str = "all", limit: int | None = None) -> dict[s
     return {"status": "started", "stage": stage, "started_at": _pipeline_state["started_at"]}
 
 
+def _dispatch_stage(stage: str, limit: int | None) -> int:
+    """Run one stage. The caller must already hold cli.pipeline_lease()."""
+    from pipeline import cli
+
+    if stage == "all":
+        # run_all_stages, not cmd_run: cmd_run takes the run lease itself and
+        # the worker already holds it.
+        return cli.run_all_stages(
+            argparse.Namespace(limit=limit, no_llm=False, owner=OWNER_NAME)
+        )
+    if stage == "ingest":
+        return cli.cmd_ingest(argparse.Namespace(then_run=False))
+    if stage == "capture":
+        return cli.cmd_capture(argparse.Namespace(dry_run=False, complete_backfill=False))
+    if stage == "transcribe":
+        return cli.cmd_transcribe(
+            argparse.Namespace(limit=limit, keep_going=False, traceback=False)
+        )
+    if stage == "speakers":
+        return cli.cmd_speakers(
+            argparse.Namespace(
+                limit=limit, owner=OWNER_NAME, no_llm=False, traceback=False, all=False
+            )
+        )
+    if stage == "minutes":
+        return cli.cmd_minutes(
+            argparse.Namespace(limit=limit, recompile=False, traceback=False, force=False)
+        )
+    if stage == "graph-sync":
+        return cli.cmd_graph_sync(argparse.Namespace(limit=limit))
+    if stage == "recompile":
+        return cli.cmd_minutes(
+            argparse.Namespace(limit=limit, recompile=True, traceback=False, force=False)
+        )
+    if stage == "speaker-refresh":
+        with db.connect() as conn:
+            queued = db.pending(conn, db.SPEAKERS_RESOLVED, limit)
+        if not queued:
+            print("No speaker-corrected minutes are waiting to refresh.")
+            return 0
+        rc = cli.cmd_minutes(
+            argparse.Namespace(limit=limit, recompile=False, traceback=False, force=False)
+        )
+        if rc == 0:
+            rc = cli.cmd_graph_sync(argparse.Namespace(limit=limit))
+        return rc
+    raise ValueError(f"Unknown pipeline stage: {stage}")
+
+
 def _run_pipeline_worker(stage: str, limit: int | None) -> None:
     from pipeline import cli
 
@@ -126,48 +175,12 @@ def _run_pipeline_worker(stage: str, limit: int | None) -> None:
         with contextlib.redirect_stdout(log_stream), contextlib.redirect_stderr(log_stream):
             cli.ensure_dirs()
             db.init_db()
-            if stage == "all":
-                rc = cli.cmd_run(argparse.Namespace(limit=limit, no_llm=False, owner=OWNER_NAME))
-            elif stage == "ingest":
-                rc = cli.cmd_ingest(argparse.Namespace(then_run=False))
-            elif stage == "capture":
-                rc = cli.cmd_capture(argparse.Namespace(dry_run=False, complete_backfill=False))
-            elif stage == "transcribe":
-                rc = cli.cmd_transcribe(
-                    argparse.Namespace(limit=limit, keep_going=False, traceback=False)
-                )
-            elif stage == "speakers":
-                rc = cli.cmd_speakers(
-                    argparse.Namespace(
-                        limit=limit, owner=OWNER_NAME, no_llm=False, traceback=False, all=False
-                    )
-                )
-            elif stage == "minutes":
-                rc = cli.cmd_minutes(
-                    argparse.Namespace(limit=limit, recompile=False, traceback=False, force=False)
-                )
-            elif stage == "graph-sync":
-                rc = cli.cmd_graph_sync(argparse.Namespace(limit=limit))
-            elif stage == "recompile":
-                rc = cli.cmd_minutes(
-                    argparse.Namespace(limit=limit, recompile=True, traceback=False, force=False)
-                )
-            elif stage == "speaker-refresh":
-                with db.connect() as conn:
-                    queued = db.pending(conn, db.SPEAKERS_RESOLVED, limit)
-                if not queued:
-                    print("No speaker-corrected minutes are waiting to refresh.")
-                    rc = 0
-                else:
-                    rc = cli.cmd_minutes(
-                        argparse.Namespace(
-                            limit=limit, recompile=False, traceback=False, force=False
-                        )
-                    )
-                    if rc == 0:
-                        rc = cli.cmd_graph_sync(argparse.Namespace(limit=limit))
-            else:
-                raise ValueError(f"Unknown pipeline stage: {stage}")
+            # _pipeline_state only guards this process. A shell `pipeline run`
+            # and the Drive watcher are invisible to it, and two runs working
+            # the same queue orphan minutes on disk, so take the cross-process
+            # run lease as well.
+            with cli.pipeline_lease():
+                rc = _dispatch_stage(stage, limit)
             success = rc == 0
             _log_buffer.append(
                 f"[{now_iso()}] Pipeline stage '{stage}' finished with exit code {rc}"

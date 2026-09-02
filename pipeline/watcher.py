@@ -29,10 +29,15 @@ class CycleResult:
 
 
 class WatchLease:
-    """An atomic, recoverable cross-process lease for one Drive watcher."""
+    """An atomic, recoverable cross-process lease for one Drive watcher.
 
-    def __init__(self, path: Path) -> None:
+    Also used to serialize pipeline runs, under its own path - see
+    cli.pipeline_lease - so `label` names whatever the caller is guarding.
+    """
+
+    def __init__(self, path: Path, *, label: str = "Drive watcher") -> None:
         self.path = Path(path)
+        self.label = label
         self._held = False
 
     def __enter__(self) -> WatchLease:
@@ -42,7 +47,7 @@ class WatchLease:
             descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError as exc:
             raise WatcherAlreadyRunning(
-                f"Drive watcher is already running ({self.path})."
+                f"{self.label} is already running ({self.path})."
             ) from exc
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(str(os.getpid()))

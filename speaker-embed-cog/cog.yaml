@@ -6,11 +6,10 @@ build:
   python_version: "3.11"
   system_packages:
     - ffmpeg
-  python_packages:
-    - torch==2.5.1
-    - torchaudio==2.5.1
-    - pyannote.audio==3.3.2
-    - numpy==1.26.4
+  # A requirements file, not build.python_packages: that field is deprecated and
+  # its parser splits a dotted distribution name, turning `pyannote.audio==3.3.2`
+  # into a request for a package called `audio`.
+  python_requirements: requirements.txt
   # Weights are fetched into ./weights by CI before the build and copied in, so
   # a cold start never reaches Hugging Face and no token exists at run time.
   # Baking them is also what makes the pushed version hash mean something: it
