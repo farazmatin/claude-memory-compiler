@@ -362,9 +362,14 @@ CREATE INDEX IF NOT EXISTS idx_chat_turns_session ON chat_turns(session_id, turn
 -- handed to a caller as an excerpt plus a citation, and the citation has to name
 -- the meeting this text actually came from; carrying it on the row makes that a
 -- property of the data rather than of whoever remembered to join.
+-- meeting_id CASCADEs, unlike voice_samples above. The opposite reasoning
+-- applies: an embedding is an irreplaceable asset whose provenance is merely
+-- nice to have, whereas a chunk IS its provenance - text with no meeting behind
+-- it is an excerpt that cites a meeting the manifest cannot produce, and it
+-- costs one second to rebuild from the file on disk.
 CREATE TABLE IF NOT EXISTS minute_chunks (
     chunk_id      TEXT PRIMARY KEY,   -- "<meeting_id>:<ordinal, 4 digits>"
-    meeting_id    TEXT NOT NULL,
+    meeting_id    TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
     meeting_date  TEXT,
     source_path   TEXT NOT NULL,
     ordinal       INTEGER NOT NULL,   -- position in the file; stable across reindex
@@ -521,10 +526,43 @@ MIGRATIONS: dict[str, str] = {
 }
 
 
+def _drop_prefk_chunk_index(conn: sqlite3.Connection) -> None:
+    """Discard a `minute_chunks` built before it referenced `meetings`.
+
+    SQLite cannot add a foreign key to an existing table, and
+    `CREATE TABLE IF NOT EXISTS` would leave the old shape in place forever
+    while every test passed against a freshly created one. Dropping is the
+    right migration for this table specifically: it holds nothing authored -
+    only a projection of minutes files that `pipeline chunk-index` rebuilds in
+    about a second.
+
+    Both the FTS table and its triggers go with it, and in that order. The FTS
+    table is external-content, so leaving it behind would point it at a table
+    that no longer exists; the triggers reference the same rowids and would be
+    recreated stale. Must run BEFORE the SCHEMA script, which puts all four
+    back.
+    """
+    table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'minute_chunks'"
+    ).fetchone()
+    if not table or conn.execute("PRAGMA foreign_key_list(minute_chunks)").fetchone():
+        return
+    conn.executescript(
+        """
+        DROP TRIGGER IF EXISTS minute_chunks_ai;
+        DROP TRIGGER IF EXISTS minute_chunks_ad;
+        DROP TRIGGER IF EXISTS minute_chunks_au;
+        DROP TABLE IF EXISTS minute_chunks_fts;
+        DROP TABLE IF EXISTS minute_chunks;
+        """
+    )
+
+
 def init_db(db_path: Path | None = None) -> None:
     """Create tables and apply pending migrations. Idempotent."""
     with connect(db_path) as conn:
         conn.execute("PRAGMA journal_mode = WAL")
+        _drop_prefk_chunk_index(conn)
         conn.executescript(SCHEMA)
         # CREATE TABLE IF NOT EXISTS silently skips an existing table, so new
         # columns must be added explicitly or an upgraded install keeps running
@@ -817,9 +855,11 @@ def delete_meeting(conn: sqlite3.Connection, meeting_id: str) -> bool:
     # in inbox/ can never be re-ingested: every future `pipeline ingest` sees the
     # same path/size/mtime and skips it, silently and permanently.
     conn.execute("DELETE FROM seen_files WHERE meeting_id = ?", (meeting_id,))
-    # minute_chunks carries its own copy of the provenance and no foreign key, so
-    # nothing cascades. Orphaned chunks would keep answering searches, citing a
-    # meeting the manifest no longer has.
+    # Belt and braces: minute_chunks CASCADEs, but only on a connection with
+    # `PRAGMA foreign_keys = ON`, which SQLite defaults to OFF and every caller
+    # has to set for itself. `connect()` sets it; a maintenance script opening
+    # the file with a bare sqlite3.connect() would not, and the chunks left
+    # behind would keep answering searches citing a meeting that is gone.
     conn.execute("DELETE FROM minute_chunks WHERE meeting_id = ?", (meeting_id,))
     cur = conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
     return cur.rowcount > 0

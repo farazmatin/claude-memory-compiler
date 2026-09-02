@@ -13,7 +13,10 @@ meeting) are easier to state exactly than to find.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
+
+import pytest
 
 from pipeline import chunk_index, db
 
@@ -351,10 +354,153 @@ def test_hits_carry_the_provenance_of_their_own_meeting(manifest, tmp_path):
         assert all(line in source for line in hit.text.splitlines() if line.strip())
 
 
+def test_an_oversized_paragraph_splits_on_line_boundaries(tmp_path):
+    """A 2,775-char single paragraph is real in this corpus; it must not survive whole.
+
+    The "## Entities" block is one paragraph of many lines with no blank line
+    between them, so paragraph splitting alone leaves it intact and one chunk
+    then eats most of a 4,000-character retrieval budget.
+    """
+    lines = [f"Entity {n} (team): owns the control inventory for domain {n}." for n in range(50)]
+    body = "\n".join(lines)
+    assert len(body) > 1_200 and "\n\n" not in body
+
+    chunks = chunk_index.chunk_minutes(
+        _write_minutes(tmp_path / "entities.md", f"# Meeting\n\n## Entities\n\n{body}\n"),
+        meeting_id="m1",
+    )
+
+    assert len(chunks) > 1
+    assert all(len(c.text) <= chunk_index.MAX_CHUNK_CHARS for c in chunks)
+    # Split on line boundaries, never mid-line: every source line survives whole
+    # in exactly one chunk, and none is cut in half.
+    emitted = [line for chunk in chunks for line in chunk.text.splitlines()]
+    assert emitted == lines
+
+
+# ── Cascade ───────────────────────────────────────────────────────────
+
+def test_deleting_a_meeting_removes_its_chunks_and_its_fts_rows(manifest, tmp_path):
+    """The FK cascade and the FTS delete trigger must both fire.
+
+    A stale FTS index is the dangerous half: it keeps matching a deleted
+    meeting's terms, and because the table is external-content the rowids it
+    hands back can then resolve against whatever now occupies them - another
+    meeting's text under the deleted meeting's citation.
+    """
+    _add_meeting(
+        manifest,
+        "gone",
+        "2026-06-09",
+        _write_minutes(
+            tmp_path / "gone.md",
+            "# Gone\n\nThe quagga control inventory was discussed. " + FILLER * 2,
+        ),
+    )
+    _add_meeting(manifest, "kept", "2026-06-10", _sample_minutes(tmp_path, "kept.md"))
+    chunk_index.reindex_all(manifest)
+
+    def fts_hits(term: str) -> int:
+        return manifest.execute(
+            "SELECT COUNT(*) FROM minute_chunks_fts WHERE minute_chunks_fts MATCH ?", (term,)
+        ).fetchone()[0]
+
+    assert fts_hits('"quagga"') == 1
+    kept_before = manifest.execute(
+        "SELECT COUNT(*) FROM minute_chunks WHERE meeting_id = 'kept'"
+    ).fetchone()[0]
+
+    assert db.delete_meeting(manifest, "gone") is True
+
+    assert manifest.execute(
+        "SELECT COUNT(*) FROM minute_chunks WHERE meeting_id = 'gone'"
+    ).fetchone()[0] == 0
+    assert fts_hits('"quagga"') == 0
+    assert chunk_index.search_chunks(manifest, "quagga") == []
+    assert manifest.execute(
+        "SELECT COUNT(*) FROM minute_chunks WHERE meeting_id = 'kept'"
+    ).fetchone()[0] == kept_before
+    # FTS5's own reconciliation of the index against the content table. This is
+    # what catches a delete trigger that silently did not fire.
+    manifest.execute("INSERT INTO minute_chunks_fts(minute_chunks_fts) VALUES('integrity-check')")
+
+
+def test_the_cascade_holds_without_the_explicit_delete(manifest, tmp_path):
+    """`delete_meeting`'s explicit DELETE is belt-and-braces, not the mechanism."""
+    _add_meeting(manifest, "m1", "2026-06-09", _sample_minutes(tmp_path, "a.md"))
+    chunk_index.reindex_all(manifest)
+    assert manifest.execute("SELECT COUNT(*) FROM minute_chunks").fetchone()[0] > 0
+
+    manifest.execute("DELETE FROM meetings WHERE id = 'm1'")
+
+    assert manifest.execute("SELECT COUNT(*) FROM minute_chunks").fetchone()[0] == 0
+    manifest.execute("INSERT INTO minute_chunks_fts(minute_chunks_fts) VALUES('integrity-check')")
+
+
+def test_a_chunk_cannot_name_a_meeting_that_does_not_exist(manifest):
+    """GC3 at the schema level: no citation without a meeting behind it."""
+    with pytest.raises(sqlite3.IntegrityError):
+        manifest.execute(
+            """
+            INSERT INTO minute_chunks (
+                chunk_id, meeting_id, meeting_date, source_path, ordinal, heading,
+                text, context_header, char_count, content_hash, indexed_at
+            ) VALUES ('ghost:0000', 'ghost', '2026-06-09', '/x.md', 0, NULL,
+                      'orphan', NULL, 6, 'deadbeef', '2026-06-09T00:00:00')
+            """
+        )
+
+
+def test_a_pre_foreign_key_chunk_table_is_migrated_not_kept(tmp_path):
+    """An index built before the FK existed is dropped and rebuilt, not inherited.
+
+    CREATE TABLE IF NOT EXISTS would skip the new definition silently, leaving
+    an installed manifest permanently on the old shape while every test passed
+    against a table created from scratch.
+    """
+    db_path = tmp_path / "legacy.db"
+    db.init_db(db_path)
+    with db.connect(db_path) as conn:
+        conn.executescript(
+            """
+            DROP TRIGGER minute_chunks_ai;
+            DROP TRIGGER minute_chunks_ad;
+            DROP TRIGGER minute_chunks_au;
+            DROP TABLE minute_chunks_fts;
+            DROP TABLE minute_chunks;
+            CREATE TABLE minute_chunks (
+                chunk_id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, meeting_date TEXT,
+                source_path TEXT NOT NULL, ordinal INTEGER NOT NULL, heading TEXT,
+                text TEXT NOT NULL, context_header TEXT, char_count INTEGER NOT NULL,
+                content_hash TEXT NOT NULL, indexed_at TEXT NOT NULL
+            );
+            """
+        )
+        assert not conn.execute("PRAGMA foreign_key_list(minute_chunks)").fetchall()
+
+    db.init_db(db_path)
+
+    with db.connect(db_path) as conn:
+        keys = conn.execute("PRAGMA foreign_key_list(minute_chunks)").fetchall()
+        assert [(k["table"], k["to"], k["on_delete"]) for k in keys] == [
+            ("meetings", "id", "CASCADE")
+        ]
+        # The FTS table and all three triggers came back with it.
+        names = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE 'minute_chunks%'"
+            )
+        }
+        assert {"minute_chunks_fts", "minute_chunks_ai", "minute_chunks_ad",
+                "minute_chunks_au"} <= names
+        _add_meeting(conn, "m1", "2026-06-09", _sample_minutes(tmp_path, "a.md"))
+        assert chunk_index.reindex_meeting(conn, "m1") > 0
+        conn.execute("INSERT INTO minute_chunks_fts(minute_chunks_fts) VALUES('integrity-check')")
+
+
 def test_missing_table_returns_empty_with_a_reason(tmp_path):
     """GC5: an unbuilt index answers empty, not with a stack trace."""
-    import sqlite3
-
     conn = sqlite3.connect(tmp_path / "bare.db")
     conn.row_factory = sqlite3.Row
     try:
