@@ -350,6 +350,75 @@ CREATE TABLE IF NOT EXISTS chat_turns (
 
 -- DESC because every read is "the last N turns of this session".
 CREATE INDEX IF NOT EXISTS idx_chat_turns_session ON chat_turns(session_id, turn_index DESC);
+
+-- ── BM25 chunk index ────────────────────────────────────────────────
+--
+-- The searchable copy of the minutes. Minutes live on disk and are the record;
+-- these rows are a derived, disposable projection of them, which is why nothing
+-- here is authored and the whole table can be rebuilt from the files in seconds.
+-- See pipeline/chunk_index.py for the chunk geometry.
+--
+-- Every provenance field is denormalized from `meetings` on purpose. A hit is
+-- handed to a caller as an excerpt plus a citation, and the citation has to name
+-- the meeting this text actually came from; carrying it on the row makes that a
+-- property of the data rather than of whoever remembered to join.
+CREATE TABLE IF NOT EXISTS minute_chunks (
+    chunk_id      TEXT PRIMARY KEY,   -- "<meeting_id>:<ordinal, 4 digits>"
+    meeting_id    TEXT NOT NULL,
+    meeting_date  TEXT,
+    source_path   TEXT NOT NULL,
+    ordinal       INTEGER NOT NULL,   -- position in the file; stable across reindex
+    heading       TEXT,               -- nearest enclosing markdown heading
+    text          TEXT NOT NULL,
+    -- Written by a later retrieval stage, NULL until then. Declared and indexed
+    -- now so adding it needs no second migration over a live manifest.
+    context_header TEXT,
+    char_count    INTEGER NOT NULL,
+    -- SHA-256 of `text`. Reindex compares hashes and skips a meeting whose
+    -- chunks all match, so re-running over the whole corpus is cheap and does
+    -- not churn ids that downstream artifacts key on.
+    content_hash  TEXT NOT NULL,
+    indexed_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_minute_chunks_meeting ON minute_chunks(meeting_id);
+-- One chunk per position per meeting. Guards the reindex path: a replace that
+-- failed to clear the old rows would otherwise double a meeting's text in the
+-- index and let one meeting outvote itself.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_minute_chunks_pos ON minute_chunks(meeting_id, ordinal);
+
+-- External-content FTS5: the index stores only the inverted index, and the text
+-- is read back from minute_chunks. Two copies of an 18,000-character minutes
+-- file per meeting would double the manifest for nothing.
+CREATE VIRTUAL TABLE IF NOT EXISTS minute_chunks_fts USING fts5(
+    text,
+    context_header,
+    heading,
+    content='minute_chunks',
+    content_rowid='rowid',
+    tokenize='porter unicode61'
+);
+
+-- An external-content table is not maintained by SQLite; these triggers are the
+-- only thing keeping it in step. Without them a reindex leaves the FTS index
+-- pointing at rowids that no longer hold the text it indexed, and searches
+-- start returning other meetings' passages under the wrong citation.
+CREATE TRIGGER IF NOT EXISTS minute_chunks_ai AFTER INSERT ON minute_chunks BEGIN
+    INSERT INTO minute_chunks_fts(rowid, text, context_header, heading)
+    VALUES (new.rowid, new.text, new.context_header, new.heading);
+END;
+
+CREATE TRIGGER IF NOT EXISTS minute_chunks_ad AFTER DELETE ON minute_chunks BEGIN
+    INSERT INTO minute_chunks_fts(minute_chunks_fts, rowid, text, context_header, heading)
+    VALUES ('delete', old.rowid, old.text, old.context_header, old.heading);
+END;
+
+CREATE TRIGGER IF NOT EXISTS minute_chunks_au AFTER UPDATE ON minute_chunks BEGIN
+    INSERT INTO minute_chunks_fts(minute_chunks_fts, rowid, text, context_header, heading)
+    VALUES ('delete', old.rowid, old.text, old.context_header, old.heading);
+    INSERT INTO minute_chunks_fts(rowid, text, context_header, heading)
+    VALUES (new.rowid, new.text, new.context_header, new.heading);
+END;
 """
 
 
@@ -748,6 +817,10 @@ def delete_meeting(conn: sqlite3.Connection, meeting_id: str) -> bool:
     # in inbox/ can never be re-ingested: every future `pipeline ingest` sees the
     # same path/size/mtime and skips it, silently and permanently.
     conn.execute("DELETE FROM seen_files WHERE meeting_id = ?", (meeting_id,))
+    # minute_chunks carries its own copy of the provenance and no foreign key, so
+    # nothing cascades. Orphaned chunks would keep answering searches, citing a
+    # meeting the manifest no longer has.
+    conn.execute("DELETE FROM minute_chunks WHERE meeting_id = ?", (meeting_id,))
     cur = conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
     return cur.rowcount > 0
 

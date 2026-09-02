@@ -10,6 +10,7 @@ bounded historical-context service. Read [AGENTS.md](AGENTS.md), then
     uv run pipeline capture --dry-run
     uv run pipeline run --owner "Faraz"
     uv run pipeline graph-sync
+    uv run pipeline chunk-index
     uv run pipeline doctor
 
 Start the authenticated loopback dashboard with open-dashboard.ps1 -Port 8765.

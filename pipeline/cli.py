@@ -15,6 +15,7 @@ minutes compilation loses minutes of work rather than hours.
     pipeline minutes               compile structured minutes
     pipeline graph-sync            publish subscription-authored graph records
     pipeline graph-sync            author the graph from the manifest
+    pipeline chunk-index           build the BM25 index over compiled minutes
     pipeline watch                 process each newly-arrived Drive recording
     pipeline dashboard             browse and search the local meeting record
     pipeline query "question"      ask the knowledge base
@@ -40,6 +41,7 @@ from pathlib import Path
 
 from pipeline import (
     capture,
+    chunk_index,
     compile_minutes,
     db,
     entities,
@@ -470,6 +472,47 @@ def cmd_minutes(args: argparse.Namespace) -> int:
             f"{skipped} meeting(s) parked as junk recordings (see `pipeline status`)."
         )
     return 1 if failures else 0
+
+
+def cmd_chunk_index(args: argparse.Namespace) -> int:
+    """Rebuild the local BM25 index over compiled minutes.
+
+    Cheap and safe to re-run: a meeting whose chunks all hash the same is
+    skipped, so the normal case writes nothing. `--rebuild` forces the write
+    anyway, which is what to reach for after changing the chunk geometry.
+    """
+    db.init_db()
+    with db.connect() as conn:
+        if args.meeting:
+            # A mistyped id and an already-current meeting both write zero
+            # chunks. Reporting them the same way would let a typo read as
+            # success, so the manifest is consulted before anything is claimed.
+            meeting = db.get_meeting(conn, args.meeting)
+            if meeting is None:
+                print(f"No meeting {args.meeting} in the manifest.", file=sys.stderr)
+                return 1
+            if not meeting.minutes_path:
+                print(f"{meeting.label}: no minutes compiled yet.", file=sys.stderr)
+                return 1
+            written = chunk_index.reindex_meeting(conn, args.meeting, force=args.rebuild)
+            if written:
+                print(f"{meeting.label}: indexed {written} chunk(s).")
+            else:
+                print(f"{meeting.label}: unchanged (no chunks written).")
+            return 0
+
+        stats = chunk_index.reindex_all(conn, force=args.rebuild)
+        print(
+            f"{stats['meetings']} meeting(s) with minutes: "
+            f"{stats['reindexed']} reindexed, {stats['unchanged']} unchanged, "
+            f"{stats['unreadable']} unreadable."
+        )
+        print(f"Wrote {stats['chunks']} chunk(s).")
+        _, reason = chunk_index.index_status(conn)
+        print(reason)
+        # An unreadable minutes file is a real gap in the index, not a warning to
+        # scroll past: the meeting is silently unsearchable until it is fixed.
+        return 1 if stats["unreadable"] else 0
 
 
 def cmd_graph_sync(args: argparse.Namespace) -> int:
@@ -1357,6 +1400,17 @@ def build_parser() -> argparse.ArgumentParser:
         "graph-sync", help="author the LightRAG graph from the manifest's entities"
     )
     p_graph.set_defaults(func=cmd_graph_sync)
+
+    p_chunk = subparsers.add_parser(
+        "chunk-index", help="build the local BM25 index over compiled minutes"
+    )
+    p_chunk.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="rewrite chunks even where content hashes are unchanged",
+    )
+    p_chunk.add_argument("--meeting", help="index one meeting id instead of the whole corpus")
+    p_chunk.set_defaults(func=cmd_chunk_index)
 
     p_run = subparsers.add_parser("run", help="every pending stage, in order")
     p_run.add_argument("--limit", type=int, default=None)
