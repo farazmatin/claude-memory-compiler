@@ -543,7 +543,13 @@ def cmd_dense_index(args: argparse.Namespace) -> int:
             # A named failure, not a traceback: the usual cause is a model that
             # has never been downloaded, and the operator needs to know the rest
             # of retrieval is still working.
-            print(f"Dense index not built: {exc}", file=sys.stderr)
+            print(f"Dense index build stopped: {exc}", file=sys.stderr)
+            # And how much of it survived. Batches commit as they land, so a
+            # failure at chunk 2,000 of a 40-minute build leaves 2,000 usable
+            # vectors - reporting only "stopped" would tell the operator the
+            # opposite of what happened, and they would rebuild from zero.
+            _, reason = dense_index.dense_status(conn, model=model)
+            print(reason, file=sys.stderr)
             print("BM25 retrieval is unaffected.", file=sys.stderr)
             return 1
         print(
@@ -554,12 +560,21 @@ def cmd_dense_index(args: argparse.Namespace) -> int:
         print(reason)
         if model != dense_index.EMBED_MODEL:
             # Searching reads MMC_EMBED_MODEL and nothing else, so a one-off
-            # --model builds an index that nothing will ever look at. Said here
-            # rather than refused: building a second index to compare against is
-            # a legitimate thing to want.
+            # --model builds an index nothing will look at. Warned rather than
+            # refused: building a second index to A/B two embedders is exactly
+            # what the flag is for, and refusing it makes the flag decorative.
+            #
+            # On stderr, not stdout, and not phrased as a note. This is the only
+            # thing standing between an operator and a 40-minute build no search
+            # will ever read, and stdout is where an overnight run's summary
+            # scrolls past unread or into `> build.log`. `dense_status` repeats
+            # the condition on every later run.
             print(
-                f"Note: searches read {dense_index.EMBED_MODEL}. "
-                f"Set MMC_EMBED_MODEL={model} for this index to be used."
+                f"\nWARNING: nothing will search this index yet."
+                f"\n  built under:   {model}"
+                f"\n  searches read: {dense_index.EMBED_MODEL}"
+                f"\n  to use it:     set MMC_EMBED_MODEL={model}\n",
+                file=sys.stderr,
             )
     return 0
 

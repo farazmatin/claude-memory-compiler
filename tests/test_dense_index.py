@@ -89,8 +89,22 @@ def _install(monkeypatch, fake):
     monkeypatch.setattr(dense_index, "_load_embedder", lambda model: fake)
     monkeypatch.setattr(dense_index, "_EMBEDDER", None)
     monkeypatch.setattr(dense_index, "_EMBEDDER_MODEL", None)
-    monkeypatch.setattr(dense_index, "_LOAD_FAILURE", None)
+    monkeypatch.setattr(dense_index, "_LOAD_FAILURES", {})
+    monkeypatch.setattr(dense_index, "_LAST_ERROR", None)
     return fake
+
+
+def _install_reranker(monkeypatch, loader):
+    """Put `loader` behind the reranker seam and clear every cached decision.
+
+    `_LOAD_FAILURES` is part of that state now: it gates load attempts, so a
+    failure recorded by one test would make the next one's loader unreachable.
+    """
+    monkeypatch.setattr(dense_index, "_load_reranker", loader)
+    monkeypatch.setattr(dense_index, "_RERANKER", None)
+    monkeypatch.setattr(dense_index, "_RERANKER_MODEL", None)
+    monkeypatch.setattr(dense_index, "_RERANKER_WARNED", False)
+    monkeypatch.setattr(dense_index, "_LOAD_FAILURES", {})
 
 
 @pytest.fixture()
@@ -135,6 +149,23 @@ def _indexed(conn, tmp_path: Path, bodies: dict[str, str], dates: dict[str, str]
     for meeting_id, body in bodies.items():
         _meeting(conn, tmp_path, meeting_id, body, date=dates.get(meeting_id, "2026-06-09"))
     chunk_index.reindex_all(conn)
+
+
+def _hits(count: int, *, score: float | None = None) -> list[chunk_index.ChunkHit]:
+    """A ranked list to hand `rerank`, best first. No database needed."""
+    return [
+        chunk_index.ChunkHit(
+            chunk_id=f"m1:000{n}",
+            meeting_id="m1",
+            meeting_date="2026-06-09",
+            source_path="/minutes/m1.md",
+            ordinal=n,
+            heading=None,
+            text=f"passage {n}",
+            score=1.0 - n / 10 if score is None else score,
+        )
+        for n in range(count)
+    ]
 
 
 def _plain(title: str, repeats: int = 2, marker: str = "") -> str:
@@ -577,27 +608,12 @@ def test_a_missing_model_empties_the_dense_path_without_touching_bm25(
 
 
 def test_rerank_without_a_model_returns_the_input_order_truncated(monkeypatch, capsys):
-    hits = [
-        chunk_index.ChunkHit(
-            chunk_id=f"m1:000{n}",
-            meeting_id="m1",
-            meeting_date="2026-06-09",
-            source_path="/minutes/m1.md",
-            ordinal=n,
-            heading=None,
-            text=f"passage {n}",
-            score=1.0 - n / 10,
-        )
-        for n in range(5)
-    ]
+    hits = _hits(5)
 
     def unavailable(model):
         raise OSError("reranker weights are not on this machine")
 
-    monkeypatch.setattr(dense_index, "_load_reranker", unavailable)
-    monkeypatch.setattr(dense_index, "_RERANKER", None)
-    monkeypatch.setattr(dense_index, "_RERANKER_MODEL", None)
-    monkeypatch.setattr(dense_index, "_RERANKER_WARNED", False)
+    _install_reranker(monkeypatch, unavailable)
 
     out = dense_index.rerank("who owns sampling", hits, top_n=3)
     again = dense_index.rerank("who owns sampling", hits, top_n=3)
@@ -611,28 +627,14 @@ def test_rerank_without_a_model_returns_the_input_order_truncated(monkeypatch, c
 
 
 def test_rerank_reorders_and_rescores_when_the_model_is_there(monkeypatch):
-    hits = [
-        chunk_index.ChunkHit(
-            chunk_id=f"m1:000{n}",
-            meeting_id="m1",
-            meeting_date="2026-06-09",
-            source_path="/minutes/m1.md",
-            ordinal=n,
-            heading=None,
-            text=f"passage {n}",
-            score=0.9,
-        )
-        for n in range(3)
-    ]
+    hits = _hits(3, score=0.9)
 
     class FakeCrossEncoder:
         def rerank(self, query, documents, **kwargs):
             # "passage 2" is the answer; the dense order put it last.
             return [-4.0, 0.0, 6.0][: len(list(documents))]
 
-    monkeypatch.setattr(dense_index, "_load_reranker", lambda model: FakeCrossEncoder())
-    monkeypatch.setattr(dense_index, "_RERANKER", None)
-    monkeypatch.setattr(dense_index, "_RERANKER_MODEL", None)
+    _install_reranker(monkeypatch, lambda model: FakeCrossEncoder())
 
     out = dense_index.rerank("who owns sampling", hits, top_n=2)
 
@@ -642,6 +644,183 @@ def test_rerank_reorders_and_rescores_when_the_model_is_there(monkeypatch):
     assert out[0].score > out[1].score
     assert all(0.0 <= hit.score <= 1.0 for hit in out)
     assert out[0].text == "passage 2"
+
+
+def test_a_failed_reranker_load_is_attempted_once_per_process(monkeypatch, capsys):
+    """Otherwise every retrieval pays a hub fetch and its timeout, silently.
+
+    This is the normal path on this machine, not an edge case: the reranker has
+    never been downloaded and the disk is at 1%. The single warning line is
+    spent on the first query, so a per-call retry would be both slow and
+    invisible - the failure mode explicit degradation exists to prevent.
+    """
+    hits = _hits(4)
+    attempts: list[str] = []
+
+    def unavailable(model):
+        attempts.append(model)
+        raise OSError("reranker weights are not on this machine")
+
+    _install_reranker(monkeypatch, unavailable)
+
+    for _ in range(5):
+        assert dense_index.rerank("who owns sampling", hits, top_n=2) == hits[:2]
+
+    # One attempt for five calls. The literal 1, not len(set(attempts)):
+    # de-duplicating would pass even if the loader ran five times.
+    assert attempts == [dense_index.RERANK_MODEL]
+    assert capsys.readouterr().out.count("reranker unavailable") == 1
+
+
+def test_a_failed_embedder_load_is_attempted_once_per_process(
+    manifest, tmp_path, monkeypatch
+):
+    """The `_vector_count` guard does not cover this.
+
+    It spares a machine that never built an index. A machine that built one and
+    then lost its model cache reaches the load on every single search.
+    """
+    _install(monkeypatch, FakeEmbedder())
+    _indexed(manifest, tmp_path, {"m1": _plain("First")})
+    dense_index.embed_chunks(manifest)
+
+    attempts: list[str] = []
+
+    def unavailable(model):
+        attempts.append(model)
+        raise OSError("no network and no cached model")
+
+    monkeypatch.setattr(dense_index, "_load_embedder", unavailable)
+    monkeypatch.setattr(dense_index, "_EMBEDDER", None)
+    monkeypatch.setattr(dense_index, "_EMBEDDER_MODEL", None)
+    monkeypatch.setattr(dense_index, "_LOAD_FAILURES", {})
+
+    for _ in range(5):
+        assert dense_index.search_dense(manifest, "control inventory") == []
+
+    assert attempts == [dense_index.EMBED_MODEL]
+    searchable, reason = dense_index.dense_status(manifest)
+    assert searchable is False
+    assert "no network and no cached model" in reason
+    # The count rides along, so "how much did I keep" is answerable from the
+    # same line the CLI prints when a build stops.
+    assert "1 vectors already stored" in reason
+
+
+def test_reset_models_is_the_way_back_after_the_cause_is_fixed(
+    manifest, tmp_path, monkeypatch
+):
+    """One attempt per process is wrong on its own for a process that lives all day.
+
+    The loopback context service holds one process for a day; without this it
+    would keep reporting an 03:00 failure at 17:00, long after the operator
+    freed the disk. Both halves are the same mechanism.
+    """
+    _install(monkeypatch, FakeEmbedder())
+    _indexed(manifest, tmp_path, {"m1": _plain("First")})
+    dense_index.embed_chunks(manifest)
+
+    working = FakeEmbedder()
+    calls: list[str] = []
+
+    def flaky(model):
+        calls.append(model)
+        if len(calls) == 1:
+            raise OSError("disk full")
+        return working
+
+    monkeypatch.setattr(dense_index, "_load_embedder", flaky)
+    monkeypatch.setattr(dense_index, "_EMBEDDER", None)
+    monkeypatch.setattr(dense_index, "_EMBEDDER_MODEL", None)
+    monkeypatch.setattr(dense_index, "_LOAD_FAILURES", {})
+
+    assert dense_index.search_dense(manifest, "control inventory") == []
+    assert dense_index.dense_status(manifest)[0] is False
+    # Still one attempt, however many searches ran.
+    assert dense_index.search_dense(manifest, "control inventory") == []
+    assert len(calls) == 1
+
+    dense_index.reset_models()
+
+    assert dense_index.search_dense(manifest, "control inventory", max_chars=100_000)
+    assert len(calls) == 2
+    searchable, reason = dense_index.dense_status(manifest)
+    assert searchable is True
+    assert "disk full" not in reason
+
+
+def test_reset_models_drops_a_loaded_session_too_not_only_the_failure_record(
+    manifest, tmp_path, monkeypatch
+):
+    """An operator who replaced the model files needs a new session, not the old graph."""
+    _install(monkeypatch, FakeEmbedder())
+    loads: list[str] = []
+    fake = FakeEmbedder()
+
+    def counting(model):
+        loads.append(model)
+        return fake
+
+    monkeypatch.setattr(dense_index, "_load_embedder", counting)
+    _indexed(manifest, tmp_path, {"m1": _plain("First")})
+
+    dense_index.embed_chunks(manifest)
+    assert dense_index.search_dense(manifest, "control inventory", max_chars=100_000)
+    assert len(loads) == 1, "the session has to be cached across calls"
+
+    dense_index.reset_models()
+
+    assert dense_index.search_dense(manifest, "control inventory", max_chars=100_000)
+    assert len(loads) == 2
+
+
+def test_a_query_the_model_refuses_does_not_disable_the_model(
+    manifest, tmp_path, monkeypatch
+):
+    """A failed *load* gates further attempts; a single refused *call* must not.
+
+    Otherwise one tokenizer edge case in one query takes dense retrieval down for
+    the life of a process that is otherwise perfectly able to serve it. This is
+    why the two failures are recorded in different places.
+    """
+
+    class RefusesPoison(FakeEmbedder):
+        def __init__(self):
+            super().__init__()
+            self.refusals = 0
+
+        def embed(self, documents, batch_size: int = 256, **kwargs):
+            docs = list(documents)
+            if docs == ["poison"]:
+                self.refusals += 1
+                raise RuntimeError("tokenizer blew up")
+            yield from super().embed(docs, batch_size=batch_size)
+
+    fake = RefusesPoison()
+    _install(monkeypatch, fake)
+    loads: list[str] = []
+
+    def counting(model):
+        loads.append(model)
+        return fake
+
+    monkeypatch.setattr(dense_index, "_load_embedder", counting)
+    _indexed(manifest, tmp_path, {"m1": _plain("First")})
+    dense_index.embed_chunks(manifest)
+
+    assert dense_index.search_dense(manifest, "poison") == []
+    searchable, reason = dense_index.dense_status(manifest)
+    assert searchable is False
+    assert "tokenizer blew up" in reason
+
+    # A good query still works, and clears the reported error.
+    assert dense_index.search_dense(manifest, "control inventory", max_chars=100_000)
+    assert dense_index.dense_status(manifest)[0] is True
+
+    # And the bad one is attempted again rather than short-circuited by the gate.
+    assert dense_index.search_dense(manifest, "poison") == []
+    assert fake.refusals == 2
+    assert len(loads) == 1, "a refused call must not force a reload either"
 
 
 # ── 11. Import loads nothing ──────────────────────────────────────────
@@ -762,6 +941,34 @@ def test_the_cli_reports_what_it_built(manifest, tmp_path, embedder, capsys):
     assert dense_index.EMBED_MODEL in out
 
 
+def test_the_cli_warns_unmissably_when_it_builds_an_index_nothing_will_search(
+    manifest, tmp_path, embedder, capsys
+):
+    """`--model X` is legitimate, and it also builds something no search reads.
+
+    `search_dense` reads MMC_EMBED_MODEL and nothing else, so this warning is
+    the only thing between an operator and a 40-minute build for nothing. It
+    goes to stderr and names the variable, because stdout is where an overnight
+    summary scrolls past or lands in `> build.log`.
+    """
+    from pipeline import cli
+
+    _indexed(manifest, tmp_path, {"m1": _plain("First")})
+    manifest.commit()
+
+    assert cli.cmd_dense_index(argparse.Namespace(rebuild=False, model="other/model")) == 0
+    captured = capsys.readouterr()
+
+    assert "WARNING" in captured.err
+    assert "MMC_EMBED_MODEL=other/model" in captured.err
+    assert dense_index.EMBED_MODEL in captured.err
+    # And the condition outlives the run that created it, so a later build says
+    # so too rather than the operator having to remember.
+    _, reason = dense_index.dense_status(manifest)
+    assert "under other/model" in reason
+    assert "no search will read" in reason
+
+
 def test_the_cli_reports_a_missing_model_and_says_bm25_still_works(
     manifest, tmp_path, monkeypatch, capsys
 ):
@@ -787,3 +994,53 @@ def test_the_cli_reports_a_missing_model_and_says_bm25_still_works(
     assert "no network and no cached model" in captured.err
     assert "BM25 retrieval is unaffected" in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_the_cli_says_how_much_a_stopped_build_kept(manifest, tmp_path, monkeypatch, capsys):
+    """A failure partway through is not "nothing was built".
+
+    Batches commit as they land, so a 40-minute build that dies at chunk 2,000
+    leaves 2,000 usable vectors. Reporting only the failure would tell the
+    operator the opposite of what happened and they would rebuild from zero.
+    """
+    from pipeline import cli
+
+    class FailsPartway(FakeEmbedder):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        def embed(self, documents, batch_size: int = 256, **kwargs):
+            self.attempts += 1
+            # Second batch, so the first one's 32 vectors are already committed.
+            if self.attempts > 1:
+                raise RuntimeError("the model died")
+            yield from super().embed(documents, batch_size=batch_size)
+
+    fake = _install(monkeypatch, FailsPartway())
+    # More than one CLI batch: cmd_dense_index uses embed_chunks' default
+    # batch_size of 32, so a corpus that fits in one batch could only ever fail
+    # with nothing stored - which is not the case under test.
+    wordy = "".join(
+        f"## Section {n}\n\nThe control inventory was discussed. {FILLER * 2}\n\n"
+        for n in range(40)
+    )
+    _indexed(manifest, tmp_path, {"m1": wordy})
+    assert manifest.execute("SELECT COUNT(*) FROM minute_chunks").fetchone()[0] > 32
+    manifest.commit()
+
+    assert cli.cmd_dense_index(argparse.Namespace(rebuild=False, model=None)) == 1
+    captured = capsys.readouterr()
+
+    assert fake.attempts == 2, "the fixture must fail on the second batch, not the first"
+    assert "Dense index build stopped" in captured.err
+    assert "the model died" in captured.err
+    # The count is the actionable half: the first batch of 32 is already usable
+    # and re-running resumes from there rather than starting over. It arrives on
+    # dense_status' healthy line, not the failure line, because the model loaded
+    # fine here - it was one batch that died, so nothing poisons _LOAD_FAILURES.
+    assert "32 vectors indexed for" in captured.err
+    assert "BM25 retrieval is unaffected" in captured.err
+    assert (
+        manifest.execute("SELECT COUNT(*) FROM chunk_vectors").fetchone()[0] == 32
+    ), "the surviving vectors have to actually be there, not just be claimed"

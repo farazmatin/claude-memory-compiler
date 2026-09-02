@@ -53,9 +53,11 @@ from typing import Any, Protocol
 from pipeline.chunk_index import MAX_CHUNKS_PER_MEETING, ChunkHit, fit_excerpt
 from pipeline.config import EMBED_MODEL, RERANK_MODEL, now_iso
 
-# numpy is imported inside functions rather than at module scope, matching
-# voices.py: every `pipeline` command imports this module transitively through
-# retrieval, and only the two that actually score anything should pay for it.
+# numpy is imported inside the two functions that score rather than at module
+# scope, matching voices.py. Today the only importer is `cli.cmd_dense_index`,
+# which imports inside the command for the same reason; when the fusion step
+# lands, this module will be on the import path of every retrieval and the
+# deferral is what keeps a BM25-only search from paying for numpy.
 
 
 class DenseIndexError(RuntimeError):
@@ -98,10 +100,27 @@ _RERANKER: CrossEncoder | None = None
 _RERANKER_MODEL: str | None = None
 _RERANKER_WARNED = False
 
-# Why the last model load failed, if it did. `search_dense` returns a bare list,
-# so this is the only channel a caller has for "there is no model" as against
-# "nothing matched" - the same job `chunk_index.index_status` does for BM25.
-_LOAD_FAILURE: str | None = None
+# model id -> why loading it failed. Two jobs, and the second is the important
+# one.
+#
+# It is the reason channel: `search_dense` returns a bare list, so this is all a
+# caller has to tell "there is no model" from "nothing matched" - the job
+# `chunk_index.index_status` does for BM25.
+#
+# It is also a gate, checked BEFORE a load is attempted, so a process tries each
+# model at most once. Caching only success is not enough: the reranker has never
+# been downloaded on this machine and the disk is at 1%, so a failed load is the
+# normal path, not an edge case, and a retrieval calls `rerank` every time. A
+# per-call retry would pay a hub fetch and its timeout on every query -
+# silently, because the one warning line was spent on the first one. Degradation
+# that is slow and invisible is the failure mode explicit degradation exists to
+# prevent.
+_LOAD_FAILURES: dict[str, str] = {}
+
+# Why the last dense call failed when it was not a load failure - a loaded model
+# that refused one query. Reported, but deliberately not a gate: a single bad
+# call must not disable a working model for the life of the process.
+_LAST_ERROR: str | None = None
 
 
 def _load_embedder(model: str) -> TextEmbedder:
@@ -122,32 +141,77 @@ def _load_reranker(model: str) -> CrossEncoder:
     return TextCrossEncoder(model_name=model)
 
 
+def _record_load_failure(model: str, exc: BaseException) -> str:
+    """Remember that `model` cannot be loaded in this process, and why.
+
+    The `except` clauses feeding this are deliberately broad. An unknown model
+    id arrives as ValueError, an uninstalled fastembed as ImportError, and an
+    absent network as any of a dozen huggingface_hub, urllib3 and OSError types.
+    Enumerating them would mean the next urllib3 release turns "no network" into
+    a crash in the middle of an unattended run.
+    """
+    reason = f"{model} unavailable: {type(exc).__name__}: {exc}"
+    _LOAD_FAILURES[model] = reason
+    return reason
+
+
 def _embedder(model: str) -> TextEmbedder:
-    """The cached embedding model, built on first use. Raises DenseIndexError."""
-    global _EMBEDDER, _EMBEDDER_MODEL, _LOAD_FAILURE
+    """The cached embedding model, built on first use. Raises DenseIndexError.
+
+    A model that already failed in this process is not retried; see
+    `_LOAD_FAILURES` for why, and `reset_models` for the way back.
+    """
+    global _EMBEDDER, _EMBEDDER_MODEL
     if _EMBEDDER is not None and _EMBEDDER_MODEL == model:
         return _EMBEDDER
+    if model in _LOAD_FAILURES:
+        raise DenseIndexError(_LOAD_FAILURES[model])
     try:
         embedder = _load_embedder(model)
     except Exception as exc:
-        # Deliberately broad. An unknown model id arrives as ValueError, an
-        # uninstalled fastembed as ImportError, and an absent network as any of
-        # a dozen huggingface_hub, urllib3 and OSError types. Enumerating them
-        # would mean the next urllib3 release turns "no network" into a crash in
-        # the middle of an unattended run.
-        _LOAD_FAILURE = f"{model} unavailable: {type(exc).__name__}: {exc}"
-        raise DenseIndexError(_LOAD_FAILURE) from exc
-    _EMBEDDER, _EMBEDDER_MODEL, _LOAD_FAILURE = embedder, model, None
+        raise DenseIndexError(_record_load_failure(model, exc)) from exc
+    _EMBEDDER, _EMBEDDER_MODEL = embedder, model
     return embedder
 
 
 def _reranker(model: str) -> CrossEncoder:
-    """The cached cross-encoder, built on first use. Raises whatever loading raised."""
+    """The cached cross-encoder, built on first use. Raises DenseIndexError.
+
+    Same one-attempt-per-process rule as `_embedder`, and it binds harder here:
+    `rerank` runs on every retrieval, so this is the call that would otherwise
+    re-attempt a download for every query anyone ever asks.
+    """
     global _RERANKER, _RERANKER_MODEL
-    if _RERANKER is None or _RERANKER_MODEL != model:
-        _RERANKER = _load_reranker(model)
-        _RERANKER_MODEL = model
-    return _RERANKER
+    if _RERANKER is not None and _RERANKER_MODEL == model:
+        return _RERANKER
+    if model in _LOAD_FAILURES:
+        raise DenseIndexError(_LOAD_FAILURES[model])
+    try:
+        encoder = _load_reranker(model)
+    except Exception as exc:
+        raise DenseIndexError(_record_load_failure(model, exc)) from exc
+    _RERANKER, _RERANKER_MODEL = encoder, model
+    return encoder
+
+
+def reset_models() -> None:
+    """Forget the loaded models and every recorded failure. The way back.
+
+    One attempt per process is right for a CLI run, and wrong on its own for a
+    process that lives all day: the loopback context service would keep
+    reporting a 03:00 failure at 17:00, long after the operator freed the disk
+    or reconnected the network. This is the documented reset - call it once the
+    cause is fixed and the next search loads the model again.
+
+    Cheap and safe to call: it drops cached ONNX sessions, which are rebuilt on
+    demand, and clears nothing persistent. It does not touch `chunk_vectors`.
+    """
+    global _EMBEDDER, _EMBEDDER_MODEL, _RERANKER, _RERANKER_MODEL
+    global _RERANKER_WARNED, _LAST_ERROR
+    _EMBEDDER = _EMBEDDER_MODEL = _RERANKER = _RERANKER_MODEL = None
+    _RERANKER_WARNED = False
+    _LAST_ERROR = None
+    _LOAD_FAILURES.clear()
 
 
 # ── Vector storage ────────────────────────────────────────────────────
@@ -364,18 +428,40 @@ def dense_status(conn: sqlite3.Connection, *, model: str | None = None) -> tuple
         return False, "dense index not built; run `pipeline dense-index`"
     total = _vector_count(conn, model)
     if not total:
-        return False, f"no vectors for {model}; run `pipeline dense-index`"
-    if _LOAD_FAILURE:
+        return False, f"no vectors for {model}{_orphans(conn, model)}; run `pipeline dense-index`"
+    failure = _LOAD_FAILURES.get(model) or _LAST_ERROR
+    if failure:
         # Vectors exist but nothing can embed a query against them, so the index
-        # is unusable however complete it looks.
-        return False, _LOAD_FAILURE
+        # is unusable however complete it looks. The count rides along because
+        # this line is also what the CLI prints when a build stops partway, and
+        # "how much did I keep" is the question then.
+        return False, f"{failure} ({total} vectors already stored)"
     stale = _stale_count(conn, model)
     if stale:
         return True, (
             f"{total} vectors for {model}, {stale} stale and not being searched; "
             "run `pipeline dense-index`"
         )
-    return True, f"{total} vectors indexed for {model}"
+    return True, f"{total} vectors indexed for {model}{_orphans(conn, model)}"
+
+
+def _orphans(conn: sqlite3.Connection, model: str) -> str:
+    """A clause naming vectors stored under a model no search will read, if any.
+
+    `search_dense` reads `EMBED_MODEL` and nothing else, so an index built under
+    a one-off `--model` is unreachable. Reported here rather than only in the
+    run that created it, so the condition resurfaces on every later
+    `pipeline dense-index` instead of scrolling out of a build log.
+    """
+    rows = conn.execute(
+        "SELECT model, COUNT(*) FROM chunk_vectors WHERE model <> ? GROUP BY model "
+        "ORDER BY COUNT(*) DESC",
+        (EMBED_MODEL,),
+    ).fetchall()
+    if not rows:
+        return ""
+    listed = ", ".join(f"{count} under {other}" for other, count in rows)
+    return f" ({listed}, which no search will read)"
 
 
 # ── Search ────────────────────────────────────────────────────────────
@@ -399,16 +485,19 @@ def _embed_query(query: str, model: str):
     """The query as a float64 vector. Raises DenseIndexError."""
     import numpy as np
 
-    global _LOAD_FAILURE
+    global _LAST_ERROR
     embedder = _embedder(model)
     try:
         vectors = list(embedder.embed([query], batch_size=1))
     except Exception as exc:
-        _LOAD_FAILURE = f"{model} failed to embed the query: {type(exc).__name__}: {exc}"
-        raise DenseIndexError(_LOAD_FAILURE) from exc
+        # Recorded on _LAST_ERROR, not in _LOAD_FAILURES: the model loaded, so
+        # one refused query must not disable it for the life of the process.
+        _LAST_ERROR = f"{model} failed to embed the query: {type(exc).__name__}: {exc}"
+        raise DenseIndexError(_LAST_ERROR) from exc
     if not vectors:
-        _LOAD_FAILURE = f"{model} returned no vector for the query"
-        raise DenseIndexError(_LOAD_FAILURE)
+        _LAST_ERROR = f"{model} returned no vector for the query"
+        raise DenseIndexError(_LAST_ERROR)
+    _LAST_ERROR = None
     return np.asarray(vectors[0], dtype="float64").ravel()
 
 
