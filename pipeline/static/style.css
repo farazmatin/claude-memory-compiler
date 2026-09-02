@@ -2311,3 +2311,57 @@ button[aria-busy="true"]::after {
   font-variant-numeric: tabular-nums;
   font-size: 0.85em;
 }
+
+
+/* ── Live run detail ──────────────────────────────────────────────────
+   A run reports its stage, the recording it is inside, and what is left,
+   right under the badge. Before this the masthead could only say "running"
+   or "idle", and a run started outside the dashboard said neither. */
+.pipeline-detail {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #475569;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  align-items: center;
+}
+.pipeline-detail .pd-item { white-space: nowrap; }
+.pipeline-detail .pd-item strong { color: #0f172a; font-weight: 600; }
+.pipeline-detail .pd-queue {
+  display: inline-flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.pipeline-detail .pd-chip {
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  padding: 1px 9px;
+  font-variant-numeric: tabular-nums;
+}
+.pipeline-detail .pd-chip.pd-chip-failed {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #b91c1c;
+}
+.pipeline-detail .pd-meeting {
+  color: #334155;
+  max-width: 46ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pipeline-detail.pd-external .pd-owner {
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  color: #1d4ed8;
+  border-radius: 999px;
+  padding: 1px 9px;
+}
+.terminal-foot {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: #94a3b8;
+}

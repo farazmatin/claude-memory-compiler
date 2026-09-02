@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import json
 import mimetypes
+import os
 import re
 import subprocess
 import threading
@@ -25,16 +26,14 @@ from urllib.parse import parse_qs, urlparse
 
 from pydantic import ValidationError
 
-from pipeline import dashboard_auth, db, index, people_merge, voices
+from pipeline import config, dashboard_auth, db, index, people_merge, voices
 from pipeline.config import (
-    ANTIGRAVITY_MODEL,
     AUDIO_DIR,
     CHAT_HISTORY_TURNS,
     DASHBOARD_HOST,
     DASHBOARD_PORT,
     DRIVE_CREDENTIALS_FILE,
     DRIVE_TOKEN_FILE,
-    GEMINI_MODEL,
     INBOX_DIR,
     MINUTES_DIR,
     OWNER_NAME,
@@ -64,30 +63,132 @@ _pipeline_state: dict[str, Any] = {
     "finished_at": None,
     "success": None,
     "error": None,
+    "blocked_by": None,
 }
 _log_buffer: deque[str] = deque(maxlen=200)
 
 
+def _clock(timestamp: str | None) -> str:
+    """An ISO timestamp as the wall clock a person reads off it."""
+    if not timestamp:
+        return "just now"
+    try:
+        return datetime.fromisoformat(timestamp).strftime("%H:%M")
+    except ValueError:
+        return timestamp
+
+
+def run_lock_path() -> Path:
+    from pipeline.config import DB_DIR
+
+    return DB_DIR / "pipeline-run.lock"
+
+
+def external_run() -> Any:
+    """The run holding the lease from outside this process, if there is one.
+
+    `pipeline run` in a shell and the Drive watcher are invisible to
+    `_pipeline_state`, so the panel used to report "idle" while a run was
+    plainly working and the button was correctly refusing every click.
+    """
+    from pipeline import watcher
+
+    holder = watcher.lease_holder(run_lock_path())
+    if holder is None or holder.pid == os.getpid():
+        return None
+    return holder
+
+
+def _queue_detail() -> dict[str, Any]:
+    """What the run has left to do, and what it is inside right now."""
+    try:
+        # The server initializes the manifest once before binding.  This route
+        # is polled every two seconds during a run, so repeating schema setup
+        # here would turn a read-only status check into a potential SQLite
+        # writer and make it wait behind the minutes commit it is observing.
+        with db.connect() as conn:
+            counts = db.status_counts(conn)
+            active = db.active_stage_run(conn)
+    except Exception:
+        # The panel is a convenience. A locked or half-migrated manifest must
+        # never turn the status endpoint into a 500.
+        return {"queue": {}, "queue_total": 0, "in_flight": None}
+    ordered = [*db.STATUS_ORDER, db.FAILED]
+    return {
+        "queue": {name: counts[name] for name in ordered if counts.get(name)},
+        "queue_total": sum(counts.values()),
+        "in_flight": active,
+    }
+
+
 def get_pipeline_status() -> dict[str, Any]:
-    """Return the current background pipeline execution state and recent logs."""
+    """Return the current pipeline execution state and recent logs.
+
+    "Current" means any run holding the lease, not only one this process
+    started: a shell run and the watcher are the same pipeline over the same
+    queue, and hiding them is what made a refused click look like a broken one.
+    """
+    from pipeline import cli
+
     with _pipeline_lock:
+        state = dict(_pipeline_state)
+        buffered = list(_log_buffer)
+
+    holder = None if state["running"] else external_run()
+    detail = _queue_detail()
+
+    if holder is not None:
+        # An external run owns the truth about stage and start time, and its
+        # output exists only in the shared run log.
+        in_flight = detail["in_flight"] or {}
         return {
-            "running": _pipeline_state["running"],
-            "stage": _pipeline_state["stage"],
-            "started_at": _pipeline_state["started_at"],
-            "finished_at": _pipeline_state["finished_at"],
-            "success": _pipeline_state["success"],
-            "error": _pipeline_state["error"],
-            "logs": list(_log_buffer),
+            "running": True,
+            "owner": "external",
+            "holder_pid": holder.pid,
+            "stage": in_flight.get("stage") or "all",
+            "started_at": holder.started_at,
+            "finished_at": None,
+            "success": None,
+            "error": None,
+            "blocked_by": None,
+            "logs": cli.read_run_log(),
+            **detail,
         }
+
+    return {
+        "running": state["running"],
+        "owner": "dashboard" if state["running"] else None,
+        "holder_pid": os.getpid() if state["running"] else None,
+        "stage": state["stage"],
+        "started_at": state["started_at"],
+        "finished_at": state["finished_at"],
+        "success": state["success"],
+        "error": state["error"],
+        "blocked_by": state.get("blocked_by"),
+        # An idle dashboard that has never run anything still has the last
+        # run's log to show, whoever started it.
+        "logs": buffered or cli.read_run_log(),
+        **detail,
+    }
 
 
 def trigger_pipeline_run(stage: str = "all", limit: int | None = None) -> dict[str, Any]:
     """Start an asynchronous pipeline execution in a background worker thread."""
+    holder = external_run()
+    if holder is not None:
+        raise ValueError(
+            f"A pipeline run is already running - started {_clock(holder.started_at)}"
+            f" (pid {holder.pid}). Its progress is in the log below."
+        )
     with _pipeline_lock:
         if _pipeline_state["running"]:
-            raise ValueError("A pipeline operation is already in progress.")
+            raise ValueError(
+                "A pipeline run is already running - started "
+                + _clock(_pipeline_state["started_at"])
+                + "."
+            )
         _pipeline_state["running"] = True
+        _pipeline_state["blocked_by"] = None
         _pipeline_state["stage"] = stage
         _pipeline_state["started_at"] = now_iso()
         _pipeline_state["finished_at"] = None
@@ -156,7 +257,7 @@ def _dispatch_stage(stage: str, limit: int | None) -> int:
 
 
 def _run_pipeline_worker(stage: str, limit: int | None) -> None:
-    from pipeline import cli
+    from pipeline import cli, watcher
 
     class _LogCapture:
         def write(self, text: str) -> int:
@@ -171,6 +272,7 @@ def _run_pipeline_worker(stage: str, limit: int | None) -> None:
     log_stream = _LogCapture()
     success = False
     error_msg: str | None = None
+    blocked_by: dict[str, Any] | None = None
     try:
         with contextlib.redirect_stdout(log_stream), contextlib.redirect_stderr(log_stream):
             cli.ensure_dirs()
@@ -185,6 +287,18 @@ def _run_pipeline_worker(stage: str, limit: int | None) -> None:
             _log_buffer.append(
                 f"[{now_iso()}] Pipeline stage '{stage}' finished with exit code {rc}"
             )
+    except watcher.WatcherAlreadyRunning:
+        # Not a crash: the lease did its job. Another run - a shell `pipeline
+        # run`, or the watcher - claimed the queue between the click and this
+        # worker starting. Reporting that as a crash is what made a correctly
+        # refused click read as a broken button.
+        holder = external_run()
+        blocked_by = {"pid": holder.pid, "started_at": holder.started_at} if holder else None
+        started = _clock(holder.started_at) if holder else "earlier"
+        _log_buffer.append(
+            f"[{now_iso()}] Already running - a pipeline run started {started} owns the "
+            "queue. This click changed nothing; that run's progress is below."
+        )
     except Exception as exc:
         error_msg = str(exc)
         _log_buffer.append(f"[{now_iso()}] Pipeline stage '{stage}' crashed: {exc}")
@@ -195,6 +309,7 @@ def _run_pipeline_worker(stage: str, limit: int | None) -> None:
             _pipeline_state["finished_at"] = now_iso()
             _pipeline_state["success"] = success
             _pipeline_state["error"] = error_msg
+            _pipeline_state["blocked_by"] = blocked_by
 
 
 def retry_failed(target_status: str = db.DISCOVERED) -> int:
@@ -921,7 +1036,10 @@ def overview() -> dict[str, Any]:
             "asr_backend": "Replicate Serverless GPU (Cloud)",
             "asr_model": "configured Replicate remote transcription model",
             "asr_speed": "~1-2 min per meeting",
-            "minutes_model": ANTIGRAVITY_MODEL or GEMINI_MODEL or "gemini-3.7-flash",
+            # The authoring chain is Codex-first by policy.  Reporting the
+            # fallback model here made a slow Codex run look like Gemini or
+            # Antigravity work in the dashboard's configuration payload.
+            "minutes_model": config.CODEX_MODEL,
         },
         "maintenance": {
             "stale_templates": stale_templates,
@@ -1228,6 +1346,10 @@ def run(host: str = DASHBOARD_HOST, port: int = DASHBOARD_PORT, open_browser: bo
     # Fail before binding rather than after: a dashboard that serves the whole
     # archive to a network is worse than one that refuses to start.
     dashboard_auth.check_startup(host)
+    # Complete schema setup before request threads start.  In particular,
+    # /api/pipeline/status stays a read-only, low-latency poll while minutes are
+    # compiling instead of rerunning migrations every two seconds.
+    db.init_db()
     DashboardHandler.bind_host = host
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     address = f"http://{host}:{port}"

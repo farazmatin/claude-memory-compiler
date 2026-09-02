@@ -8,7 +8,10 @@ how minutes end up orphaned on disk.
 
 from __future__ import annotations
 
+import gc
 import os
+import subprocess
+import sys
 
 import pytest
 
@@ -50,3 +53,23 @@ def test_run_lease_is_a_different_lease_than_the_watcher_poll_loop(tmp_path, mon
     with watcher.WatchLease(tmp_path / "drive-watcher.lock"):
         with cli.pipeline_lease():
             pass
+
+
+def test_lease_recovers_from_a_pid_that_once_named_a_real_process(tmp_path, monkeypatch) -> None:
+    """The stale-lease probe has to survive a plausible dead pid, not just a silly one.
+
+    99999999 sits outside the Windows pid space, so the probe's OpenProcess is
+    rejected with a plain OSError and the recovery test above takes an easy
+    branch. A pid that really did name a process takes the other branch, and
+    that is the one that left db/pipeline-run.lock in place and crashed every
+    Sync & Process run with "<class 'OSError'> returned a result with an
+    exception set".
+    """
+    dead = subprocess.Popen([sys.executable, "-c", ""])
+    dead.wait()
+    gc.collect()  # drop Popen's handle so the pid is genuinely reaped on Windows
+
+    monkeypatch.setattr(cli, "DB_DIR", tmp_path)
+    (tmp_path / "pipeline-run.lock").write_text(str(dead.pid), encoding="utf-8")
+    with cli.pipeline_lease():
+        assert (tmp_path / "pipeline-run.lock").read_text(encoding="utf-8") == str(os.getpid())

@@ -63,6 +63,7 @@ from pipeline.config import (
     MIN_MEETING_SEC,
     MIN_TRANSCRIPT_WORDS,
     OWNER_NAME,
+    RUN_LOG_FILE,
     TEMPLATE_VERSION,
     ensure_dirs,
 )
@@ -401,6 +402,20 @@ def cmd_minutes(args: argparse.Namespace) -> int:
                 queue = queue[: args.limit]
         else:
             queue = db.pending(conn, db.SPEAKERS_RESOLVED, args.limit)
+
+    wanted = (getattr(args, "meeting", None) or "").strip()
+    if wanted:
+        # The queue is oldest-first, which is right for building graph context
+        # in the order events happened - and wrong when the operator is waiting
+        # on one specific recording that happens to be the newest. Selecting by
+        # id prefix jumps it without disturbing that ordering for everyone else.
+        queue = [m for m in queue if m.id.startswith(wanted)]
+        if not queue:
+            print(
+                f"No meeting waiting at {db.SPEAKERS_RESOLVED} matches id "
+                f"'{wanted}'. `pipeline status` lists what is queued."
+            )
+            return 1
 
     if not queue:
         print("Nothing to compile.")
@@ -910,7 +925,84 @@ def pipeline_lease() -> Iterator[None]:
     from pipeline import watcher
 
     with watcher.WatchLease(DB_DIR / "pipeline-run.lock", label="A pipeline run"):
+        with run_log_tee():
+            yield
+
+
+# One run's worth of output. Long enough to hold a full catch-up over twenty
+# meetings, short enough that reading it costs nothing.
+RUN_LOG_LINES = 400
+
+
+@contextlib.contextmanager
+def run_log_tee() -> Iterator[None]:
+    """Mirror this run's output to a file every process can read.
+
+    The dashboard's log panel is an in-process deque, so a run started from a
+    shell or by the watcher showed it nothing at all - the panel stayed blank
+    while transcription was plainly working, which is indistinguishable from a
+    button that did nothing. Teeing here rather than in each command covers
+    every entry point at once, because holding this lease is exactly what it
+    means to be a run.
+
+    A log that cannot be opened must never stop a run, so every failure here is
+    swallowed: the output still goes to the real stream.
+    """
+    try:
+        RUN_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        handle = RUN_LOG_FILE.open("w", encoding="utf-8")
+    except OSError:
         yield
+        return
+
+    real_out, real_err = sys.stdout, sys.stderr
+    try:
+        sys.stdout = _Tee(real_out, handle)
+        sys.stderr = _Tee(real_err, handle)
+        yield
+    finally:
+        sys.stdout, sys.stderr = real_out, real_err
+        with contextlib.suppress(OSError):
+            handle.close()
+
+
+class _Tee:
+    """Write to the real stream and to the run log, and never fail on the log."""
+
+    def __init__(self, stream: object, handle: object) -> None:
+        self._stream = stream
+        self._handle = handle
+
+    def write(self, text: str) -> int:
+        written = self._stream.write(text)
+        try:
+            self._handle.write(text)
+            # Unbuffered on purpose: a reader tailing this file mid-run is the
+            # entire point, and a buffered write shows it nothing until exit.
+            self._handle.flush()
+        except (OSError, ValueError):
+            pass
+        return written
+
+    def flush(self) -> None:
+        with contextlib.suppress(Exception):
+            self._stream.flush()
+
+    def isatty(self) -> bool:
+        return bool(getattr(self._stream, "isatty", lambda: False)())
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._stream, name)
+
+
+def read_run_log(limit: int = RUN_LOG_LINES) -> list[str]:
+    """The tail of the current or most recent run's output, oldest line first."""
+    try:
+        text = RUN_LOG_FILE.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    return lines[-limit:]
 
 
 def run_all_stages(args: argparse.Namespace, include_ingest: bool = True) -> int:
@@ -1494,6 +1586,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true",
         help="compile even a meeting under the junk-recording floor "
              "(MMC_MIN_MEETING_SEC / MMC_MIN_TRANSCRIPT_WORDS)",
+    )
+    p_minutes.add_argument(
+        "--meeting", metavar="ID",
+        help="compile only this meeting (id or unique id prefix), jumping the "
+             "oldest-first queue",
     )
     p_minutes.set_defaults(func=cmd_minutes)
 

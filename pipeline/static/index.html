@@ -23,6 +23,10 @@
             </div>
             <div class="archive-badge" id="archive-attention" aria-live="polite">Checking Archive</div>
           </div>
+          <!-- A run's progress belongs next to the button that starts it. The
+               log panel below is inside a collapsed drawer, so a run started
+               from a shell used to leave the masthead saying nothing at all. -->
+          <div class="pipeline-detail" id="pipeline-detail" aria-live="polite" hidden></div>
           <div class="masthead-actions">
             <button type="button" id="btn-quick-run" class="btn-action">▶ Sync &amp; Process Recordings</button>
             <button type="button" id="btn-export-pm" class="btn-outline">📁 Push to Product Manager</button>
@@ -594,6 +598,7 @@
                 </div>
               </div>
               <pre id="terminal-body" class="terminal-body">No background operations currently running.</pre>
+              <p class="terminal-foot" id="terminal-source"></p>
             </div>
 
             <!-- Stage Timings -->

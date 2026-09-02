@@ -107,6 +107,15 @@ def test_overview_computes_extended_metrics(manifest):
     assert data["knowledge"]["people_count"] >= 1
 
 
+def test_overview_reports_the_codex_minutes_model(manifest, monkeypatch):
+    """Engine metadata must name the primary author, not a fallback model."""
+    monkeypatch.setattr(dashboard.config, "CODEX_MODEL", "codex-test-model")
+
+    data = dashboard.overview()
+
+    assert data["engine"]["minutes_model"] == "codex-test-model"
+
+
 def test_stage_failures_is_its_own_endpoint_not_folded_into_overview(manifest):
     """Deliberately not a key on overview(): overview is polled every 8s and
     already makes a network call, so this history is fetched separately, only

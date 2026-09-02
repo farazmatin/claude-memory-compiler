@@ -1494,6 +1494,40 @@ def stage_timings(conn: sqlite3.Connection) -> list[dict[str, object]]:
     return [dict(r) for r in rows]
 
 
+def active_stage_run(conn: sqlite3.Connection) -> dict[str, object] | None:
+    """The stage_run a run is inside right now, if any.
+
+    An open record - started, never finished - is the only trace a run leaves
+    of what it is working on this second. The dashboard needs it to say
+    "transcribing X" for a run it did not start; without it the panel can only
+    report that something, somewhere, is busy.
+
+    A row left open by a killed run also matches, so the caller must pair this
+    with a live lease before calling it progress.
+    """
+    row = conn.execute(
+        """
+        SELECT sr.stage, sr.started_at,
+               m.id AS meeting_id, m.meeting_date, m.title_hint, m.source_name
+        FROM stage_runs sr
+        JOIN meetings m ON m.id = sr.meeting_id
+        WHERE sr.finished_at IS NULL
+        ORDER BY sr.started_at DESC, sr.rowid DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if not row:
+        return None
+    date = row["meeting_date"] or "????-??-??"
+    hint = row["title_hint"] or row["source_name"]
+    return {
+        "stage": row["stage"],
+        "started_at": row["started_at"],
+        "meeting_id": row["meeting_id"],
+        "label": f"{date} {hint}",
+    }
+
+
 def recent_stage_failures(conn: sqlite3.Connection, limit: int = 20) -> list[dict[str, object]]:
     """Most recent failed stage_runs, each carrying enough meeting context to
     read on its own.

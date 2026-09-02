@@ -37,8 +37,15 @@ GLOSSARY_FILE = ROOT_DIR / "glossary.md"
 MINUTES_TEMPLATE_FILE = TEMPLATES_DIR / "minutes.md"
 SPEAKER_OVERRIDES_FILE = ROOT_DIR / "speaker-overrides.yaml"
 
+# Where a run writes the log every other process reads. The dashboard's log
+# panel is an in-process buffer, so a run started from a shell or by the watcher
+# left it blank - which is how a working run reads as a dead button.
+LOGS_DIR = Path(os.environ.get("MMC_LOGS", ROOT_DIR / "logs"))
+RUN_LOG_FILE = LOGS_DIR / "pipeline-run.log"
+
 ALL_DIRS = [
     INBOX_DIR, DRIVE_HANDOFF_DIR, AUDIO_DIR, TRANSCRIPTS_DIR, MINUTES_DIR, DB_DIR, TEMPLATES_DIR,
+    LOGS_DIR,
 ]
 
 # ── External Export Targets ───────────────────────────────────────────
@@ -256,6 +263,15 @@ LLM_PROVIDER_ORDER = [
     for name in ("codex", "claude", "antigravity")
     if name in {configured.lower() for configured in _configured_llm_providers}
 ]
+
+# Minutes are a bounded synthesis task, not an open-ended coding session. Pin
+# both Codex dimensions so the subprocess cannot inherit a slower interactive
+# profile from ~/.codex/config.toml. MMC_CODEX_ARGS remains the full-command
+# escape hatch for an operator who needs different flags.
+CODEX_MODEL = os.environ.get("MMC_CODEX_MODEL", "gpt-5.6-terra").strip()
+CODEX_REASONING_EFFORT = os.environ.get(
+    "MMC_CODEX_REASONING_EFFORT", "low"
+).strip()
 
 # Antigravity is the final configured fallback after Codex and Claude.
 ANTIGRAVITY_BIN = os.environ.get("MMC_ANTIGRAVITY_BIN", "agy")

@@ -516,6 +516,83 @@ function renderStageFailures(failures) {
 }
 
 // ── Pipeline Orchestrator & Live Status ──────────────────────────────
+const STAGE_FRIENDLY = {
+  all: "Processing All Stages",
+  capture: "Checking Google Drive",
+  ingest: "Discovering Audio",
+  transcribe: "Transcribing Speech",
+  speakers: "Matching Speakers",
+  minutes: "Synthesizing Minutes",
+  index: "Updating AI Search Index",
+  "graph-sync": "Publishing to Knowledge Graph",
+  recompile: "Refreshing Formats",
+};
+
+// Statuses named by the work still owed, not by the row they sit in. "12
+// speakers_resolved" tells you nothing about whether minutes are coming.
+const QUEUE_LABELS = {
+  discovered: "to transcribe",
+  transcribed: "to name speakers",
+  speakers_resolved: "to compile",
+  minutes_compiled: "to index",
+  indexed: "done",
+  failed: "failed",
+};
+
+function clockOf(timestamp) {
+  if (!timestamp) return "";
+  const parsed = new Date(timestamp);
+  if (Number.isNaN(parsed.getTime())) return String(timestamp);
+  return parsed.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+// The run detail line under the badge. Everything here used to live only in
+// the log drawer, which is collapsed by default, so a run in progress and a
+// dead button looked identical from the masthead.
+function renderPipelineDetail(status) {
+  const box = $("pipeline-detail");
+  if (!box) return;
+  const parts = [];
+
+  if (status.running) {
+    if (status.owner === "external") {
+      const pid = status.holder_pid ? ` · pid ${status.holder_pid}` : "";
+      parts.push(
+        `<span class="pd-item pd-owner">started outside the dashboard${escapeHtml(pid)}</span>`
+      );
+    }
+    if (status.started_at) {
+      parts.push(`<span class="pd-item">since <strong>${escapeHtml(clockOf(status.started_at))}</strong></span>`);
+    }
+    const flight = status.in_flight;
+    if (flight && flight.stage) {
+      const stage = STAGE_FRIENDLY[flight.stage] || flight.stage;
+      parts.push(
+        `<span class="pd-item"><strong>${escapeHtml(stage)}</strong>: ` +
+          `<span class="pd-meeting">${escapeHtml(flight.label || "")}</span></span>`
+      );
+    }
+  } else if (status.blocked_by) {
+    parts.push(
+      `<span class="pd-item pd-owner">a run started ` +
+        `${escapeHtml(clockOf(status.blocked_by.started_at))} owns the queue</span>`
+    );
+  }
+
+  const queue = status.queue || {};
+  const chips = Object.keys(queue)
+    .filter((key) => queue[key])
+    .map((key) => {
+      const cls = key === "failed" ? "pd-chip pd-chip-failed" : "pd-chip";
+      return `<span class="${cls}">${queue[key]} ${escapeHtml(QUEUE_LABELS[key] || key)}</span>`;
+    });
+  if (chips.length) parts.push(`<span class="pd-queue">${chips.join("")}</span>`);
+
+  box.innerHTML = parts.join("");
+  box.hidden = parts.length === 0;
+  box.classList.toggle("pd-external", status.owner === "external");
+}
+
 async function checkPipelineStatus() {
   try {
     const res = await fetch("/api/pipeline/status");
@@ -535,23 +612,19 @@ function handlePipelineStatus(status) {
   state.pipelineRunning = status.running;
   setStageControlsRunning(status.running);
 
-  const stageFriendly = {
-    all: "Processing All Stages",
-    capture: "Checking Google Drive",
-    ingest: "Discovering Audio",
-    transcribe: "Transcribing Speech",
-    speakers: "Matching Speakers",
-    minutes: "Synthesizing Minutes",
-    index: "Updating AI Search Index",
-    recompile: "Refreshing Formats",
-  };
+  renderPipelineDetail(status);
 
   if (status.running) {
-    const friendlyName = stageFriendly[status.stage] || status.stage;
+    const friendlyName = STAGE_FRIENDLY[status.stage] || status.stage;
     indicator.classList.add("running");
     statusText.textContent = `● ${friendlyName}...`;
     $("btn-quick-run").disabled = true;
-    $("btn-quick-run").textContent = `⏳ ${friendlyName}...`;
+    // A run this dashboard did not start is still a run. Naming its start time
+    // on the button is what tells a second click apart from a dead one.
+    $("btn-quick-run").textContent =
+      status.owner === "external"
+        ? `⏳ Already running since ${clockOf(status.started_at)}`
+        : `⏳ ${friendlyName}...`;
   } else {
     indicator.classList.remove("running");
     statusText.textContent = "Processing Idle";
@@ -565,13 +638,18 @@ function handlePipelineStatus(status) {
     terminalBody.textContent = status.logs.join("\n");
     terminalBody.scrollTop = terminalBody.scrollHeight;
   }
+  const terminalSource = $("terminal-source");
+  if (terminalSource) {
+    terminalSource.textContent =
+      status.owner === "external"
+        ? `Mirrored from logs/pipeline-run.log — this run was started outside the dashboard (pid ${status.holder_pid}).`
+        : "";
+  }
 
   if (status.running && !state.pollTimer) {
     state.pollTimer = setTimeout(async () => {
       state.pollTimer = null;
       await checkPipelineStatus();
-      loadOverview();
-      loadMeetings();
     }, 1500);
   } else if (!status.running && state.pollTimer) {
     clearTimeout(state.pollTimer);
@@ -584,7 +662,12 @@ function handlePipelineStatus(status) {
   // Announce the outcome once, on the transition, and reload what the run
   // could have changed.
   if (wasRunning && !status.running) {
-    if (status.error) {
+    if (status.blocked_by) {
+      showToast(
+        `Already running - a run started ${clockOf(status.blocked_by.started_at)} owns the queue.`,
+        "info"
+      );
+    } else if (status.error) {
       showToast(`Processing stopped: ${status.error}`, "error");
     } else if (status.success === false) {
       showToast("Processing finished with errors - open Diagnostics for the log.", "error");
@@ -635,6 +718,14 @@ async function runStage(stage, trigger = triggerButton()) {
         body: JSON.stringify({ stage }),
       });
       const data = await res.json();
+      if (res.status === 409) {
+        // The lease refused a second run over the same queue. That is the
+        // guard working, so it reads as information; a red banner here is what
+        // made a healthy run look broken.
+        showToast(data.error || "A pipeline run is already running.", "info");
+        checkPipelineStatus();
+        return false;
+      }
       if (!res.ok) throw new Error(data.error || "Failed to start operation");
       const stageMessage = stage === "speaker-refresh"
         ? "Updating corrected minutes and AI search"
@@ -686,6 +777,11 @@ async function recompileStale(trigger = triggerButton()) {
         headers: { "Content-Type": "application/json" },
       });
       const data = await res.json();
+      if (res.status === 409) {
+        showToast(data.error || "A pipeline run is already running.", "info");
+        checkPipelineStatus();
+        return false;
+      }
       if (!res.ok) throw new Error(data.error || "Format refresh failed");
       showToast("Refreshing minutes layout", "success");
       return true;

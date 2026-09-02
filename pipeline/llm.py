@@ -31,6 +31,8 @@ from typing import Protocol
 from pipeline.config import (
     ANTIGRAVITY_BIN,
     ANTIGRAVITY_MODEL,
+    CODEX_MODEL,
+    CODEX_REASONING_EFFORT,
     GEMINI_MODEL,
     LLM_PROVIDER_ORDER,
     LLM_TIMEOUT_SEC,
@@ -182,11 +184,27 @@ def gemini_provider() -> CLIProvider:
 
 
 def codex_provider() -> CLIProvider:
-    """Codex CLI, non-interactive exec mode."""
+    """Codex CLI with a task-local model and effort profile.
+
+    Without explicit flags, ``codex exec`` inherits the user's interactive
+    configuration. That made minutes generation silently jump from Terra/low
+    to Sol/high when the desktop profile changed, turning the same compile from
+    roughly 95 seconds into more than nine minutes.
+    """
     return CLIProvider(
         name="codex",
         binary=os.environ.get("MMC_CODEX_BIN", "codex"),
-        args=_split_override("MMC_CODEX_ARGS", ["exec", "-"]),
+        args=_split_override(
+            "MMC_CODEX_ARGS",
+            [
+                "exec",
+                "-m",
+                CODEX_MODEL,
+                "-c",
+                f"model_reasoning_effort={CODEX_REASONING_EFFORT}",
+                "-",
+            ],
+        ),
     )
 
 

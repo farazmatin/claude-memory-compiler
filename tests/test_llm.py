@@ -52,6 +52,42 @@ def test_first_working_provider_wins(monkeypatch):
     assert llm.last_provider == "gemini"
 
 
+def test_codex_provider_pins_the_fast_minutes_profile(monkeypatch):
+    """Minutes must not inherit a slow model/effort from ~/.codex/config.toml.
+
+    Regression: an inherited Sol/high run exceeded nine minutes; the same
+    meeting completed in about 95 seconds with Terra/low.
+    """
+    monkeypatch.delenv("MMC_CODEX_ARGS", raising=False)
+    monkeypatch.setattr(llm, "CODEX_MODEL", "gpt-5.6-terra")
+    monkeypatch.setattr(llm, "CODEX_REASONING_EFFORT", "low")
+
+    assert llm.codex_provider().args == [
+        "exec",
+        "-m",
+        "gpt-5.6-terra",
+        "-c",
+        "model_reasoning_effort=low",
+        "-",
+    ]
+
+
+def test_codex_args_remains_a_full_operator_override(monkeypatch):
+    monkeypatch.setenv(
+        "MMC_CODEX_ARGS",
+        "exec -m custom-model -c model_reasoning_effort=medium -",
+    )
+
+    assert llm.codex_provider().args == [
+        "exec",
+        "-m",
+        "custom-model",
+        "-c",
+        "model_reasoning_effort=medium",
+        "-",
+    ]
+
+
 def test_falls_through_on_failure(monkeypatch):
     """A quota limit on the preferred provider must not stall a batch that has
     already paid for transcription."""
