@@ -1,0 +1,49 @@
+name: build and push cog
+
+# Manual only. A push to Replicate creates a new version hash, and the pipeline
+# pins vectors to that hash - so a build that fires on every commit would keep
+# inventing namespaces nobody asked for.
+on:
+  workflow_dispatch:
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The GPU image is large; reclaim runner space before building.
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: fetch weights
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          pip install --quiet huggingface_hub
+          python scripts/fetch_weights.py
+
+      - name: install cog
+        run: |
+          sudo curl -o /usr/local/bin/cog -L \
+            https://github.com/replicate/cog/releases/latest/download/cog_linux_x86_64
+          sudo chmod +x /usr/local/bin/cog
+
+      - name: push
+        env:
+          REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
+        run: cog push r8.im/${{ vars.REPLICATE_MODEL }}
+
+      - name: report the pinned version
+        env:
+          REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
+        run: |
+          curl -s -H "Authorization: Bearer $REPLICATE_API_TOKEN" \
+            "https://api.replicate.com/v1/models/${{ vars.REPLICATE_MODEL }}" \
+            | python -c "import json,sys; print('MMC_REMOTE_VOICE_VERSION=' + json.load(sys.stdin)['latest_version']['id'])"

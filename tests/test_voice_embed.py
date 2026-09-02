@@ -361,3 +361,67 @@ def test_a_valid_response_parses():
     assert parsed.dim == 2
     assert parsed.encoder == "enc@v1"
     assert parsed.embeddings["SPEAKER_00"] == [1.0, 2.0]
+
+
+def test_the_client_payload_is_what_the_cog_parses(monkeypatch, tmp_path):
+    """The two sides are in different repos, so nothing else checks they agree.
+
+    Reproduces the cog's own region parsing against the exact payload the client
+    builds - a mismatch here is a failure that only shows up as a paid, failed
+    prediction.
+    """
+    import json
+
+    from pipeline.voice_embed_replicate import ReplicateVoiceBackend
+
+    sent: dict = {}
+
+    class _Resp:
+        status_code = 201
+
+        @staticmethod
+        def json():
+            return {"id": "pred-1"}
+
+    class _Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            sent.update(json or {})
+            return _Resp()
+
+    backend = ReplicateVoiceBackend("owner/cog", version="v1", encoder="wespeaker-resnet34-lm")
+    monkeypatch.setattr(backend._transport, "_upload_file", lambda *a, **k: "https://x/audio")
+    monkeypatch.setattr(backend._transport, "_headers", dict)
+    monkeypatch.setattr(
+        backend._transport, "_poll_prediction",
+        lambda *a, **k: {"output": {"embeddings": {"SPEAKER_00": [1.0, 2.0]}, "dim": 2}},
+    )
+    monkeypatch.setattr("pipeline.voice_embed_replicate.httpx.Client", lambda **k: _Client())
+
+    backend.embed(
+        tmp_path / "a.opus",
+        [voice_embed.LabelRegion("SPEAKER_00", 0.0, 5.0),
+         voice_embed.LabelRegion("SPEAKER_00", 9.0, 12.0)],
+        encoder="ignored-fallback",
+    )
+
+    assert sent["version"] == "v1"
+    payload = sent["input"]
+    assert payload["encoder"] == "wespeaker-resnet34-lm"
+    assert payload["audio"] == "https://x/audio"
+
+    # The cog's parsing, reproduced.
+    parsed = json.loads(payload["regions"])
+    assert isinstance(parsed, list) and parsed
+    by_label: dict[str, list[tuple[float, float]]] = {}
+    for item in parsed:
+        label = str(item["label"])
+        start, end = float(item["start"]), float(item["end"])
+        if end > start:
+            by_label.setdefault(label, []).append((start, end))
+    assert by_label == {"SPEAKER_00": [(0.0, 5.0), (9.0, 12.0)]}

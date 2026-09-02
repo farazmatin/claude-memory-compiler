@@ -21,7 +21,10 @@ happens on the wire.
 Input:
 
     {"audio": <url>, "encoder": str,
-     "regions": [{"label": str, "start": float, "end": float}, ...]}
+     "regions": "<JSON array of {label, start, end}>"}
+
+`regions` is a JSON *string*, not an array: cog inputs are scalars, files and
+flat lists, so a list of objects has to travel encoded.
 
 Output:
 
@@ -40,6 +43,7 @@ scripts/probe_voice_comparability.py exists to confirm before any backfill.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -99,10 +103,13 @@ class ReplicateVoiceBackend:
             "input": {
                 "audio": None,  # filled in below, after the upload
                 "encoder": self.encoder,
-                "regions": [
-                    {"label": r.label, "start": round(r.start, 3), "end": round(r.end, 3)}
-                    for r in regions
-                ],
+                # Encoded, because a cog input cannot be a list of objects.
+                "regions": json.dumps(
+                    [
+                        {"label": r.label, "start": round(r.start, 3), "end": round(r.end, 3)}
+                        for r in regions
+                    ]
+                ),
             },
         }
 

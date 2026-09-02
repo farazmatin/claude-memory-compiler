@@ -1,0 +1,18 @@
+# Speaker embedding cog. Built and pushed by CI only - the pipeline machine
+# builds nothing and loads no weights.
+build:
+  gpu: true
+  cuda: "12.1"
+  python_version: "3.11"
+  system_packages:
+    - ffmpeg
+  python_packages:
+    - torch==2.5.1
+    - torchaudio==2.5.1
+    - pyannote.audio==3.3.2
+    - numpy==1.26.4
+  # Weights are fetched into ./weights by CI before the build and copied in, so
+  # a cold start never reaches Hugging Face and no token exists at run time.
+  # Baking them is also what makes the pushed version hash mean something: it
+  # pins the weights, not just the code.
+predict: "predict.py:Predictor"
