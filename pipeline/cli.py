@@ -16,6 +16,7 @@ minutes compilation loses minutes of work rather than hours.
     pipeline graph-sync            publish subscription-authored graph records
     pipeline graph-sync            author the graph from the manifest
     pipeline chunk-index           build the BM25 index over compiled minutes
+    pipeline chunk-context         write contextual headers onto those chunks
     pipeline dense-index           build the dense vector index over those chunks
     pipeline watch                 process each newly-arrived Drive recording
     pipeline dashboard             browse and search the local meeting record
@@ -42,6 +43,7 @@ from pathlib import Path
 
 from pipeline import (
     capture,
+    chunk_context,
     chunk_index,
     compile_minutes,
     db,
@@ -519,6 +521,64 @@ def cmd_chunk_index(args: argparse.Namespace) -> int:
         # An unreadable minutes file is a real gap in the index, not a warning to
         # scroll past: the meeting is silently unsearchable until it is fixed.
         return 1 if stats["unreadable"] else 0
+
+
+def cmd_chunk_context(args: argparse.Namespace) -> int:
+    """Write a situating header onto every chunk the BM25 index holds.
+
+    One model call per meeting, committed per meeting, and a meeting whose
+    headers already describe its current text is skipped - so this is safe to
+    re-run and safe to interrupt. `--force` regenerates anyway, which is what to
+    reach for after changing the header contract.
+
+    Non-zero when a meeting failed or the run was interrupted: either way some
+    chunks are still reachable only by their own words, and the operator has to
+    know to re-run.
+    """
+    db.init_db()
+    with db.connect() as conn:
+        if args.meeting:
+            # A mistyped id and an unindexed meeting both do no work. Reporting
+            # them the same way as an already-current meeting would let a typo
+            # read as success, so the manifest is consulted first.
+            meeting = db.get_meeting(conn, args.meeting)
+            if meeting is None:
+                print(f"No meeting {args.meeting} in the manifest.", file=sys.stderr)
+                return 1
+            indexed = conn.execute(
+                "SELECT COUNT(*) FROM minute_chunks WHERE meeting_id = ?", (args.meeting,)
+            ).fetchone()[0]
+            if not indexed:
+                print(
+                    f"{meeting.label}: no chunks indexed; run `pipeline chunk-index` first.",
+                    file=sys.stderr,
+                )
+                return 1
+
+        stats = chunk_context.generate_all(
+            conn, meeting=args.meeting, limit=args.limit, force=args.force
+        )
+        print(
+            f"{stats['meetings']} meeting(s) with chunks: {stats['headed']} headed, "
+            f"{stats['skipped']} skipped, {stats['failed']} failed."
+        )
+        detail = f"Wrote {stats['chunks']} header(s)"
+        if stats["clipped"]:
+            detail += f"; {stats['clipped']} clipped to {chunk_context.HEADER_MAX_CHARS} chars"
+        if stats["batched"]:
+            detail += f"; {stats['batched']} meeting(s) too large for one prompt"
+        print(detail + ".")
+        _, reason = chunk_context.context_status(conn)
+        print(reason)
+        if stats["interrupted"]:
+            print(
+                "Interrupted. Everything committed before the meeting in flight is kept; "
+                "re-run `pipeline chunk-context` to resume.",
+                file=sys.stderr,
+            )
+        # A failed meeting is a real gap: those chunks stay reachable only by
+        # their own words, with nothing in the header column to say so.
+        return 1 if stats["failed"] or stats["interrupted"] else 0
 
 
 def cmd_dense_index(args: argparse.Namespace) -> int:
@@ -1475,6 +1535,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_chunk.add_argument("--meeting", help="index one meeting id instead of the whole corpus")
     p_chunk.set_defaults(func=cmd_chunk_index)
+
+    p_context = subparsers.add_parser(
+        "chunk-context", help="write contextual headers onto the indexed chunks"
+    )
+    p_context.add_argument("--meeting", help="only this meeting id")
+    p_context.add_argument("--limit", type=int, help="stop after this many meetings")
+    p_context.add_argument(
+        "--force", action="store_true", help="regenerate headers that are already current"
+    )
+    p_context.set_defaults(func=cmd_chunk_context)
 
     p_dense = subparsers.add_parser(
         "dense-index", help="build the local dense vector index over compiled minutes"

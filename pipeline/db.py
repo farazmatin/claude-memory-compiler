@@ -378,6 +378,14 @@ CREATE TABLE IF NOT EXISTS minute_chunks (
     -- Written by a later retrieval stage, NULL until then. Declared and indexed
     -- now so adding it needs no second migration over a live manifest.
     context_header TEXT,
+    -- Provenance of that header, all three NULL until it is written. The hash is
+    -- the invalidation and the reason this is not just a timestamp: the header
+    -- describes one exact passage, so a header carried over text that has since
+    -- changed is a description of something nobody can be shown. Same rule as
+    -- chunk_vectors.content_hash, for the same reason.
+    header_content_hash  TEXT,
+    header_model         TEXT,   -- the provider that produced it
+    headers_generated_at TEXT,
     char_count    INTEGER NOT NULL,
     -- SHA-256 of `text`. Reindex compares hashes and skips a meeting whose
     -- chunks all match, so re-running over the whole corpus is cheap and does
@@ -552,13 +560,32 @@ def connect(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-#  column -> DDL. Applied to manifests created before the column existed.
-MIGRATIONS: dict[str, str] = {
-    "lightrag_doc_id": "ALTER TABLE meetings ADD COLUMN lightrag_doc_id TEXT",
-    "retryable":
-        "ALTER TABLE meetings ADD COLUMN retryable INTEGER NOT NULL DEFAULT 0",
-    "retry_count":
-        "ALTER TABLE meetings ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+#  table -> column -> DDL. Applied to manifests created before the column
+#  existed. Keyed by table as well as column because the same column name can
+#  legitimately appear on two tables, and a flat dict would apply one of them to
+#  the wrong one.
+#
+#  Every entry here must also be in SCHEMA, which is what a fresh manifest gets;
+#  this dict is only how an existing one catches up.
+MIGRATIONS: dict[str, dict[str, str]] = {
+    "meetings": {
+        "lightrag_doc_id": "ALTER TABLE meetings ADD COLUMN lightrag_doc_id TEXT",
+        "retryable":
+            "ALTER TABLE meetings ADD COLUMN retryable INTEGER NOT NULL DEFAULT 0",
+        "retry_count":
+            "ALTER TABLE meetings ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+    },
+    # Added by the contextual-header stage. ALTER rather than a drop-and-rebuild
+    # like _drop_prefk_chunk_index does: by the time these landed the table
+    # carried 2,809 chunks with a dense vector built per chunk, and dropping it
+    # would have cascaded away 40 minutes of embedding to add three nullable
+    # columns. Appended columns leave rowids untouched, so the external-content
+    # FTS index over this table stays valid.
+    "minute_chunks": {
+        "header_content_hash": "ALTER TABLE minute_chunks ADD COLUMN header_content_hash TEXT",
+        "header_model": "ALTER TABLE minute_chunks ADD COLUMN header_model TEXT",
+        "headers_generated_at": "ALTER TABLE minute_chunks ADD COLUMN headers_generated_at TEXT",
+    },
 }
 
 
@@ -603,10 +630,13 @@ def init_db(db_path: Path | None = None) -> None:
         # CREATE TABLE IF NOT EXISTS silently skips an existing table, so new
         # columns must be added explicitly or an upgraded install keeps running
         # against the old shape and fails at the first write.
-        existing = {row["name"] for row in conn.execute("PRAGMA table_info(meetings)")}
-        for column, ddl in MIGRATIONS.items():
-            if column not in existing:
-                conn.execute(ddl)
+        for table, columns in MIGRATIONS.items():
+            # PRAGMA takes no parameters; the table name is a key of this
+            # module's own dict, never caller input.
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for column, ddl in columns.items():
+                if column not in existing:
+                    conn.execute(ddl)
 
 
 # ── Meeting rows ──────────────────────────────────────────────────────
