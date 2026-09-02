@@ -289,12 +289,45 @@ def test_the_producer_loads_no_local_model_weights():
 # ── Provider contract ─────────────────────────────────────────────────
 
 def test_an_unpinned_model_is_refused():
-    """'latest' silently changes what every stored voiceprint means."""
+    """Unpinned weights silently redefine every stored voiceprint."""
     from pipeline.replicate_asr import ReplicateError
     from pipeline.voice_embed_replicate import ReplicateVoiceBackend
 
-    with pytest.raises(ReplicateError, match="pinned"):
-        ReplicateVoiceBackend("owner/name")
+    with pytest.raises(ReplicateError, match="pinned version"):
+        ReplicateVoiceBackend("owner/name", version="")
+
+
+def test_the_namespace_names_the_encoder_and_the_build(monkeypatch):
+    """A vector is comparable only to one from the same weights, so the
+    namespace has to say which model AND which build of it."""
+    from pipeline import voice_embed
+
+    monkeypatch.setattr(voice_embed, "REMOTE_VOICE_MODEL", "farazmatin/speaker-embed")
+    monkeypatch.setattr(voice_embed, "REMOTE_VOICE_VERSION", "abcdef1234567890")
+    monkeypatch.setattr(voice_embed, "REMOTE_VOICE_ENCODER", "wespeaker-resnet34-lm")
+    assert voice_embed.configured()
+    assert voice_embed.provider_namespace() == "wespeaker-resnet34-lm@abcdef123456"
+
+
+def test_a_model_without_a_version_is_not_configured(monkeypatch):
+    from pipeline import voice_embed
+
+    monkeypatch.setattr(voice_embed, "REMOTE_VOICE_MODEL", "farazmatin/speaker-embed")
+    monkeypatch.setattr(voice_embed, "REMOTE_VOICE_VERSION", "")
+    assert voice_embed.configured() is False
+
+
+def test_the_encoder_is_sent_to_the_cog(monkeypatch):
+    """The cog hosts several encoders behind one interface; which one answered
+    is half the namespace, so it cannot be left to the cog's default."""
+    from pipeline.voice_embed_replicate import ReplicateVoiceBackend
+
+    backend = ReplicateVoiceBackend(
+        "farazmatin/speaker-embed", version="abc123", encoder="wespeaker-resnet34-lm"
+    )
+    assert backend.encoder == "wespeaker-resnet34-lm"
+    assert backend.version == "abc123"
+    assert backend.model == "farazmatin/speaker-embed"
 
 
 @pytest.mark.parametrize(

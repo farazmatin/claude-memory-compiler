@@ -196,6 +196,17 @@ VOICE_MAX_EMBED_SEC = float(os.environ.get("MMC_VOICE_MAX_EMBED_SEC", "90"))
 # no-ops without it: this is the only paid call in the stage, and a model that
 # silently starts running because a default existed is a bill nobody approved.
 REMOTE_VOICE_MODEL = os.environ.get("MMC_REMOTE_VOICE_MODEL", "").strip()
+# Pinned version hash of that model, set after the encoder benchmark. Separate
+# from the model name because the namespace every vector is keyed by is
+# `encoder@version`: the name alone does not say which weights answered.
+REMOTE_VOICE_VERSION = os.environ.get("MMC_REMOTE_VOICE_VERSION", "").strip()
+# Which encoder the cog should serve. It hosts several behind one interface, and
+# `wespeaker-resnet34-lm` is the same representation family as the vectors
+# already in the corpus - the choice that lets the existing enrollments carry
+# over instead of restarting.
+REMOTE_VOICE_ENCODER = os.environ.get(
+    "MMC_REMOTE_VOICE_ENCODER", "wespeaker-resnet34-lm"
+).strip()
 
 ALL_DIRS.append(SNIPPETS_DIR)
 

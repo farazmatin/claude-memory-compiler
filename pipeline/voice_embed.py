@@ -40,7 +40,9 @@ from typing import Protocol
 
 from pipeline import db, voices
 from pipeline.config import (
+    REMOTE_VOICE_ENCODER,
     REMOTE_VOICE_MODEL,
+    REMOTE_VOICE_VERSION,
     SNIPPET_BITRATE,
     SNIPPET_EXT,
     TARGET_SAMPLE_RATE,
@@ -377,8 +379,28 @@ class RunResult:
 
 
 def configured() -> bool:
-    """Whether a provider is configured. The stage no-ops when it is not."""
-    return bool(REMOTE_VOICE_MODEL)
+    """Whether a provider is fully pinned. The stage no-ops when it is not.
+
+    Both the model and its version are required. A model without a pinned
+    version would let the weights change under a namespace that claims to
+    identify them, which silently redefines every stored voiceprint.
+    """
+    return bool(REMOTE_VOICE_MODEL and REMOTE_VOICE_VERSION)
+
+
+def provider_namespace() -> str:
+    """The namespace vectors from the configured provider belong to.
+
+    `encoder@version`, because a vector is only comparable to another produced
+    by the same weights: the encoder says which model, the version says which
+    build of it.
+    """
+    if not configured():
+        raise VoiceEmbedError(
+            "no embedding provider pinned; set MMC_REMOTE_VOICE_MODEL and "
+            "MMC_REMOTE_VOICE_VERSION"
+        )
+    return f"{REMOTE_VOICE_ENCODER}@{REMOTE_VOICE_VERSION[:12]}"
 
 
 def eligible_meetings(conn, limit: int | None = None) -> list:

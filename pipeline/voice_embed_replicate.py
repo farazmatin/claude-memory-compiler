@@ -9,23 +9,33 @@ entirely the wrong cog and return something that looks like a vector).
 
 ## The cog contract
 
-`MMC_REMOTE_VOICE_MODEL` must be pinned as `owner/name:version`. A bare model
-name is refused: the namespace every stored vector is keyed by has to identify
-the weights exactly, and "latest" silently changes what a voiceprint means.
+The provider is the self-deployed cog named in the 2026-08-27 design:
+`farazmatin/speaker-embed`, hosting several encoders behind one interface and
+embedding the whisperx labels' own regions server-side, so no label-mapping
+happens on the wire.
+
+    MMC_REMOTE_VOICE_MODEL     the cog, e.g. farazmatin/speaker-embed
+    MMC_REMOTE_VOICE_VERSION   pinned version hash (required)
+    MMC_REMOTE_VOICE_ENCODER   which encoder to serve
 
 Input:
 
-    {"audio": <url>, "regions": [{"label": str, "start": float, "end": float}, ...]}
+    {"audio": <url>, "encoder": str,
+     "regions": [{"label": str, "start": float, "end": float}, ...]}
 
 Output:
 
     {"embeddings": {label: [float, ...]}, "dim": int, "encoder": str}
 
-No model is configured by default and none is assumed here. Choosing one is a
-paid decision that should start with a comparability probe against the existing
-`pyannote/wespeaker-voxceleb-resnet34-LM` vectors: if the new encoder is
-comparable the corpus keeps its enrolled people, and if it is not, enrollment
-restarts from whatever gets re-embedded.
+The version is required and separate from the name, because the namespace every
+vector is keyed by is `encoder@version`. An unpinned model would let the weights
+change under a namespace that claims to identify them, silently redefining every
+stored voiceprint.
+
+The default encoder, `wespeaker-resnet34-lm`, is the same representation family
+as the 268 vectors already in the corpus. If the cog serves those weights the
+existing 23 enrolled people carry over rather than restarting - which is what
+scripts/probe_voice_comparability.py exists to confirm before any backfill.
 """
 
 from __future__ import annotations
@@ -35,7 +45,12 @@ from typing import Any
 
 import httpx
 
-from pipeline.config import REMOTE_VOICE_MODEL, REPLICATE_TIMEOUT_SEC
+from pipeline.config import (
+    REMOTE_VOICE_ENCODER,
+    REMOTE_VOICE_MODEL,
+    REMOTE_VOICE_VERSION,
+    REPLICATE_TIMEOUT_SEC,
+)
 from pipeline.replicate_asr import REPLICATE_API_BASE, ReplicateBackend, ReplicateError
 from pipeline.voice_embed import EmbedResponse, LabelRegion
 
@@ -43,16 +58,32 @@ from pipeline.voice_embed import EmbedResponse, LabelRegion
 class ReplicateVoiceBackend:
     """Embeds every region of one meeting in a single prediction."""
 
-    def __init__(self, model: str | None = None) -> None:
-        self.model = (model or REMOTE_VOICE_MODEL).strip()
+    def __init__(
+        self,
+        model: str | None = None,
+        version: str | None = None,
+        encoder: str | None = None,
+    ) -> None:
+        raw = (model or REMOTE_VOICE_MODEL).strip()
+        # Accept owner/name:version as a convenience, but keep the two apart
+        # internally: the version is half the namespace, not part of the name.
+        if ":" in raw:
+            raw, embedded_version = raw.split(":", 1)
+        else:
+            embedded_version = ""
+        self.model = raw
+        self.version = (version or embedded_version or REMOTE_VOICE_VERSION).strip()
+        self.encoder = (encoder or REMOTE_VOICE_ENCODER).strip()
+
         if not self.model:
             raise ReplicateError("no embedding model configured; set MMC_REMOTE_VOICE_MODEL")
-        if ":" not in self.model:
+        if not self.version:
             raise ReplicateError(
-                f"MMC_REMOTE_VOICE_MODEL must be pinned as owner/name:version, got {self.model!r}. "
-                "An unpinned model changes what every stored voiceprint means."
+                f"{self.model} has no pinned version; set MMC_REMOTE_VOICE_VERSION. "
+                "Unpinned weights silently redefine every stored voiceprint."
             )
-        self.version = self.model.split(":", 1)[1]
+        if not self.encoder:
+            raise ReplicateError("no encoder selected; set MMC_REMOTE_VOICE_ENCODER")
         # Composition, not inheritance: only the transport is shared, and the
         # ASR backend's transcribe() has no business being reachable from here.
         self._transport = ReplicateBackend(model_name=self.model)
@@ -67,6 +98,7 @@ class ReplicateVoiceBackend:
             "version": self.version,
             "input": {
                 "audio": None,  # filled in below, after the upload
+                "encoder": self.encoder,
                 "regions": [
                     {"label": r.label, "start": round(r.start, 3), "end": round(r.end, 3)}
                     for r in regions
