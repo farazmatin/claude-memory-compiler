@@ -429,11 +429,11 @@ def generate_all(
             # done what the operator asked - the loop stops - and the caller
             # needs the counts to know how much of a 45-minute job survived.
             stats["interrupted"] = 1
-            print(f"    {label} interrupted; stopping. Re-run to resume.")
+            print(f"    {label} interrupted; stopping. Re-run to resume.", flush=True)
             break
         except HeaderError as exc:
             stats["failed"] += 1
-            print(f"    {label} FAILED, headers left unwritten: {exc}")
+            print(f"    {label} FAILED, headers left unwritten: {exc}", flush=True)
             continue
         if durable:
             conn.commit()
@@ -441,7 +441,11 @@ def generate_all(
         stats["chunks"] += written
         stats["batched"] += int(batched)
         stats["clipped"] += clipped
-        print(f"    {label} {_short_title(row)}: {written} header(s)")
+        # flush: an unattended run is normally launched with stdout redirected
+        # to a log, where Python block-buffers 8 KB - about 130 of these lines,
+        # so the whole 45-minute job would land in the log at the end and an
+        # operator watching it would see nothing at all.
+        print(f"    {label} {_short_title(row)}: {written} header(s)", flush=True)
     return stats
 
 
