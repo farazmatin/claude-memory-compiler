@@ -450,10 +450,17 @@ def test_an_undecodable_file_is_unreadable_not_unchanged(manifest, tmp_path, cap
 def test_hits_carry_the_provenance_of_their_own_meeting(manifest, tmp_path):
     """GC3: a citation names the meeting the text actually came from.
 
-    Ten meetings, not two, and an explicit budget. With the default 4,000 the
-    corpus below overflows it and the last hit comes back trimmed, so the
-    line-by-line check would fail on the ellipsis - the property under test
-    would be hostage to the budget rather than to provenance.
+    Ten meetings, not two, and an explicit budget. Under the default 4,000 this
+    corpus returns only 8 of its 10 hits - eight 490-character chunks spend
+    3,920, and the two behind them are dropped whole because 80 characters left
+    is under MIN_CHUNK_CHARS. So `max_chars` here is what stops the provenance
+    check from silently running over a subset.
+
+    The hit-count assertion below is a GC4 budget assertion, not a GC3 one, and
+    it is what makes removing `max_chars` fail. Provenance of a *trimmed* hit -
+    the case where the returned text is not a whole chunk - is a different
+    property and is covered by `test_a_trimmed_hit_still_traces_to_its_source`.
+    Nothing in this fixture is ever trimmed.
     """
     dates = {}
     paths = {}
@@ -482,6 +489,48 @@ def test_hits_carry_the_provenance_of_their_own_meeting(manifest, tmp_path):
         # have had. See _merge_fragments.)
         source = paths[hit.meeting_id].read_text(encoding="utf-8")
         assert all(line in source for line in hit.text.splitlines() if line.strip())
+
+
+def test_a_trimmed_hit_still_traces_to_its_source(manifest, tmp_path):
+    """GC3 for the one case the other provenance test cannot reach.
+
+    `_fit` appends an ellipsis, a character that appears in no minutes file, and
+    Task 5 will rerank these hits and cite them. So the returned text has to
+    still be a verbatim prefix of a real chunk in the meeting the citation
+    names - a trim may shorten the quote, never move it.
+    """
+    sources = {}
+    for meeting_id, marker in (("m1", "quagga"), ("m2", "narwhal")):
+        sources[meeting_id] = _write_minutes(
+            tmp_path / f"{meeting_id}.md",
+            f"# {marker} review\n\nThe {marker} control inventory was discussed. " + FILLER * 2,
+        )
+        _add_meeting(manifest, meeting_id, "2026-06-09", sources[meeting_id])
+    chunk_index.reindex_all(manifest)
+
+    whole = chunk_index.search_chunks(manifest, "control inventory", max_chars=100_000)
+    assert len(whole) == 2
+    # Budget for the first hit plus 300 - over MIN_CHUNK_CHARS, so the second
+    # hit is trimmed rather than dropped. Derived at runtime so a change in
+    # chunk geometry cannot quietly stop forcing the trim.
+    budget = len(whole[0].text) + 300
+
+    hits = chunk_index.search_chunks(manifest, "control inventory", max_chars=budget)
+
+    trimmed = [hit for hit in hits if hit.text.endswith("…")]
+    assert len(trimmed) == 1, "no trim occurred; the assertions below would prove nothing"
+    hit = trimmed[0]
+    quoted = hit.text[:-1]
+
+    # The quote is verbatim source text, and it is in the file the hit cites.
+    assert hit.source_path == str(sources[hit.meeting_id])
+    assert quoted in Path(hit.source_path).read_text(encoding="utf-8")
+    assert hit.chunk_id.startswith(f"{hit.meeting_id}:")
+    # And it is a strict prefix of the chunk it claims to be, not a rewrite.
+    untrimmed = {candidate.chunk_id: candidate.text for candidate in whole}[hit.chunk_id]
+    assert untrimmed.startswith(quoted)
+    assert len(quoted) < len(untrimmed)
+    assert sum(len(h.text) for h in hits) <= budget
 
 
 def test_an_oversized_paragraph_splits_on_line_boundaries(tmp_path):
