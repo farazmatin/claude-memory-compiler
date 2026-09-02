@@ -367,6 +367,28 @@ LIGHTRAG_TIMEOUT = float(os.environ.get("MMC_LIGHTRAG_TIMEOUT", "600"))
 # spans many meetings ("summarize all budget discussion this year").
 LIGHTRAG_DEFAULT_MODE = os.environ.get("MMC_LIGHTRAG_MODE", "hybrid")
 
+# ── Dense retrieval ───────────────────────────────────────────────────
+# The local embedding model behind `pipeline dense-index`. 384 dimensions,
+# English, CPU-only through the onnxruntime fastembed already rides on - no API
+# key and no metered call, which is why this has a working default while the
+# remote voice encoder above deliberately does not.
+#
+# Changing it invalidates every stored vector. Vectors are namespaced by this id
+# and a search only ever reads its own model's rows, so a swap silently empties
+# the dense half until `pipeline dense-index` has run again.
+EMBED_MODEL = os.environ.get("MMC_EMBED_MODEL", "BAAI/bge-small-en-v1.5").strip()
+
+# The cross-encoder that reorders a dense shortlist. Fetched only when
+# something actually reranks - retrieval works without it, at lower ranking
+# quality, so nothing here forces a download.
+#
+# The small model is the default because disk is the binding constraint on the
+# machine this runs on: 4.4 GB free of 456 GB. At 0.12 GB this and the embedder
+# together come to about 0.19 GB. `BAAI/bge-reranker-base` ranks better and is
+# the right value for `MMC_RERANK_MODEL` on a machine with room, but it is
+# 1.04 GB and cannot be the default here.
+RERANK_MODEL = os.environ.get("MMC_RERANK_MODEL", "Xenova/ms-marco-MiniLM-L-12-v2").strip()
+
 # ── Ask AI conversation history ─────────────────────────────────────────
 # Hard cap on how many prior turns of a chat session join a synthesis prompt,
 # regardless of how many the dashboard has stored - a long-running session

@@ -494,7 +494,7 @@ def test_hits_carry_the_provenance_of_their_own_meeting(manifest, tmp_path):
 def test_a_trimmed_hit_still_traces_to_its_source(manifest, tmp_path):
     """GC3 for the one case the other provenance test cannot reach.
 
-    `_fit` appends an ellipsis, a character that appears in no minutes file, and
+    `fit_excerpt` appends an ellipsis, a character that appears in no minutes file, and
     Task 5 will rerank these hits and cite them. So the returned text has to
     still be a verbatim prefix of a real chunk in the meeting the citation
     names - a trim may shorten the quote, never move it.

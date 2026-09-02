@@ -441,8 +441,12 @@ def _normalise_score(raw: float, term_count: int) -> float:
     return relevance / (relevance + BM25_HALF_SCORE)
 
 
-def _fit(text: str, limit: int) -> str | None:
+def fit_excerpt(text: str, limit: int) -> str | None:
     """`text` for a `limit`-character budget, or None when it cannot fit honestly.
+
+    Public because `dense_index.search_dense` serves excerpts into the same
+    fused result list. Two copies of this rule would drift, and the drift would
+    show up as an unmarked partial quote sitting beside a marked one.
 
     A chunk that fits comes back untouched. One that does not is cut at a word
     break and marked with an ellipsis, so anything quoting it downstream can see
@@ -547,7 +551,7 @@ def search_chunks(
     for row in rows:
         if len(hits) >= limit or used >= max_chars:
             break
-        text = _fit(row["text"], max_chars - used)
+        text = fit_excerpt(row["text"], max_chars - used)
         if text is None:
             # Too little budget left to quote this chunk honestly. Keep going
             # rather than stopping: a smaller lower-ranked chunk may still fit

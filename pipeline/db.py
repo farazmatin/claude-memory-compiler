@@ -424,6 +424,42 @@ CREATE TRIGGER IF NOT EXISTS minute_chunks_au AFTER UPDATE ON minute_chunks BEGI
     INSERT INTO minute_chunks_fts(rowid, text, context_header, heading)
     VALUES (new.rowid, new.text, new.context_header, new.heading);
 END;
+
+-- ── Dense vectors over the same chunks ──────────────────────────────
+--
+-- The semantic half of retrieval. The FTS index above finds the passage that
+-- uses the caller's words; these vectors find the one that means the same thing
+-- in different words, which is most of what a question about a meeting needs.
+-- See pipeline/dense_index.py.
+--
+-- No vector extension and no index structure. The corpus is 2,809 chunks at 384
+-- float32 each - about 4 MB - and scoring a query against all of them is one
+-- numpy matrix-vector product. An approximate index at this size would cost a
+-- native dependency and an approximation to save nothing measurable.
+--
+-- chunk_id alone is the primary key, so the store holds one model's vectors at
+-- a time and switching models replaces the corpus rather than doubling it.
+-- `model` is still carried per row and every search filters on it: vectors from
+-- two models are not on the same scale, and a search that mixed them would rank
+-- on noise. Same namespacing rule as voice_samples, for the same reason.
+--
+-- content_hash is the invalidation, and the foreign key does not replace it.
+-- reindex_meeting deletes and re-inserts a changed meeting's chunks, so
+-- "m1:0003" after an edit is a different passage at the same id - and the
+-- cascade only fires on a connection with `PRAGMA foreign_keys = ON`, which
+-- SQLite defaults to OFF. A vector whose content_hash no longer matches its
+-- chunk describes text nobody can be shown; embed_chunks rebuilds it and
+-- search_dense refuses to score it.
+CREATE TABLE IF NOT EXISTS chunk_vectors (
+    chunk_id     TEXT PRIMARY KEY REFERENCES minute_chunks(chunk_id) ON DELETE CASCADE,
+    model        TEXT NOT NULL,
+    dim          INTEGER NOT NULL,
+    vector       BLOB NOT NULL,      -- float32 little-endian, np.ndarray.tobytes()
+    content_hash TEXT NOT NULL,      -- the minute_chunks.content_hash this was built from
+    embedded_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunk_vectors_model ON chunk_vectors(model);
 """
 
 
@@ -860,6 +896,16 @@ def delete_meeting(conn: sqlite3.Connection, meeting_id: str) -> bool:
     # has to set for itself. `connect()` sets it; a maintenance script opening
     # the file with a bare sqlite3.connect() would not, and the chunks left
     # behind would keep answering searches citing a meeting that is gone.
+    #
+    # The vectors go first, and have to: they are identified by joining through
+    # minute_chunks, so once the chunk rows are gone there is nothing left to
+    # name them by and they would sit orphaned until a meeting reusing the id
+    # minted a colliding chunk_id.
+    conn.execute(
+        "DELETE FROM chunk_vectors WHERE chunk_id IN "
+        "(SELECT chunk_id FROM minute_chunks WHERE meeting_id = ?)",
+        (meeting_id,),
+    )
     conn.execute("DELETE FROM minute_chunks WHERE meeting_id = ?", (meeting_id,))
     cur = conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
     return cur.rowcount > 0

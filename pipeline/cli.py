@@ -16,6 +16,7 @@ minutes compilation loses minutes of work rather than hours.
     pipeline graph-sync            publish subscription-authored graph records
     pipeline graph-sync            author the graph from the manifest
     pipeline chunk-index           build the BM25 index over compiled minutes
+    pipeline dense-index           build the dense vector index over those chunks
     pipeline watch                 process each newly-arrived Drive recording
     pipeline dashboard             browse and search the local meeting record
     pipeline query "question"      ask the knowledge base
@@ -518,6 +519,49 @@ def cmd_chunk_index(args: argparse.Namespace) -> int:
         # An unreadable minutes file is a real gap in the index, not a warning to
         # scroll past: the meeting is silently unsearchable until it is fixed.
         return 1 if stats["unreadable"] else 0
+
+
+def cmd_dense_index(args: argparse.Namespace) -> int:
+    """Build the dense vector index over the chunks `chunk-index` already wrote.
+
+    Cheap to re-run: a chunk whose vector was built from the text it still holds
+    is skipped, so the normal case embeds nothing and never loads a model.
+    `--rebuild` re-embeds everything, which is what to reach for after changing
+    the chunk geometry.
+
+    Imported here rather than at module scope so the rest of the CLI - and every
+    BM25 path - stays free of numpy and of this module's model plumbing.
+    """
+    from pipeline import dense_index
+
+    db.init_db()
+    with db.connect() as conn:
+        model = args.model or dense_index.EMBED_MODEL
+        try:
+            stats = dense_index.embed_chunks(conn, model=model, force=args.rebuild)
+        except dense_index.DenseIndexError as exc:
+            # A named failure, not a traceback: the usual cause is a model that
+            # has never been downloaded, and the operator needs to know the rest
+            # of retrieval is still working.
+            print(f"Dense index not built: {exc}", file=sys.stderr)
+            print("BM25 retrieval is unaffected.", file=sys.stderr)
+            return 1
+        print(
+            f"{stats['chunks']} chunk(s): {stats['embedded']} embedded, "
+            f"{stats['current']} already current, {stats['stale']} were stale."
+        )
+        _, reason = dense_index.dense_status(conn, model=model)
+        print(reason)
+        if model != dense_index.EMBED_MODEL:
+            # Searching reads MMC_EMBED_MODEL and nothing else, so a one-off
+            # --model builds an index that nothing will ever look at. Said here
+            # rather than refused: building a second index to compare against is
+            # a legitimate thing to want.
+            print(
+                f"Note: searches read {dense_index.EMBED_MODEL}. "
+                f"Set MMC_EMBED_MODEL={model} for this index to be used."
+            )
+    return 0
 
 
 def cmd_graph_sync(args: argparse.Namespace) -> int:
@@ -1416,6 +1460,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_chunk.add_argument("--meeting", help="index one meeting id instead of the whole corpus")
     p_chunk.set_defaults(func=cmd_chunk_index)
+
+    p_dense = subparsers.add_parser(
+        "dense-index", help="build the local dense vector index over compiled minutes"
+    )
+    p_dense.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="re-embed every chunk, including ones whose vector is already current",
+    )
+    p_dense.add_argument(
+        "--model", help="embedding model id; overrides MMC_EMBED_MODEL for this run"
+    )
+    p_dense.set_defaults(func=cmd_dense_index)
 
     p_run = subparsers.add_parser("run", help="every pending stage, in order")
     p_run.add_argument("--limit", type=int, default=None)

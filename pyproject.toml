@@ -20,6 +20,11 @@ dependencies = [
     "google-auth-oauthlib>=1.2.0",
     # Voice identity & speaker embeddings
     "numpy>=1.26.0",
+    # Local text embeddings and reranking for the dense half of retrieval. Runs
+    # on the onnxruntime it pulls in, on CPU, from a cached model file - no API
+    # key, no metered call and no vendor service, which is the only reason a
+    # semantic index is allowed to exist in this pipeline at all.
+    "fastembed>=0.8.0",
 ]
 
 [project.optional-dependencies]
