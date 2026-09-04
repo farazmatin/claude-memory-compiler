@@ -65,6 +65,7 @@ If it reports authorization failure, run:
     pipeline speakers --owner "Name"
     pipeline minutes
     pipeline graph-sync
+    pipeline graph-sync --full       # explicit whole-corpus graph repair
     pipeline watch --owner "Name"
     pipeline doctor
     pipeline dashboard --open
@@ -85,6 +86,11 @@ the page. The equivalent from a shell is:
 Only run one at a time. The dashboard tracks its own run in process, so it does
 not know about a run started from a shell, and two runs will both work the same
 queue.
+
+Normal graph sync is incremental and uses bounded parallel PostgreSQL batches;
+it does not republish historical meetings or invoke a LightRAG model/vector
+route. Tune with `MMC_GRAPH_SYNC_WORKERS` and `MMC_GRAPH_SYNC_BATCH_SIZE` only if
+the local Postgres service needs a different concurrency bound.
 
 A continuous Drive watcher also exists for hands-off processing, but is not
 installed by default:

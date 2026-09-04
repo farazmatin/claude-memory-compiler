@@ -379,6 +379,21 @@ RESOLUTION_FULL_DIALOGUE_MAX_SPEAKERS = int(
 LIGHTRAG_URL = os.environ.get("MMC_LIGHTRAG_URL", "http://localhost:9621")
 LIGHTRAG_API_KEY = os.environ.get("MMC_LIGHTRAG_API_KEY", "")
 LIGHTRAG_TIMEOUT = float(os.environ.get("MMC_LIGHTRAG_TIMEOUT", "600"))
+# Graph publication is local database I/O. A small bounded pool overlaps batch
+# latency without turning a routine publication into a CPU-heavy workload; the
+# HTTP compatibility backend uses the same ceiling for its request workers.
+GRAPH_SYNC_WORKERS = max(1, int(os.environ.get("MMC_GRAPH_SYNC_WORKERS", "4")))
+GRAPH_SYNC_BATCH_SIZE = max(1, int(os.environ.get("MMC_GRAPH_SYNC_BATCH_SIZE", "200")))
+GRAPH_SYNC_BACKEND = os.environ.get("MMC_GRAPH_SYNC_BACKEND", "postgres").strip().lower()
+POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "127.0.0.1")
+POSTGRES_PORT = int(os.environ.get("POSTGRES_PORT", "5432"))
+POSTGRES_USER = os.environ.get("POSTGRES_USER", "lightrag")
+POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
+POSTGRES_DATABASE = os.environ.get("POSTGRES_DATABASE", "rag")
+LIGHTRAG_WORKSPACE = os.environ.get("POSTGRES_WORKSPACE", "default")
+LIGHTRAG_GRAPH_NAMESPACE = os.environ.get(
+    "MMC_LIGHTRAG_GRAPH_NAMESPACE", "chunk_entity_relation"
+)
 # hybrid = graph + vector. Use "global" for aggregative questions whose answer
 # spans many meetings ("summarize all budget discussion this year").
 LIGHTRAG_DEFAULT_MODE = os.environ.get("MMC_LIGHTRAG_MODE", "hybrid")

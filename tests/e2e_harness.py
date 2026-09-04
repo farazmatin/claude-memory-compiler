@@ -410,6 +410,9 @@ def pipeline_env(root: Path, lightrag_url: str, **extra: str) -> dict[str, str]:
         "MMC_DB_DIR": str(root / "db"),
         "MMC_LIGHTRAG_URL": lightrag_url,
         "MMC_LIGHTRAG_API_KEY": "test-key",
+        # The fake implements the HTTP compatibility contract, not a Postgres
+        # server. Production defaults to native PGTable batches.
+        "MMC_GRAPH_SYNC_BACKEND": "http",
         "MMC_TIMEZONE": "America/Toronto",
         "MMC_OWNER_NAME": "Faraz",
     }
@@ -462,6 +465,7 @@ def apply_env(monkeypatch, env: dict[str, str], modules: list | None = None) -> 
         "MMC_MINUTES": ("MINUTES_DIR", Path),
         "MMC_LIGHTRAG_URL": ("LIGHTRAG_URL", str),
         "MMC_LIGHTRAG_API_KEY": ("LIGHTRAG_API_KEY", str),
+        "MMC_GRAPH_SYNC_BACKEND": ("GRAPH_SYNC_BACKEND", str),
     }
     for env_key, (attr, caster) in path_attrs.items():
         if env_key in env:

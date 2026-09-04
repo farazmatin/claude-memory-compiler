@@ -41,7 +41,17 @@ catch {
     $shortcutPath = Join-Path $startup "Meeting Memory Dashboard.lnk"
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($shortcutPath)
-    $shortcut.TargetPath = Join-Path $PSHOME "pwsh.exe"
+    # $PSHOME on a Store-installed PowerShell is version-pinned
+    # (...Microsoft.PowerShell_7.6.5.0_x64__8wekyb3d8bbwe), so a shortcut built
+    # from it stops working the next time PowerShell updates - silently, at the
+    # only moment it matters, which is the next sign-in. The WindowsApps
+    # execution alias is the stable path to the same interpreter.
+    $aliasPwsh = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\pwsh.exe"
+    $shortcut.TargetPath = if (Test-Path -LiteralPath $aliasPwsh) {
+        $aliasPwsh
+    } else {
+        Join-Path $PSHOME "pwsh.exe"
+    }
     $shortcut.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$launcher`" -Port $Port"
     $shortcut.WorkingDirectory = $projectRoot
     $shortcut.WindowStyle = 7

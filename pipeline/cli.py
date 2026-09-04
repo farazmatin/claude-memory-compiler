@@ -60,6 +60,9 @@ from pipeline.config import (
     DASHBOARD_PORT,
     DB_DIR,
     DB_PATH,
+    GRAPH_SYNC_BACKEND,
+    GRAPH_SYNC_BATCH_SIZE,
+    GRAPH_SYNC_WORKERS,
     MIN_MEETING_SEC,
     MIN_TRANSCRIPT_WORDS,
     OWNER_NAME,
@@ -664,15 +667,29 @@ def cmd_graph_sync(args: argparse.Namespace) -> int:
     from pipeline import graph_sync
 
     db.init_db()
+    with db.connect() as conn:
+        queue = db.pending(conn, db.MINUTES_COMPILED, getattr(args, "limit", None))
+    full = bool(getattr(args, "full", False))
+    if not full and not queue:
+        print("Nothing to publish.")
+        return 0
+
     try:
         index.health()
     except index.IndexError_ as exc:
         print(f"{exc}\nStart it with: docker compose up -d")
         return 1
 
+    meeting_ids = None if full else [meeting.id for meeting in queue]
+
     before = len(graph_sync.graph_labels())
     print(f"graph holds {before} entities before sync")
-    report = graph_sync.sync()
+    report = graph_sync.sync(
+        meeting_ids=meeting_ids,
+        workers=getattr(args, "workers", GRAPH_SYNC_WORKERS),
+        batch_size=getattr(args, "batch_size", GRAPH_SYNC_BATCH_SIZE),
+        backend=getattr(args, "backend", GRAPH_SYNC_BACKEND),
+    )
     print(report.summary())
     for err in report.errors[:10]:
         print(f"  {err[:160]}")
@@ -697,17 +714,22 @@ def cmd_graph_sync(args: argparse.Namespace) -> int:
         + report.entities_verified
         + report.relations_verified
     )
-    if not wrote and report.errors:
-        print(
-            f"graph-sync wrote nothing: {len(report.errors)} write(s) refused. "
-            "The graph still holds the PREVIOUS corpus. Review the errors and re-run."
-        )
+    if report.errors:
+        if not wrote:
+            print(
+                f"graph-sync wrote nothing: {len(report.errors)} write(s) refused. "
+                "The graph still holds the PREVIOUS corpus. Review the errors and re-run."
+            )
+        else:
+            print(
+                f"graph-sync was only partially published: {len(report.errors)} write(s) "
+                "refused. The meeting queue was left unchanged for a safe retry."
+            )
         return 1
     # Publication is the terminal context stage in the active build. Advance the
     # queued meetings only after the graph is demonstrably populated and this
     # sync reported no refused writes. The legacy document id remains untouched.
     with db.connect() as conn:
-        queue = db.pending(conn, db.MINUTES_COMPILED, getattr(args, "limit", None))
         for meeting in queue:
             run_id = db.start_stage(conn, meeting.id, STAGE_INDEX)
             db.finish_stage(conn, run_id, True, "subscription-authored graph published")
@@ -1048,7 +1070,17 @@ def _run_all(args: argparse.Namespace, include_ingest: bool = True) -> int:
             no_llm=args.no_llm, traceback=False)),
         ("minutes", cmd_minutes, argparse.Namespace(
             limit=args.limit, recompile=False, traceback=False, force=False)),
-        ("graph-sync", cmd_graph_sync, argparse.Namespace(limit=args.limit)),
+        (
+            "graph-sync",
+            cmd_graph_sync,
+            argparse.Namespace(
+                limit=args.limit,
+                full=False,
+                workers=GRAPH_SYNC_WORKERS,
+                batch_size=GRAPH_SYNC_BATCH_SIZE,
+                backend=GRAPH_SYNC_BACKEND,
+            ),
+        ),
     ]
     failed: list[str] = []
     crashes: list[str] = []
@@ -1619,6 +1651,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_graph = subparsers.add_parser(
         "graph-sync", help="author the LightRAG graph from the manifest's entities"
+    )
+    p_graph.add_argument(
+        "--full",
+        action="store_true",
+        help="repair/rebuild by republishing the entire manifest instead of only queued meetings",
+    )
+    p_graph.add_argument(
+        "--workers",
+        type=int,
+        default=GRAPH_SYNC_WORKERS,
+        help=f"bounded concurrent graph batches (default: {GRAPH_SYNC_WORKERS})",
+    )
+    p_graph.add_argument(
+        "--batch-size",
+        type=int,
+        default=GRAPH_SYNC_BATCH_SIZE,
+        help=f"records per native graph batch (default: {GRAPH_SYNC_BATCH_SIZE})",
+    )
+    p_graph.add_argument(
+        "--backend",
+        choices=("postgres", "http"),
+        default=GRAPH_SYNC_BACKEND,
+        help="native PGTable batches, or compatibility HTTP writes",
     )
     p_graph.set_defaults(func=cmd_graph_sync)
 

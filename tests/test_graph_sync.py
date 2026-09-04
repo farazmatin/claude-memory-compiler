@@ -8,9 +8,11 @@ command the only writer of the graph - so a run that writes nothing must say so.
 from __future__ import annotations
 
 import argparse
+import threading
+import time
 
 
-def test_graph_sync_exits_non_zero_when_every_write_was_refused(monkeypatch, capsys):
+def test_graph_sync_exits_non_zero_when_every_write_was_refused(manifest, monkeypatch, capsys):
     """A sync that wrote nothing is a failure, even against a populated graph.
 
     `return 0 if after else 1` asked only whether the graph has any entities at
@@ -27,8 +29,18 @@ def test_graph_sync_exits_non_zero_when_every_write_was_refused(monkeypatch, cap
     )
     monkeypatch.setattr(index, "health", lambda: None)
     monkeypatch.setattr(graph_sync, "graph_labels", lambda: ["a"] * 307)
-    monkeypatch.setattr(graph_sync, "sync", lambda: report)
-    monkeypatch.setattr(cli.db, "init_db", lambda: None)
+    monkeypatch.setattr(graph_sync, "sync", lambda **_kwargs: report)
+
+    from .conftest import make_meeting
+
+    make_meeting(
+        manifest,
+        "pending",
+        "2026-08-10",
+        status=cli.db.MINUTES_COMPILED,
+        minutes_path="/pending.md",
+    )
+    manifest.commit()
 
     assert cli.cmd_graph_sync(argparse.Namespace()) == 1
     assert "wrote nothing" in capsys.readouterr().out
@@ -112,7 +124,7 @@ def test_graph_sync_publishes_when_the_only_refusals_are_drops(manifest, monkeyp
     )
     monkeypatch.setattr(index, "health", lambda: None)
     monkeypatch.setattr(graph_sync, "graph_labels", lambda: ["a"] * 1495)
-    monkeypatch.setattr(graph_sync, "sync", lambda: report)
+    monkeypatch.setattr(graph_sync, "sync", lambda **_kwargs: report)
 
     from .conftest import make_meeting
 
@@ -199,7 +211,7 @@ def test_graph_sync_publishes_when_every_write_landed_despite_a_500(
     )
     monkeypatch.setattr(index, "health", lambda: None)
     monkeypatch.setattr(graph_sync, "graph_labels", lambda: ["a"] * 1640)
-    monkeypatch.setattr(graph_sync, "sync", lambda: report)
+    monkeypatch.setattr(graph_sync, "sync", lambda **_kwargs: report)
 
     from .conftest import make_meeting
 
@@ -215,3 +227,178 @@ def test_graph_sync_publishes_when_every_write_landed_despite_a_500(
     assert "landed despite a 5xx" in out, "a verified write must stay visible, not read as clean"
     with cli.db.connect() as conn:
         assert cli.db.get_meeting(conn, "m1").status == cli.db.INDEXED
+
+
+def test_collect_limits_normal_sync_to_the_requested_meetings(manifest):
+    """A routine run must not republish the entire historical graph."""
+    from pipeline import db, graph_sync
+
+    from .conftest import make_meeting
+
+    make_meeting(manifest, "old", "2026-08-09")
+    make_meeting(manifest, "new", "2026-08-10")
+    db.replace_entities(
+        manifest,
+        "old",
+        [{"name": "Historical", "kind": "feature", "description": "old"}],
+        [],
+    )
+    db.replace_entities(
+        manifest,
+        "new",
+        [
+            {"name": "Current", "kind": "feature", "description": "new"},
+            {"name": "Shared", "kind": "system", "description": "dependency"},
+        ],
+        [{"subject": "Current", "predicate": "uses", "object": "Shared"}],
+    )
+
+    entities, relations = graph_sync.collect(manifest, meeting_ids={"new"})
+
+    assert set(entities) == {"Current", "Shared"}
+    assert [(r["source"], r["target"]) for r in relations] == [("Current", "Shared")]
+
+
+def test_sync_uses_bounded_parallel_workers(manifest, monkeypatch):
+    """The graph writer must overlap local HTTP waits without exceeding its bound."""
+    from pipeline import graph_sync
+
+    entities = {
+        f"Entity {i}": {
+            "entity_type": "feature",
+            "descriptions": [f"description {i}"],
+            "meetings": {"m1"},
+        }
+        for i in range(8)
+    }
+    monkeypatch.setattr(
+        graph_sync,
+        "collect",
+        lambda _conn, meeting_ids=None: (entities, []),
+    )
+
+    lock = threading.Lock()
+    active = 0
+    max_seen = 0
+
+    def slow_post(_client, _path, _payload, verify=None):
+        nonlocal active, max_seen
+        with lock:
+            active += 1
+            max_seen = max(max_seen, active)
+        time.sleep(0.04)
+        with lock:
+            active -= 1
+        return graph_sync.WRITTEN, ""
+
+    monkeypatch.setattr(graph_sync, "_post", slow_post)
+
+    report = graph_sync.sync(manifest, meeting_ids={"m1"}, workers=3, backend="http")
+
+    assert report.entities_written == 8
+    assert 1 < max_seen <= 3
+
+
+def test_cli_syncs_only_pending_meetings(manifest, monkeypatch):
+    """The normal graph stage publishes its queue, not all historical rows."""
+    from pipeline import cli, db, graph_sync, index
+
+    from .conftest import make_meeting
+
+    make_meeting(
+        manifest,
+        "pending",
+        "2026-08-10",
+        status=db.MINUTES_COMPILED,
+        minutes_path="/pending.md",
+    )
+    make_meeting(
+        manifest,
+        "old",
+        "2026-08-09",
+        status=db.INDEXED,
+        minutes_path="/old.md",
+    )
+    manifest.commit()
+
+    captured = {}
+
+    def fake_sync(*, meeting_ids=None, workers=None, batch_size=None, backend=None):
+        captured["meeting_ids"] = meeting_ids
+        captured["workers"] = workers
+        captured["batch_size"] = batch_size
+        captured["backend"] = backend
+        return graph_sync.SyncReport(entities_skipped=1)
+
+    monkeypatch.setattr(index, "health", lambda: None)
+    monkeypatch.setattr(graph_sync, "graph_labels", lambda: ["existing"])
+    monkeypatch.setattr(graph_sync, "sync", fake_sync)
+
+    rc = cli.cmd_graph_sync(
+        argparse.Namespace(
+            limit=None, full=False, workers=3, batch_size=50, backend="postgres"
+        )
+    )
+
+    assert rc == 0
+    assert captured == {
+        "meeting_ids": ["pending"],
+        "workers": 3,
+        "batch_size": 50,
+        "backend": "postgres",
+    }
+    with db.connect() as conn:
+        assert db.get_meeting(conn, "pending").status == db.INDEXED
+        assert db.get_meeting(conn, "old").status == db.INDEXED
+
+
+def test_partial_graph_failure_does_not_publish_the_queue(manifest, monkeypatch):
+    """A partly written incremental batch remains retryable as one unit."""
+    from pipeline import cli, db, graph_sync, index
+
+    from .conftest import make_meeting
+
+    make_meeting(
+        manifest,
+        "pending",
+        "2026-08-10",
+        status=db.MINUTES_COMPILED,
+        minutes_path="/pending.md",
+    )
+    manifest.commit()
+    monkeypatch.setattr(index, "health", lambda: None)
+    monkeypatch.setattr(graph_sync, "graph_labels", lambda: ["existing"])
+    monkeypatch.setattr(
+        graph_sync,
+        "sync",
+        lambda **_kwargs: graph_sync.SyncReport(
+            entities_written=1,
+            relations_skipped=1,
+            errors=["relation A->B: HTTP 500"],
+        ),
+    )
+
+    rc = cli.cmd_graph_sync(argparse.Namespace(limit=None, full=False, workers=3))
+
+    assert rc == 1
+    with db.connect() as conn:
+        assert db.get_meeting(conn, "pending").status == db.MINUTES_COMPILED
+
+
+def test_empty_incremental_queue_skips_lightrag(manifest, monkeypatch, capsys):
+    """A pipeline run with no graph work should finish without touching the service."""
+    from pipeline import cli, graph_sync, index
+
+    monkeypatch.setattr(
+        index,
+        "health",
+        lambda: (_ for _ in ()).throw(AssertionError("empty queue must not need LightRAG")),
+    )
+    monkeypatch.setattr(
+        graph_sync,
+        "sync",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("nothing should be written")),
+    )
+
+    assert cli.cmd_graph_sync(argparse.Namespace(limit=None, full=False)) == 0
+    assert "Nothing to publish" in capsys.readouterr().out

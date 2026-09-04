@@ -16,15 +16,23 @@ nothing here is load-bearing for the minutes themselves.
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 
 from pipeline import db
-from pipeline.config import LIGHTRAG_API_KEY, LIGHTRAG_URL
+from pipeline.config import (
+    GRAPH_SYNC_BACKEND,
+    GRAPH_SYNC_BATCH_SIZE,
+    GRAPH_SYNC_WORKERS,
+    LIGHTRAG_API_KEY,
+    LIGHTRAG_URL,
+)
 
 # One HTTP round trip per entity and per relation, against a loopback service.
 REQUEST_TIMEOUT_SEC = 120.0
@@ -129,7 +137,10 @@ def _resolve(name: str, meeting_id: str, speakers: dict[str, str]) -> str | None
     return clean
 
 
-def collect(conn: sqlite3.Connection) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+def collect(
+    conn: sqlite3.Connection,
+    meeting_ids: Iterable[str] | None = None,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Fold the per-meeting entity and relation rows into graph-shaped records.
 
     Entities are per-meeting in the manifest, so the same person appears once per
@@ -138,9 +149,18 @@ def collect(conn: sqlite3.Connection) -> tuple[dict[str, dict[str, Any]], list[d
     worth retrieving.
     """
     speakers = _speaker_names(conn)
+    selected = None if meeting_ids is None else tuple(dict.fromkeys(meeting_ids))
+
+    def rows(query: str):
+        if selected is None:
+            return conn.execute(query)
+        if not selected:
+            return ()
+        placeholders = ",".join("?" for _ in selected)
+        return conn.execute(f"{query} WHERE meeting_id IN ({placeholders})", selected)
 
     entities: dict[str, dict[str, Any]] = {}
-    for row in conn.execute("SELECT meeting_id, name, kind, description FROM entities"):
+    for row in rows("SELECT meeting_id, name, kind, description FROM entities"):
         resolved = _resolve(row["name"], row["meeting_id"], speakers)
         if resolved is None:
             continue
@@ -156,16 +176,26 @@ def collect(conn: sqlite3.Connection) -> tuple[dict[str, dict[str, Any]], list[d
         if bucket["entity_type"] == "other" and row["kind"]:
             bucket["entity_type"] = row["kind"]
 
+    # An incremental relation can point at an entity introduced by an older
+    # meeting. Those historical nodes are valid endpoints but must not be
+    # republished during this run.
+    known_entities = set(entities)
+    if selected is not None:
+        for row in conn.execute("SELECT meeting_id, name FROM entities"):
+            resolved = _resolve(row["name"], row["meeting_id"], speakers)
+            if resolved:
+                known_entities.add(resolved)
+
     seen: set[tuple[str, str, str]] = set()
     relations: list[dict[str, Any]] = []
-    for row in conn.execute("SELECT meeting_id, subject, predicate, object FROM relations"):
+    for row in rows("SELECT meeting_id, subject, predicate, object FROM relations"):
         subject = _resolve(row["subject"], row["meeting_id"], speakers)
         obj = _resolve(row["object"], row["meeting_id"], speakers)
         predicate = (row["predicate"] or "").strip()
         if not subject or not obj or not predicate or subject == obj:
             continue
         # A relation is only retrievable if both endpoints exist as nodes.
-        if subject not in entities or obj not in entities:
+        if subject not in known_entities or obj not in known_entities:
             continue
         key = (subject, predicate, obj)
         if key in seen:
@@ -275,69 +305,138 @@ class _GraphVerifier:
         return found
 
 
-def sync(conn: sqlite3.Connection | None = None) -> SyncReport:
-    """Write every manifest entity and relation into the LightRAG graph."""
+def sync(
+    conn: sqlite3.Connection | None = None,
+    meeting_ids: Iterable[str] | None = None,
+    workers: int = GRAPH_SYNC_WORKERS,
+    batch_size: int = GRAPH_SYNC_BATCH_SIZE,
+    backend: str = GRAPH_SYNC_BACKEND,
+) -> SyncReport:
+    """Write selected manifest records into LightRAG with bounded concurrency.
+
+    ``meeting_ids=None`` is the explicit full-repair path. Routine pipeline
+    publication passes only the meetings currently waiting at minutes_compiled.
+    Entities finish before relations start so every new edge has had a chance to
+    find its endpoints.
+    """
     if conn is None:
         with db.connect() as owned:
-            return sync(owned)
+            return sync(
+                owned,
+                meeting_ids=meeting_ids,
+                workers=workers,
+                batch_size=batch_size,
+                backend=backend,
+            )
 
     report = SyncReport()
-    entities, relations = collect(conn)
-    with httpx.Client() as client:
-        verifier = _GraphVerifier(client)
-        for name, data in entities.items():
-            payload = {
-                "entity_name": name,
-                "entity_data": {
-                    "entity_type": data["entity_type"],
-                    "description": " ".join(data["descriptions"])[:2000]
-                    or f"{data['entity_type']} mentioned in the meeting record",
-                    "source_id": "|".join(sorted(data["meetings"])),
-                },
-            }
-            outcome, detail = _post(
-                client, "/graph/entity/create", payload,
-                verify=lambda name=name: verifier.entity(name),
-            )
-            if outcome == WRITTEN:
-                report.entities_written += 1
-            elif outcome == VERIFIED:
-                report.entities_verified += 1
-            elif outcome == DROPPED:
-                report.entities_dropped += 1
-                report.drops.append(f"entity {name}: {detail}")
-            else:
-                report.entities_skipped += 1
-                if detail:
-                    report.errors.append(f"entity {name}: {detail}")
+    entities, relations = collect(conn, meeting_ids=meeting_ids)
+    worker_count = max(1, int(workers))
+    if backend == "postgres":
+        from pipeline import graph_sync_postgres
 
-        for rel in relations:
-            payload = {
-                "source_entity": rel["source"],
-                "target_entity": rel["target"],
-                "relation_data": {
-                    "description": f"{rel['source']} {rel['predicate']} {rel['target']}",
-                    "keywords": rel["predicate"],
-                    "weight": 1.0,
-                    "source_id": rel["meeting_id"],
-                },
-            }
-            outcome, detail = _post(
-                client, "/graph/relation/create", payload,
-                verify=lambda s=rel["source"], t=rel["target"]: verifier.relation(s, t),
-            )
-            label = f"relation {rel['source']}->{rel['target']}"
-            if outcome == WRITTEN:
-                report.relations_written += 1
-            elif outcome == VERIFIED:
-                report.relations_verified += 1
-            elif outcome == DROPPED:
-                report.relations_dropped += 1
-                report.drops.append(f"{label}: {detail}")
-            else:
-                report.relations_skipped += 1
-                if detail:
-                    report.errors.append(f"{label}: {detail}")
+        batch = graph_sync_postgres.sync(
+            entities,
+            relations,
+            workers=worker_count,
+            batch_size=max(1, int(batch_size)),
+        )
+        report.entities_written = batch.entities_written
+        report.relations_written = batch.relations_written
+        report.errors.extend(batch.errors)
+        return report
+    if backend != "http":
+        report.errors.append(
+            f"unsupported graph sync backend {backend!r}; expected 'postgres' or 'http'"
+        )
+        return report
+
+    local = threading.local()
+    clients: list[httpx.Client] = []
+    clients_lock = threading.Lock()
+
+    def resources() -> tuple[httpx.Client, _GraphVerifier]:
+        client = getattr(local, "client", None)
+        if client is None:
+            client = httpx.Client()
+            local.client = client
+            local.verifier = _GraphVerifier(client)
+            with clients_lock:
+                clients.append(client)
+        return client, local.verifier
+
+    def write_entity(item: tuple[str, dict[str, Any]]) -> tuple[str, str, str]:
+        name, data = item
+        client, verifier = resources()
+        payload = {
+            "entity_name": name,
+            "entity_data": {
+                "entity_type": data["entity_type"],
+                "description": " ".join(data["descriptions"])[:2000]
+                or f"{data['entity_type']} mentioned in the meeting record",
+                "source_id": "|".join(sorted(data["meetings"])),
+            },
+        }
+        outcome, detail = _post(
+            client,
+            "/graph/entity/create",
+            payload,
+            verify=lambda: verifier.entity(name),
+        )
+        return name, outcome, detail
+
+    def write_relation(rel: dict[str, Any]) -> tuple[str, str, str]:
+        client, verifier = resources()
+        payload = {
+            "source_entity": rel["source"],
+            "target_entity": rel["target"],
+            "relation_data": {
+                "description": f"{rel['source']} {rel['predicate']} {rel['target']}",
+                "keywords": rel["predicate"],
+                "weight": 1.0,
+                "source_id": rel["meeting_id"],
+            },
+        }
+        outcome, detail = _post(
+            client,
+            "/graph/relation/create",
+            payload,
+            verify=lambda: verifier.relation(rel["source"], rel["target"]),
+        )
+        return f"{rel['source']}->{rel['target']}", outcome, detail
+
+    try:
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            for name, outcome, detail in pool.map(write_entity, entities.items()):
+                if outcome == WRITTEN:
+                    report.entities_written += 1
+                elif outcome == VERIFIED:
+                    report.entities_verified += 1
+                elif outcome == DROPPED:
+                    report.entities_dropped += 1
+                    report.drops.append(f"entity {name}: {detail}")
+                else:
+                    report.entities_skipped += 1
+                    if detail:
+                        report.errors.append(f"entity {name}: {detail}")
+
+            # The first map is fully consumed before the second starts.
+            for relation, outcome, detail in pool.map(write_relation, relations):
+                label = f"relation {relation}"
+                if outcome == WRITTEN:
+                    report.relations_written += 1
+                elif outcome == VERIFIED:
+                    report.relations_verified += 1
+                elif outcome == DROPPED:
+                    report.relations_dropped += 1
+                    report.drops.append(f"{label}: {detail}")
+                else:
+                    report.relations_skipped += 1
+                    if detail:
+                        report.errors.append(f"{label}: {detail}")
+    finally:
+        for client in clients:
+            client.close()
 
     return report
 

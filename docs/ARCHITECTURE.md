@@ -49,6 +49,15 @@ subscription CLIs author minutes, speaker resolution, entities, relations, and
 answer synthesis. LightRAG backed by Postgres stores and traverses the
 subscription-authored graph; it does not author facts.
 
+Routine graph publication is incremental: `graph-sync` selects only meetings at
+`minutes_compiled`, folds their duplicate entities, and writes bounded native
+PGTable batches in parallel. Entities complete before relation batches begin,
+and the meetings advance to `indexed` only if every batch succeeds. This avoids
+LightRAG's single-record HTTP graph routes, which also attempt vector embeddings
+that this graph-only architecture intentionally disables. `graph-sync --full`
+is the explicit whole-corpus repair path; `--backend http` is a compatibility
+fallback for a non-PostgreSQL deployment.
+
 ## Voice namespace
 
 Voice vectors are namespaced by the encoder that produced them, because vectors
